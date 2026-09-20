@@ -2,7 +2,8 @@ mod keyboard_runtime;
 mod selected_text_runtime;
 
 pub use keyboard_runtime::{
-    InputProcessor, RuntimeDirective, RuntimeError, run_global_keyboard_hook,
+    InputProcessor, RuntimeDirective, RuntimeError, request_global_keyboard_hook_stop,
+    run_global_keyboard_hook,
 };
 pub use selected_text_runtime::{SelectedTextRuntimeError, SelectedTextSession};
 

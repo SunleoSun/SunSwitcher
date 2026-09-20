@@ -1,14 +1,19 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_BACK, VK_CONTROL, VK_RETURN, VK_TAB,
+    INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_BACK, VK_CONTROL, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
+    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_TAB,
 };
+
+use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
 
 use super::keyboard_runtime::{
     KeyDownDisposition, RuntimeError, build_ctrl_chord_inputs, build_replacement_inputs,
-    foreground_change_requires_invalidation, injected_marker, is_shift_modifier_key, is_toggle_key,
-    keyup_suppression_after_injection, mouse_message_invalidates_tracking, preclassify_key_down,
+    foreground_change_requires_invalidation, injected_marker, is_foreign_injected_keyboard_event,
+    is_shift_modifier_key, is_toggle_key, keyup_suppression_after_injection,
+    mouse_message_invalidates_tracking, physical_key_from_vk, preclassify_key_down,
+    update_keyboard_state,
 };
 use crate::correction::{CorrectionDecision, ReplacementText};
-use crate::input::{Boundary, CompletedToken, InputEvent};
+use crate::input::{Boundary, CompletedToken, InputEvent, PhysicalKey};
 use crate::replacement::ReplacementEngine;
 
 fn action(
@@ -35,6 +40,30 @@ fn mouse_clicks_invalidate_tracked_text_state() {
     assert!(mouse_message_invalidates_tracking(WM_MBUTTONDOWN));
     assert!(mouse_message_invalidates_tracking(WM_XBUTTONDOWN));
     assert!(!mouse_message_invalidates_tracking(WM_MOUSEMOVE));
+}
+
+#[test]
+fn foreign_injected_keyboard_events_fail_closed_but_owned_injection_does_not() {
+    assert!(is_foreign_injected_keyboard_event(LLKHF_INJECTED, 0));
+    assert!(!is_foreign_injected_keyboard_event(
+        LLKHF_INJECTED,
+        injected_marker()
+    ));
+    assert!(!is_foreign_injected_keyboard_event(0, 0));
+
+    let mut state = [0u8; 256];
+    update_keyboard_state(&mut state, VK_CONTROL as u32, true);
+    assert_ne!(state[VK_CONTROL as usize] & 0x80, 0);
+
+    update_keyboard_state(&mut state, b'A' as u32, true);
+    assert_ne!(
+        state[VK_CONTROL as usize] & 0x80,
+        0,
+        "a generic injected modifier must survive unrelated key transitions"
+    );
+
+    update_keyboard_state(&mut state, VK_CONTROL as u32, false);
+    assert_eq!(state[VK_CONTROL as usize] & 0x80, 0);
 }
 
 #[test]
@@ -82,6 +111,21 @@ fn failed_replacement_injection_does_not_suppress_physical_keyup() {
         keyup_suppression_after_injection(VK_TAB as u32, &succeeded),
         Some(VK_TAB as u32)
     );
+}
+
+#[test]
+fn windows_oem_keys_map_to_layout_ambiguous_physical_identity() {
+    for (vk_code, expected) in [
+        (VK_OEM_3, PhysicalKey::Grave),
+        (VK_OEM_4, PhysicalKey::LeftBracket),
+        (VK_OEM_6, PhysicalKey::RightBracket),
+        (VK_OEM_1, PhysicalKey::Semicolon),
+        (VK_OEM_7, PhysicalKey::Quote),
+        (VK_OEM_COMMA, PhysicalKey::Comma),
+        (VK_OEM_PERIOD, PhysicalKey::Period),
+    ] {
+        assert_eq!(physical_key_from_vk(vk_code as u32), expected);
+    }
 }
 
 #[test]

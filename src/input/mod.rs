@@ -1,6 +1,8 @@
 mod input_buffer;
 
-pub use input_buffer::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome};
+pub use input_buffer::{
+    Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome, PhysicalKey, TypedCharacter,
+};
 
 #[cfg(test)]
 mod input_buffer_certification;

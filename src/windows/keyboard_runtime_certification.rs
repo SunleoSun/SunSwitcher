@@ -1,14 +1,17 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_RETURN, VK_TAB,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7,
+    VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_TAB,
 };
+
+use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
 
 use super::keyboard_runtime::{
     KeyDownDisposition, RuntimeError, build_replacement_inputs,
-    foreground_change_requires_invalidation, keyup_suppression_after_injection,
-    preclassify_key_down,
+    foreground_change_requires_invalidation, injected_marker, is_foreign_injected_keyboard_event,
+    keyup_suppression_after_injection, physical_key_from_vk, preclassify_key_down,
 };
 use crate::correction::{CorrectionDecision, ReplacementText};
-use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome};
+use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome, PhysicalKey};
 use crate::replacement::ReplacementEngine;
 
 fn action(
@@ -83,6 +86,30 @@ fn certification_cyrillic_replacement_is_encoded_as_utf16_unicode_events() {
 }
 
 #[test]
+fn certification_windows_runtime_preserves_layout_ambiguous_physical_keys() {
+    for (vk_code, expected) in [
+        (VK_OEM_3, PhysicalKey::Grave),
+        (VK_OEM_4, PhysicalKey::LeftBracket),
+        (VK_OEM_6, PhysicalKey::RightBracket),
+        (VK_OEM_1, PhysicalKey::Semicolon),
+        (VK_OEM_7, PhysicalKey::Quote),
+        (VK_OEM_COMMA, PhysicalKey::Comma),
+        (VK_OEM_PERIOD, PhysicalKey::Period),
+    ] {
+        assert_eq!(physical_key_from_vk(vk_code as u32), expected);
+    }
+}
+
+#[test]
+fn certification_foreign_injected_input_cannot_become_owned_text_state() {
+    assert!(is_foreign_injected_keyboard_event(LLKHF_INJECTED, 0));
+    assert!(!is_foreign_injected_keyboard_event(
+        LLKHF_INJECTED,
+        injected_marker()
+    ));
+}
+
+#[test]
 fn certification_command_modified_editing_keys_fail_closed() {
     for vk_code in [VK_BACK, VK_RETURN, VK_TAB] {
         assert_eq!(
@@ -97,7 +124,7 @@ fn certification_foreground_change_discards_stale_token_before_next_boundary() {
     let mut buffer = InputBuffer::new();
     for character in "дял".chars() {
         assert_eq!(
-            buffer.process(InputEvent::Character(character)),
+            buffer.process(InputEvent::character(character)),
             InputOutcome::Continue
         );
     }
@@ -108,7 +135,7 @@ fn certification_foreground_change_discards_stale_token_before_next_boundary() {
         InputOutcome::Invalidated
     );
     assert_eq!(
-        buffer.process(InputEvent::Character(' ')),
+        buffer.process(InputEvent::character(' ')),
         InputOutcome::Continue
     );
 }

@@ -10,13 +10,15 @@ The current focus is proving reliable Windows text replacement before adding lan
 cargo run --bin replacement_probe
 ```
 
-Keep the probe running, focus any Windows text field, and type one of the probe rules followed by a boundary such as Space, punctuation, Enter, or Tab:
+Keep the probe running and focus any Windows text field. Focusing/clicking invalidates the tracked caret state intentionally, so press an unambiguous boundary such as Space once before the first test word. Then type an example followed by Space, Enter, or Tab:
 
-- `дял` -> `для`
+- `дял`, `ддля`, `ддляя`, `lkz`, `llkz`, `lzk` -> `для`
 - `тчо` -> `что`
-- `abcx` -> `ABC_REPLACED`
+- `hlelo`, `helllo`, `руддщ` -> `hello`
 
-The fixed rules exist only in the probe executable. The library contains typed input, correction-decision, replacement-planning, and Windows execution contracts so the probe provider can later be replaced without rewriting the replacement path.
+The typed-word probe now uses the language-agnostic lexical provider with separate Russian and English language packs. The current built-in dictionaries are deliberately small seed lexicons for architecture/certification rather than production-complete dictionaries. Candidate lookup uses a two-deletion index and weighted Damerau-style scoring: adjacent transpositions are cheap, accidental repeated-key deletions are cheaper than generic edits, and a keyboard-layout transform may be combined with those typo edits in the same candidate path.
+
+Representative certified examples include `дял`, `ддля`, `ддляя` -> `для`; `hlelo`, `helllo` -> `hello`; and wrong-layout-plus-typo inputs such as `lkz`, `llkz`, `lzk` -> `для` and `руддщ`, `рдудщ`, `рудддщ` -> `hello`. The Windows input contract also keeps the physical identity of layout-ambiguous OEM keys, so wrong-layout Russian words that appear in English layout with punctuation-looking characters are supported: `;bpym` -> `жизнь`, `'[j` -> `эхо`, `j,]trn` -> `объект`, `,scnhj` -> `быстро`, and `k.lb` -> `люди`. Literal punctuation remains literal (`hello,` stays unchanged, while `hlelo,` -> `hello,`), including punctuation that appears only after layout conversion (`руддщб` -> `hello,`, `рдудщб` -> `hello,`). A token that is already an exact dictionary word in any configured language is kept unchanged.
 
 ## Selected-text replacement probe
 

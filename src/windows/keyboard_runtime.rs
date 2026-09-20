@@ -1,23 +1,27 @@
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx, VK_BACK, VK_CAPITAL, VK_CONTROL,
     VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT,
-    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB, VK_UP,
+    VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
+    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    KBDLLHOOKSTRUCT, MSG, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
 };
 
-use crate::input::{Boundary, InputEvent};
+use crate::input::{Boundary, InputEvent, PhysicalKey, TypedCharacter};
 use crate::replacement::ReplacementAction;
 
 const SUNSWITCHER_INJECTED_MARKER: usize = 0x5355_4E53_5749_5443;
@@ -36,8 +40,11 @@ pub enum RuntimeDirective {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     AlreadyRunning,
+    RuntimeStateUnavailable,
     HookInstallFailed,
     MouseHookInstallFailed,
+    HookUninstallFailed,
+    MouseHookUninstallFailed,
     MessageLoopFailed,
     InjectionFailed { expected: u32, sent: u32 },
 }
@@ -50,7 +57,10 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(processor: Box<dyn InputProcessor>) -> Self {
+    fn new(mut processor: Box<dyn InputProcessor>) -> Self {
+        // The runtime cannot prove where the caret is when a hook is attached. Start fail-closed;
+        // the input owner may resume tracking after it observes an unambiguous boundary.
+        let _ = processor.process(InputEvent::Invalidate);
         Self {
             processor,
             keyboard_state: initial_keyboard_state(),
@@ -66,34 +76,7 @@ impl RuntimeState {
     }
 
     fn update_key_state(&mut self, vk_code: u32, is_key_down: bool) {
-        let Ok(index) = usize::try_from(vk_code) else {
-            return;
-        };
-        if index >= self.keyboard_state.len() {
-            return;
-        }
-        let was_down = self.keyboard_state[index] & 0x80 != 0;
-        if is_key_down {
-            if !was_down && is_toggle_key(vk_code) {
-                self.keyboard_state[index] ^= 0x01;
-            }
-            self.keyboard_state[index] |= 0x80;
-        } else {
-            self.keyboard_state[index] &= 0x7f;
-        }
-        self.sync_generic_modifier(VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
-        self.sync_generic_modifier(VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
-        self.sync_generic_modifier(VK_MENU, VK_LMENU, VK_RMENU);
-    }
-
-    fn sync_generic_modifier(&mut self, generic: u16, left: u16, right: u16) {
-        let active = self.keyboard_state[left as usize] & 0x80 != 0
-            || self.keyboard_state[right as usize] & 0x80 != 0;
-        if active {
-            self.keyboard_state[generic as usize] |= 0x80;
-        } else {
-            self.keyboard_state[generic as usize] &= 0x7f;
-        }
+        update_keyboard_state(&mut self.keyboard_state, vk_code, is_key_down);
     }
 
     fn command_modifier_active(&self) -> bool {
@@ -104,7 +87,60 @@ impl RuntimeState {
     }
 }
 
-static RUNTIME: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
+static RUNTIME: Mutex<Option<RuntimeState>> = Mutex::new(None);
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+const WM_SUNSWITCHER_STOP: u32 = WM_USER + 0x535;
+
+struct RuntimeRegistration;
+
+impl RuntimeRegistration {
+    fn install(processor: impl InputProcessor) -> Result<Self, RuntimeError> {
+        let mut runtime = RUNTIME
+            .lock()
+            .map_err(|_| RuntimeError::RuntimeStateUnavailable)?;
+        if runtime.is_some() {
+            return Err(RuntimeError::AlreadyRunning);
+        }
+        *runtime = Some(RuntimeState::new(Box::new(processor)));
+        Ok(Self)
+    }
+}
+
+impl Drop for RuntimeRegistration {
+    fn drop(&mut self) {
+        HOOK_THREAD_ID.store(0, Ordering::Release);
+        STOP_REQUESTED.store(false, Ordering::Release);
+        if let Ok(mut runtime) = RUNTIME.lock() {
+            *runtime = None;
+        }
+    }
+}
+
+struct HookGuard(HHOOK);
+
+impl HookGuard {
+    fn new(hook: HHOOK) -> Self {
+        Self(hook)
+    }
+
+    fn release(&mut self) -> bool {
+        if self.0.is_null() {
+            return true;
+        }
+        if unsafe { UnhookWindowsHookEx(self.0) } == 0 {
+            return false;
+        }
+        self.0 = null_mut();
+        true
+    }
+}
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
 
 fn current_foreground_window_id() -> usize {
     unsafe { GetForegroundWindow() as usize }
@@ -137,41 +173,116 @@ pub(super) fn is_toggle_key(vk_code: u32) -> bool {
         .any(|key| vk_code == key as u32)
 }
 
+pub(super) fn update_keyboard_state(state: &mut [u8; 256], vk_code: u32, is_key_down: bool) {
+    // Low-level physical events normally identify left/right modifiers, while automation may emit
+    // only VK_SHIFT/VK_CONTROL/VK_MENU. Internally treat a generic transition as the left side so
+    // it survives unrelated key events until the matching generic key-up arrives.
+    let tracked_vk = match vk_code as u16 {
+        VK_SHIFT => VK_LSHIFT as u32,
+        VK_CONTROL => VK_LCONTROL as u32,
+        VK_MENU => VK_LMENU as u32,
+        _ => vk_code,
+    };
+
+    let Ok(index) = usize::try_from(tracked_vk) else {
+        return;
+    };
+    if index >= state.len() {
+        return;
+    }
+
+    let was_down = state[index] & 0x80 != 0;
+    if is_key_down {
+        if !was_down && is_toggle_key(tracked_vk) {
+            state[index] ^= 0x01;
+        }
+        state[index] |= 0x80;
+    } else {
+        state[index] &= 0x7f;
+    }
+
+    sync_generic_modifier(state, VK_SHIFT, VK_LSHIFT, VK_RSHIFT);
+    sync_generic_modifier(state, VK_CONTROL, VK_LCONTROL, VK_RCONTROL);
+    sync_generic_modifier(state, VK_MENU, VK_LMENU, VK_RMENU);
+}
+
+fn sync_generic_modifier(state: &mut [u8; 256], generic: u16, left: u16, right: u16) {
+    let active = state[left as usize] & 0x80 != 0 || state[right as usize] & 0x80 != 0;
+    if active {
+        state[generic as usize] |= 0x80;
+    } else {
+        state[generic as usize] &= 0x7f;
+    }
+}
+
 pub fn run_global_keyboard_hook(processor: impl InputProcessor) -> Result<(), RuntimeError> {
-    RUNTIME
-        .set(Mutex::new(RuntimeState::new(Box::new(processor))))
-        .map_err(|_| RuntimeError::AlreadyRunning)?;
+    let _runtime_registration = RuntimeRegistration::install(processor)?;
 
     unsafe {
         let keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), null_mut(), 0);
         if keyboard_hook.is_null() {
             return Err(RuntimeError::HookInstallFailed);
         }
+        let mut keyboard_hook = HookGuard::new(keyboard_hook);
+
         let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), null_mut(), 0);
         if mouse_hook.is_null() {
-            UnhookWindowsHookEx(keyboard_hook);
-            return Err(RuntimeError::MouseHookInstallFailed);
+            return if keyboard_hook.release() {
+                Err(RuntimeError::MouseHookInstallFailed)
+            } else {
+                Err(RuntimeError::HookUninstallFailed)
+            };
         }
+        let mut mouse_hook = HookGuard::new(mouse_hook);
 
         let mut message: MSG = zeroed();
-        loop {
-            let result = GetMessageW(&mut message, null_mut(), 0, 0);
-            if result == -1 {
-                UnhookWindowsHookEx(mouse_hook);
-                UnhookWindowsHookEx(keyboard_hook);
-                return Err(RuntimeError::MessageLoopFailed);
+        PeekMessageW(&mut message, null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
+        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::Release);
+
+        let loop_result = if STOP_REQUESTED.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            loop {
+                let result = GetMessageW(&mut message, null_mut(), 0, 0);
+                if result == -1 {
+                    break Err(RuntimeError::MessageLoopFailed);
+                }
+                if result == 0 || message.message == WM_SUNSWITCHER_STOP {
+                    break Ok(());
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
-            if result == 0 {
-                break;
-            }
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
+        };
+
+        let mouse_released = mouse_hook.release();
+        let keyboard_released = keyboard_hook.release();
+        if !mouse_released {
+            return Err(RuntimeError::MouseHookUninstallFailed);
         }
-        UnhookWindowsHookEx(mouse_hook);
-        UnhookWindowsHookEx(keyboard_hook);
+        if !keyboard_released {
+            return Err(RuntimeError::HookUninstallFailed);
+        }
+        loop_result
+    }
+}
+
+pub fn request_global_keyboard_hook_stop() -> bool {
+    let thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
+    if thread_id == 0 {
+        let running = RUNTIME
+            .lock()
+            .map(|runtime| runtime.is_some())
+            .unwrap_or(false);
+        if !running {
+            return false;
+        }
+        STOP_REQUESTED.store(true, Ordering::Release);
+        return true;
     }
 
-    Ok(())
+    STOP_REQUESTED.store(true, Ordering::Release);
+    unsafe { PostThreadMessageW(thread_id, WM_SUNSWITCHER_STOP, 0, 0) != 0 }
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
@@ -191,58 +302,121 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
     }
 
-    let Some(runtime) = RUNTIME.get() else {
-        return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
-    };
-    let Ok(mut runtime) = runtime.lock() else {
-        return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
-    };
-
-    if is_key_down {
-        let foreground_window_id = current_foreground_window_id();
-        if runtime.sync_foreground_window(foreground_window_id) {
+    if is_foreign_injected_keyboard_event(event.flags, event.dwExtraInfo) {
+        // Ask downstream hooks first: if one suppresses the injected transition, it must not
+        // become part of our modifier/toggle state. The attempted foreign edit still invalidates
+        // owned text either way.
+        let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+        if let Ok(mut runtime_slot) = RUNTIME.lock()
+            && let Some(runtime) = runtime_slot.as_mut()
+        {
+            if next_result == 0 {
+                runtime.update_key_state(event.vkCode, is_key_down);
+            }
             let _ = runtime.processor.process(InputEvent::Invalidate);
         }
+        return next_result;
     }
 
-    runtime.update_key_state(event.vkCode, is_key_down);
+    let state = {
+        let Ok(mut runtime_slot) = RUNTIME.lock() else {
+            return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+        };
+        let Some(runtime) = runtime_slot.as_mut() else {
+            return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+        };
 
-    if is_key_up {
-        if runtime.suppressed_keyup_vk == Some(event.vkCode) {
-            runtime.suppressed_keyup_vk = None;
-            return 1;
+        if is_key_down {
+            let foreground_window_id = current_foreground_window_id();
+            if runtime.sync_foreground_window(foreground_window_id) {
+                let _ = runtime.processor.process(InputEvent::Invalidate);
+            }
         }
-        return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
-    }
 
-    let Some(input_event) = classify_key_down(event, &runtime) else {
-        return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+        runtime.update_key_state(event.vkCode, is_key_down);
+
+        if is_key_up {
+            let suppress = runtime.suppressed_keyup_vk == Some(event.vkCode);
+            if suppress {
+                runtime.suppressed_keyup_vk = None;
+            }
+            HookEventState::KeyUp { suppress }
+        } else {
+            let directive = classify_key_down(event, runtime)
+                .map(|input_event| runtime.processor.process(input_event))
+                .unwrap_or(RuntimeDirective::Pass);
+            HookEventState::KeyDown(directive)
+        }
     };
-    let directive = runtime.processor.process(input_event);
-    match directive {
-        RuntimeDirective::Pass => unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) },
-        RuntimeDirective::Replace(action) => {
+
+    match state {
+        HookEventState::KeyUp { suppress } => {
+            let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+            if suppress { 1 } else { next_result }
+        }
+        HookEventState::KeyDown(RuntimeDirective::Pass) => {
+            let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+            if next_result != 0 {
+                invalidate_runtime_tracking();
+            }
+            next_result
+        }
+        HookEventState::KeyDown(RuntimeDirective::Replace(action)) => {
+            // Let downstream hooks observe the real physical event before SunSwitcher suppresses
+            // it from the target application. This keeps other low-level hook state machines in
+            // sync instead of starving them of the boundary key that triggered replacement.
+            let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+            if next_result != 0 {
+                // A downstream hook suppressed the boundary that completed our token, so the
+                // application's visible caret/text state no longer has the boundary we assumed.
+                // Stay desynchronized until a later unambiguous boundary reaches the stream.
+                invalidate_runtime_tracking();
+                return next_result;
+            }
+
             let injection_result = inject_replacement(&action);
             if let Some(vk_code) =
                 keyup_suppression_after_injection(event.vkCode, &injection_result)
             {
-                runtime.suppressed_keyup_vk = Some(vk_code);
+                if let Ok(mut runtime_slot) = RUNTIME.lock()
+                    && let Some(runtime) = runtime_slot.as_mut()
+                {
+                    runtime.suppressed_keyup_vk = Some(vk_code);
+                }
                 return 1;
             }
 
             if let Err(error) = injection_result {
                 eprintln!("SunSwitcher replacement injection failed: {error:?}");
             }
-            unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) }
+            next_result
         }
     }
+}
+
+#[derive(Debug)]
+enum HookEventState {
+    KeyDown(RuntimeDirective),
+    KeyUp { suppress: bool },
+}
+
+fn invalidate_runtime_tracking() {
+    if let Ok(mut runtime_slot) = RUNTIME.lock()
+        && let Some(runtime) = runtime_slot.as_mut()
+    {
+        let _ = runtime.processor.process(InputEvent::Invalidate);
+    }
+}
+
+pub(super) fn is_foreign_injected_keyboard_event(flags: u32, extra_info: usize) -> bool {
+    flags & LLKHF_INJECTED != 0 && extra_info != SUNSWITCHER_INJECTED_MARKER
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if code >= 0
         && mouse_message_invalidates_tracking(w_param as u32)
-        && let Some(runtime) = RUNTIME.get()
-        && let Ok(mut runtime) = runtime.lock()
+        && let Ok(mut runtime_slot) = RUNTIME.lock()
+        && let Some(runtime) = runtime_slot.as_mut()
     {
         let _ = runtime.processor.process(InputEvent::Invalidate);
     }
@@ -323,7 +497,7 @@ fn is_state_invalidating_key(vk_code: u32) -> bool {
     .any(|key| vk_code == key as u32)
 }
 
-fn translate_key(event: &KBDLLHOOKSTRUCT, keyboard_state: &[u8; 256]) -> Option<char> {
+fn translate_key(event: &KBDLLHOOKSTRUCT, keyboard_state: &[u8; 256]) -> Option<TypedCharacter> {
     let foreground = unsafe { GetForegroundWindow() };
     let thread_id = if foreground.is_null() {
         0
@@ -350,7 +524,21 @@ fn translate_key(event: &KBDLLHOOKSTRUCT, keyboard_state: &[u8; 256]) -> Option<
     let decoded: Vec<char> = char::decode_utf16(utf16[..written as usize].iter().copied())
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
-    (decoded.len() == 1).then_some(decoded[0])
+    (decoded.len() == 1)
+        .then(|| TypedCharacter::new(decoded[0], physical_key_from_vk(event.vkCode)))
+}
+
+pub(super) fn physical_key_from_vk(vk_code: u32) -> PhysicalKey {
+    match vk_code as u16 {
+        VK_OEM_3 => PhysicalKey::Grave,
+        VK_OEM_4 => PhysicalKey::LeftBracket,
+        VK_OEM_6 => PhysicalKey::RightBracket,
+        VK_OEM_1 => PhysicalKey::Semicolon,
+        VK_OEM_7 => PhysicalKey::Quote,
+        VK_OEM_COMMA => PhysicalKey::Comma,
+        VK_OEM_PERIOD => PhysicalKey::Period,
+        _ => PhysicalKey::Other,
+    }
 }
 
 fn inject_replacement(action: &ReplacementAction) -> Result<(), RuntimeError> {
