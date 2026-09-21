@@ -8,16 +8,18 @@ use crate::language::{
     DictionaryEntry, LanguageId, LanguagePack, LanguagePackError, language_pack_from_entries,
     normalize_word,
 };
-use crate::lexicon::{UserLexicon, UserLexiconError, UserTerm, UserTermProtection};
+use crate::lexicon::{UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 const SCHEMA_V1: &str = r#"
 CREATE TABLE app_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    clipboard_history_limit INTEGER NOT NULL CHECK (clipboard_history_limit > 0)
+    clipboard_history_limit INTEGER NOT NULL CHECK (clipboard_history_limit > 0),
+    undo_hotkey TEXT NOT NULL DEFAULT 'pause'
 ) STRICT;
 
-INSERT INTO app_settings (singleton, clipboard_history_limit) VALUES (1, 1000);
+INSERT INTO app_settings (singleton, clipboard_history_limit, undo_hotkey)
+VALUES (1, 1000, 'pause');
 
 CREATE TABLE languages (
     id INTEGER PRIMARY KEY,
@@ -25,6 +27,10 @@ CREATE TABLE languages (
     display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
 ) STRICT;
+
+INSERT INTO languages (code, display_name) VALUES
+    ('ru', 'Russian'),
+    ('en', 'English');
 
 CREATE TABLE dictionary_words (
     id INTEGER PRIMARY KEY,
@@ -35,12 +41,151 @@ CREATE TABLE dictionary_words (
     UNIQUE (language_id, normalized_term)
 ) STRICT;
 
-CREATE TABLE user_terms (
+WITH seed(term, frequency) AS (VALUES
+    ('для', 1000),
+    ('что', 980),
+    ('это', 970),
+    ('как', 960),
+    ('привет', 940),
+    ('жизнь', 935),
+    ('хорошо', 930),
+    ('ёлка', 925),
+    ('можно', 920),
+    ('объект', 915),
+    ('нужно', 910),
+    ('быстро', 905),
+    ('если', 900),
+    ('люди', 895),
+    ('да', 890),
+    ('эхо', 885),
+    ('нет', 880),
+    ('юг', 875),
+    ('мир', 860),
+    ('текст', 850),
+    ('слово', 840),
+    ('тест', 830),
+    ('язык', 820),
+    ('работа', 810),
+    ('окно', 800),
+    ('программа', 790),
+    ('исправление', 780),
+    ('ошибка', 770),
+    ('ошибки', 760),
+    ('русский', 750),
+    ('английский', 740),
+    ('сейчас', 730),
+    ('потом', 720),
+    ('пример', 710),
+    ('клавиатура', 700),
+    ('предложение', 690)
+)
+INSERT INTO dictionary_words (language_id, term, normalized_term, frequency)
+SELECT languages.id, seed.term, seed.term, seed.frequency
+FROM seed CROSS JOIN languages
+WHERE languages.code = 'ru';
+
+WITH seed(term, frequency) AS (VALUES
+    ('the', 1000),
+    ('and', 990),
+    ('this', 970),
+    ('that', 960),
+    ('hello', 950),
+    ('world', 940),
+    ('for', 930),
+    ('with', 920),
+    ('yes', 900),
+    ('no', 890),
+    ('if', 880),
+    ('can', 870),
+    ('need', 860),
+    ('text', 850),
+    ('word', 840),
+    ('test', 830),
+    ('language', 820),
+    ('work', 810),
+    ('window', 800),
+    ('program', 790),
+    ('correction', 780),
+    ('error', 770),
+    ('errors', 760),
+    ('english', 750),
+    ('russian', 740),
+    ('now', 730),
+    ('later', 720),
+    ('example', 710),
+    ('keyboard', 700),
+    ('sentence', 690)
+)
+INSERT INTO dictionary_words (language_id, term, normalized_term, frequency)
+SELECT languages.id, seed.term, seed.term, seed.frequency
+FROM seed CROSS JOIN languages
+WHERE languages.code = 'en';
+
+WITH surface(term, frequency) AS (VALUES
+    ('этот', 900), ('эта', 895), ('эту', 890), ('этой', 885), ('эти', 880),
+    ('этого', 875), ('этому', 870), ('этим', 865), ('этом', 860), ('этих', 855), ('этими', 850),
+    ('привета', 820), ('привету', 810), ('приветом', 800), ('привете', 790),
+    ('приветы', 780), ('приветов', 770), ('приветам', 760), ('приветами', 750), ('приветах', 740),
+    ('жизни', 900), ('жизнью', 850), ('жизней', 840), ('жизням', 800), ('жизнями', 790), ('жизнях', 780),
+    ('ёлки', 880), ('ёлке', 850), ('ёлку', 850), ('ёлкой', 820), ('ёлок', 810), ('ёлкам', 780), ('ёлками', 770), ('ёлках', 760),
+    ('объекта', 890), ('объекту', 860), ('объектом', 850), ('объекте', 840), ('объекты', 850),
+    ('объектов', 840), ('объектам', 800), ('объектами', 790), ('объектах', 780),
+    ('людей', 890), ('людям', 850), ('людьми', 840), ('людях', 820),
+    ('мира', 840), ('миру', 820), ('миром', 810), ('мире', 800), ('миры', 780),
+    ('миров', 790), ('мирам', 760), ('мирами', 750), ('мирах', 740),
+    ('текста', 830), ('тексту', 810), ('текстом', 800), ('тексте', 790), ('тексты', 800),
+    ('текстов', 790), ('текстам', 760), ('текстами', 750), ('текстах', 740),
+    ('слова', 835), ('слову', 830), ('словом', 820), ('слове', 810), ('слов', 800),
+    ('словам', 780), ('словами', 770), ('словах', 760),
+    ('теста', 810), ('тесту', 790), ('тестом', 780), ('тесте', 770), ('тесты', 790),
+    ('тестов', 780), ('тестам', 750), ('тестами', 740), ('тестах', 730),
+    ('языка', 810), ('языку', 790), ('языком', 780), ('языке', 770), ('языки', 790),
+    ('языков', 780), ('языкам', 750), ('языками', 740), ('языках', 730),
+    ('работы', 800), ('работе', 790), ('работу', 790), ('работой', 770), ('работ', 760),
+    ('работам', 740), ('работами', 730), ('работах', 720),
+    ('окна', 800), ('окну', 780), ('окном', 770), ('окне', 760), ('окон', 750),
+    ('окнам', 730), ('окнами', 720), ('окнах', 710),
+    ('программы', 790), ('программе', 780), ('программу', 780), ('программой', 760), ('программ', 750),
+    ('программам', 730), ('программами', 720), ('программах', 710),
+    ('исправления', 780), ('исправлению', 760), ('исправлением', 750), ('исправлении', 740),
+    ('исправлений', 730), ('исправлениям', 710), ('исправлениями', 700), ('исправлениях', 690),
+    ('ошибке', 750), ('ошибку', 750), ('ошибкой', 730), ('ошибок', 720),
+    ('ошибкам', 700), ('ошибками', 690), ('ошибках', 680),
+    ('русского', 740), ('русскому', 730), ('русским', 720), ('русском', 710),
+    ('русская', 730), ('русской', 720), ('русскую', 710), ('русское', 720),
+    ('русские', 720), ('русских', 710), ('русскими', 700),
+    ('английского', 730), ('английскому', 720), ('английским', 710), ('английском', 700),
+    ('английская', 720), ('английской', 710), ('английскую', 700), ('английское', 710),
+    ('английские', 710), ('английских', 700), ('английскими', 690),
+    ('примера', 700), ('примеру', 690), ('примером', 680), ('примере', 670), ('примеры', 690),
+    ('примеров', 680), ('примерам', 660), ('примерами', 650), ('примерах', 640),
+    ('клавиатуры', 690), ('клавиатуре', 680), ('клавиатуру', 680), ('клавиатурой', 660),
+    ('клавиатур', 650), ('клавиатурам', 630), ('клавиатурами', 620), ('клавиатурах', 610),
+    ('предложения', 680), ('предложению', 660), ('предложением', 650), ('предложении', 640),
+    ('предложений', 630), ('предложениям', 610), ('предложениями', 600), ('предложениях', 590)
+)
+INSERT OR IGNORE INTO dictionary_words (language_id, term, normalized_term, frequency)
+SELECT languages.id, surface.term, surface.term, surface.frequency
+FROM surface CROSS JOIN languages
+WHERE languages.code = 'ru';
+
+WITH surface(term, frequency) AS (VALUES
+    ('these', 940), ('those', 930),
+    ('worlds', 900), ('needs', 850), ('needed', 840), ('needing', 810),
+    ('texts', 820), ('words', 820), ('tests', 810), ('languages', 800),
+    ('works', 790), ('worked', 780), ('working', 800), ('windows', 790),
+    ('programs', 780), ('programmed', 750), ('programming', 770),
+    ('corrections', 760), ('examples', 700), ('keyboards', 690), ('sentences', 680), ('hellos', 650)
+)
+INSERT OR IGNORE INTO dictionary_words (language_id, term, normalized_term, frequency)
+SELECT languages.id, surface.term, surface.term, surface.frequency
+FROM surface CROSS JOIN languages
+WHERE languages.code = 'en';
+
+CREATE TABLE user_words (
     id INTEGER PRIMARY KEY,
     term TEXT NOT NULL CHECK (length(term) > 0),
     normalized_term TEXT NOT NULL UNIQUE CHECK (length(normalized_term) > 0),
-    language_id INTEGER REFERENCES languages(id) ON DELETE SET NULL,
-    protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0, 1)),
     use_count INTEGER NOT NULL DEFAULT 1 CHECK (use_count > 0),
     last_used_at_ms INTEGER NOT NULL
 ) STRICT;
@@ -94,113 +239,6 @@ CREATE TABLE clipboard_files (
     path TEXT NOT NULL CHECK (length(path) > 0),
     PRIMARY KEY (entry_id, position)
 ) STRICT;
-"#;
-
-const SCHEMA_V2: &str = r#"
-INSERT OR IGNORE INTO languages (code, display_name) VALUES
-    ('ru', 'Russian'),
-    ('en', 'English');
-
-WITH seed(term, frequency) AS (VALUES
-    ('для', 1000),
-    ('что', 980),
-    ('это', 970),
-    ('как', 960),
-    ('привет', 940),
-    ('жизнь', 935),
-    ('хорошо', 930),
-    ('ёлка', 925),
-    ('можно', 920),
-    ('объект', 915),
-    ('нужно', 910),
-    ('быстро', 905),
-    ('если', 900),
-    ('люди', 895),
-    ('да', 890),
-    ('эхо', 885),
-    ('нет', 880),
-    ('юг', 875),
-    ('мир', 860),
-    ('текст', 850),
-    ('слово', 840),
-    ('тест', 830),
-    ('язык', 820),
-    ('работа', 810),
-    ('окно', 800),
-    ('программа', 790),
-    ('исправление', 780),
-    ('ошибка', 770),
-    ('ошибки', 760),
-    ('русский', 750),
-    ('английский', 740),
-    ('сейчас', 730),
-    ('потом', 720),
-    ('пример', 710),
-    ('клавиатура', 700),
-    ('предложение', 690)
-)
-INSERT OR IGNORE INTO dictionary_words (language_id, term, normalized_term, frequency)
-SELECT languages.id, seed.term, seed.term, seed.frequency
-FROM seed CROSS JOIN languages
-WHERE languages.code = 'ru';
-
-WITH seed(term, frequency) AS (VALUES
-    ('the', 1000),
-    ('and', 990),
-    ('this', 970),
-    ('that', 960),
-    ('hello', 950),
-    ('world', 940),
-    ('for', 930),
-    ('with', 920),
-    ('yes', 900),
-    ('no', 890),
-    ('if', 880),
-    ('can', 870),
-    ('need', 860),
-    ('text', 850),
-    ('word', 840),
-    ('test', 830),
-    ('language', 820),
-    ('work', 810),
-    ('window', 800),
-    ('program', 790),
-    ('correction', 780),
-    ('error', 770),
-    ('errors', 760),
-    ('english', 750),
-    ('russian', 740),
-    ('now', 730),
-    ('later', 720),
-    ('example', 710),
-    ('keyboard', 700),
-    ('sentence', 690)
-)
-INSERT OR IGNORE INTO dictionary_words (language_id, term, normalized_term, frequency)
-SELECT languages.id, seed.term, seed.term, seed.frequency
-FROM seed CROSS JOIN languages
-WHERE languages.code = 'en';
-"#;
-
-const SCHEMA_V3: &str = r#"
-ALTER TABLE app_settings ADD COLUMN undo_hotkey TEXT NOT NULL DEFAULT 'print_screen';
-"#;
-
-const SCHEMA_V4: &str = r#"
-UPDATE app_settings SET undo_hotkey = 'pause' WHERE undo_hotkey = 'print_screen';
-
-ALTER TABLE user_terms RENAME TO user_terms_v3;
-CREATE TABLE user_terms (
-    id INTEGER PRIMARY KEY,
-    term TEXT NOT NULL CHECK (length(term) > 0),
-    normalized_term TEXT NOT NULL UNIQUE CHECK (length(normalized_term) > 0),
-    protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0, 1)),
-    use_count INTEGER NOT NULL DEFAULT 1 CHECK (use_count > 0),
-    last_used_at_ms INTEGER NOT NULL
-) STRICT;
-INSERT INTO user_terms (id, term, normalized_term, protected, use_count, last_used_at_ms)
-SELECT id, term, normalized_term, protected, use_count, last_used_at_ms FROM user_terms_v3;
-DROP TABLE user_terms_v3;
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,8 +379,7 @@ pub enum DatabaseError {
     InvalidStoredClipboardHistoryLimit(i64),
     InvalidStoredUndoHotkey(String),
     InvalidStoredDictionaryFrequency(i64),
-    InvalidStoredUserTermUseCount(i64),
-    InvalidStoredUserTermProtection(i64),
+    InvalidStoredUserWordUseCount(i64),
     InvalidCorrectionText,
     CorrectionEventNotFound(i64),
     CorrectionEventAlreadyUndone(i64),
@@ -372,11 +409,8 @@ impl Display for DatabaseError {
             Self::InvalidStoredDictionaryFrequency(value) => {
                 write!(formatter, "invalid stored dictionary frequency: {value}")
             }
-            Self::InvalidStoredUserTermUseCount(value) => {
-                write!(formatter, "invalid stored user term use count: {value}")
-            }
-            Self::InvalidStoredUserTermProtection(value) => {
-                write!(formatter, "invalid stored user term protection: {value}")
+            Self::InvalidStoredUserWordUseCount(value) => {
+                write!(formatter, "invalid stored user word use count: {value}")
             }
             Self::InvalidCorrectionText => formatter.write_str("invalid correction event text"),
             Self::CorrectionEventNotFound(id) => {
@@ -525,14 +559,9 @@ impl Database {
         Ok(packs)
     }
 
-    pub fn record_user_term(
-        &self,
-        term: &str,
-        protection: UserTermProtection,
-        used_at_ms: i64,
-    ) -> Result<UserTerm, DatabaseError> {
-        let input = UserTerm::try_new(term, protection, 1, used_at_ms)?;
-        upsert_user_term(&self.connection, &input)
+    pub fn record_user_word(&self, term: &str, used_at_ms: i64) -> Result<UserWord, DatabaseError> {
+        let input = UserWord::try_new(term, 1, used_at_ms)?;
+        upsert_user_word(&self.connection, &input)
     }
 
     pub fn record_correction_event(
@@ -586,7 +615,7 @@ impl Database {
         &mut self,
         event_id: CorrectionEventId,
         undone_at_ms: i64,
-    ) -> Result<UserTerm, DatabaseError> {
+    ) -> Result<UserWord, DatabaseError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -606,13 +635,8 @@ impl Database {
             return Err(DatabaseError::CorrectionEventAlreadyUndone(event_id.get()));
         }
 
-        let protected = UserTerm::try_new(
-            original_text,
-            UserTermProtection::Protected,
-            1,
-            undone_at_ms,
-        )?;
-        let stored = upsert_user_term(&transaction, &protected)?;
+        let accepted = UserWord::try_new(original_text, 1, undone_at_ms)?;
+        let stored = upsert_user_word(&transaction, &accepted)?;
         let changed = transaction.execute(
             "UPDATE correction_events SET undone_at_ms = ?1 WHERE id = ?2 AND undone_at_ms IS NULL",
             params![undone_at_ms, event_id.get()],
@@ -626,24 +650,18 @@ impl Database {
 
     pub fn load_user_lexicon(&self) -> Result<UserLexicon, DatabaseError> {
         let mut statement = self.connection.prepare(
-            "SELECT term, normalized_term, protected, use_count, last_used_at_ms FROM user_terms ORDER BY normalized_term",
+            "SELECT term, normalized_term, use_count, last_used_at_ms FROM user_words ORDER BY normalized_term",
         )?;
-        let stored: Vec<(String, String, i64, i64, i64)> = statement
+        let stored: Vec<(String, String, i64, i64)> = statement
             .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<_, _>>()?;
-        let mut terms = Vec::with_capacity(stored.len());
+        let mut words = Vec::with_capacity(stored.len());
         for row in stored {
-            terms.push(user_term_from_stored(row)?);
+            words.push(user_word_from_stored(row)?);
         }
-        Ok(UserLexicon::try_new(terms)?)
+        Ok(UserLexicon::try_new(words)?)
     }
 }
 
@@ -654,35 +672,20 @@ fn validate_correction_text(text: &str) -> Result<(), DatabaseError> {
     Ok(())
 }
 
-fn upsert_user_term(connection: &Connection, input: &UserTerm) -> Result<UserTerm, DatabaseError> {
+fn upsert_user_word(connection: &Connection, input: &UserWord) -> Result<UserWord, DatabaseError> {
     let stored = connection.query_row(
         r#"
-INSERT INTO user_terms (term, normalized_term, protected, use_count, last_used_at_ms)
-VALUES (?1, ?2, ?3, 1, ?4)
+INSERT INTO user_words (term, normalized_term, use_count, last_used_at_ms)
+VALUES (?1, ?2, 1, ?3)
 ON CONFLICT(normalized_term) DO UPDATE SET
-    term = CASE
-        WHEN excluded.protected = 1 THEN excluded.term
-        WHEN user_terms.protected = 1 THEN user_terms.term
-        WHEN excluded.last_used_at_ms >= user_terms.last_used_at_ms THEN excluded.term
-        ELSE user_terms.term
-    END,
-    protected = CASE
-        WHEN user_terms.protected = 1 OR excluded.protected = 1 THEN 1
-        ELSE 0
-    END,
-    use_count = user_terms.use_count + 1,
-    last_used_at_ms = MAX(user_terms.last_used_at_ms, excluded.last_used_at_ms)
-RETURNING term, normalized_term, protected, use_count, last_used_at_ms
+    use_count = user_words.use_count + 1,
+    last_used_at_ms = MAX(user_words.last_used_at_ms, excluded.last_used_at_ms)
+RETURNING term, normalized_term, use_count, last_used_at_ms
 "#,
         params![
             input.term(),
             input.normalized_term(),
-            if input.protection().is_protected() {
-                1_i64
-            } else {
-                0_i64
-            },
-            input.last_used_at_ms(),
+            input.last_used_at_ms()
         ],
         |row| {
             Ok((
@@ -690,36 +693,23 @@ RETURNING term, normalized_term, protected, use_count, last_used_at_ms
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
             ))
         },
     )?;
-    user_term_from_stored(stored)
+    user_word_from_stored(stored)
 }
 
-fn user_term_from_stored(
-    stored: (String, String, i64, i64, i64),
-) -> Result<UserTerm, DatabaseError> {
-    let (term, normalized_term, stored_protection, stored_use_count, last_used_at_ms) = stored;
+fn user_word_from_stored(stored: (String, String, i64, i64)) -> Result<UserWord, DatabaseError> {
+    let (term, normalized_term, stored_use_count, last_used_at_ms) = stored;
     if normalize_word(&term) != normalized_term {
         return Err(DatabaseError::InvalidStoredNormalizedTerm {
             term,
             normalized_term,
         });
     }
-    let protection = match stored_protection {
-        0 => UserTermProtection::Normal,
-        1 => UserTermProtection::Protected,
-        value => return Err(DatabaseError::InvalidStoredUserTermProtection(value)),
-    };
     let use_count = u32::try_from(stored_use_count)
-        .map_err(|_| DatabaseError::InvalidStoredUserTermUseCount(stored_use_count))?;
-    Ok(UserTerm::try_new(
-        term,
-        protection,
-        use_count,
-        last_used_at_ms,
-    )?)
+        .map_err(|_| DatabaseError::InvalidStoredUserWordUseCount(stored_use_count))?;
+    Ok(UserWord::try_new(term, use_count, last_used_at_ms)?)
 }
 
 fn schema_version(connection: &Connection) -> Result<i64, DatabaseError> {
@@ -727,7 +717,7 @@ fn schema_version(connection: &Connection) -> Result<i64, DatabaseError> {
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
-    let mut version = schema_version(connection)?;
+    let version = schema_version(connection)?;
     if version > CURRENT_SCHEMA_VERSION {
         return Err(DatabaseError::SchemaTooNew {
             found: version,
@@ -735,21 +725,11 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         });
     }
 
-    for (target_version, sql) in [
-        (1_i64, SCHEMA_V1),
-        (2_i64, SCHEMA_V2),
-        (3_i64, SCHEMA_V3),
-        (4_i64, SCHEMA_V4),
-    ] {
-        if version >= target_version {
-            continue;
-        }
-
+    if version < CURRENT_SCHEMA_VERSION {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(sql)?;
-        transaction.pragma_update(None, "user_version", target_version)?;
+        transaction.execute_batch(SCHEMA_V1)?;
+        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;
-        version = target_version;
     }
 
     Ok(())

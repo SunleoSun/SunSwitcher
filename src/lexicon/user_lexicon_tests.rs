@@ -1,21 +1,21 @@
-use super::{UserLexicon, UserLexiconError, UserTerm, UserTermProtection};
+use super::{UserLexicon, UserLexiconError, UserWord};
 
-fn term(value: &str, protection: UserTermProtection, use_count: u32, last_used: i64) -> UserTerm {
-    UserTerm::try_new(value, protection, use_count, last_used).unwrap()
+fn word(value: &str, use_count: u32, last_used: i64) -> UserWord {
+    UserWord::try_new(value, use_count, last_used).unwrap()
 }
 
 #[test]
-fn user_term_contract_rejects_unrepresentable_values() {
+fn user_word_contract_rejects_unrepresentable_values() {
     assert_eq!(
-        UserTerm::try_new("", UserTermProtection::Normal, 1, 0),
+        UserWord::try_new("", 1, 0),
         Err(UserLexiconError::InvalidTerm)
     );
     assert_eq!(
-        UserTerm::try_new("two words", UserTermProtection::Normal, 1, 0),
+        UserWord::try_new("two words", 1, 0),
         Err(UserLexiconError::InvalidTerm)
     );
     assert_eq!(
-        UserTerm::try_new("word", UserTermProtection::Normal, 0, 0),
+        UserWord::try_new("word", 0, 0),
         Err(UserLexiconError::InvalidUseCount)
     );
 }
@@ -23,13 +23,8 @@ fn user_term_contract_rejects_unrepresentable_values() {
 #[test]
 fn normalized_duplicates_are_rejected_instead_of_competing() {
     let result = UserLexicon::try_new(vec![
-        term("QuantileEntryStrategy", UserTermProtection::Normal, 1, 10),
-        term(
-            "quantileentrystrategy",
-            UserTermProtection::Protected,
-            1,
-            20,
-        ),
+        word("QuantileEntryStrategy", 1, 10),
+        word("quantileentrystrategy", 1, 20),
     ]);
     assert!(matches!(
         result,
@@ -39,13 +34,7 @@ fn normalized_duplicates_are_rejected_instead_of_competing() {
 
 #[test]
 fn delete_index_finds_typo_candidates_without_losing_canonical_spelling() {
-    let lexicon = UserLexicon::try_new(vec![term(
-        "QuantileEntryStrategy",
-        UserTermProtection::Normal,
-        3,
-        100,
-    )])
-    .unwrap();
+    let lexicon = UserLexicon::try_new(vec![word("QuantileEntryStrategy", 3, 100)]).unwrap();
 
     let candidates = lexicon.candidate_entries("quanntileentrysrtategy", 2);
     assert!(candidates.iter().any(|candidate| {
@@ -57,13 +46,8 @@ fn delete_index_finds_typo_candidates_without_losing_canonical_spelling() {
 #[test]
 fn prefix_matches_rank_recency_before_frequency() {
     let lexicon = UserLexicon::try_new(vec![
-        term("QuantileEntryStrategy", UserTermProtection::Normal, 20, 100),
-        term(
-            "QuantileEntryStrategy1",
-            UserTermProtection::Protected,
-            1,
-            200,
-        ),
+        word("QuantileEntryStrategy", 20, 100),
+        word("QuantileEntryStrategy1", 1, 200),
     ])
     .unwrap();
 

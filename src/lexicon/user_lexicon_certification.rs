@@ -1,16 +1,10 @@
-use super::{UserLexicon, UserTerm, UserTermProtection};
+use super::{UserLexicon, UserWord};
 
 #[test]
 fn certification_user_lexicon_supports_known_word_typo_and_prefix_views_from_one_snapshot() {
     let lexicon = UserLexicon::try_new(vec![
-        UserTerm::try_new("QuantileEntryStrategy", UserTermProtection::Normal, 4, 100).unwrap(),
-        UserTerm::try_new(
-            "QuantileEntryStrategy1",
-            UserTermProtection::Protected,
-            1,
-            200,
-        )
-        .unwrap(),
+        UserWord::try_new("QuantileEntryStrategy", 4, 100).unwrap(),
+        UserWord::try_new("QuantileEntryStrategy1", 1, 200).unwrap(),
     ])
     .unwrap();
 

@@ -142,7 +142,7 @@ fn certification_reentrant_foreground_change_invalidates_inflight_side_effect_ow
 }
 
 #[test]
-fn certification_foreground_change_discards_stale_token_before_next_boundary() {
+fn certification_foreground_change_discards_stale_token_but_fresh_typing_restarts_tracking() {
     let mut buffer = InputBuffer::new();
     for character in "дял".chars() {
         assert_eq!(
@@ -156,10 +156,16 @@ fn certification_foreground_change_discards_stale_token_before_next_boundary() {
         buffer.process(InputEvent::Invalidate),
         InputOutcome::Invalidated
     );
-    assert_eq!(
-        buffer.process(InputEvent::character(' ')),
-        InputOutcome::Continue
-    );
+    for character in "привте".chars() {
+        assert_eq!(
+            buffer.process(InputEvent::character(character)),
+            InputOutcome::Continue
+        );
+    }
+    let InputOutcome::Completed(token) = buffer.process(InputEvent::character(' ')) else {
+        panic!("fresh typing after foreground invalidation should be tracked immediately");
+    };
+    assert_eq!(token.text(), "привте");
 }
 
 #[test]

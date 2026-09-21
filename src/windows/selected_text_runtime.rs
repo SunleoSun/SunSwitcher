@@ -49,6 +49,7 @@ pub struct SelectedTextSession {
 impl SelectedTextSession {
     pub fn capture() -> Result<Option<Self>, SelectedTextRuntimeError> {
         let mut snapshot = ClipboardSnapshot::capture()?;
+        let _observation_guard = super::clipboard_listener::InternalClipboardMutationGuard::begin();
         let sequence_before_copy = unsafe { GetClipboardSequenceNumber() };
 
         inject_ctrl_chord(VK_C)?;
@@ -57,7 +58,7 @@ impl SelectedTextSession {
             return Ok(None);
         }
 
-        let copied_text = read_unicode_clipboard();
+        let copied_text = read_unicode_clipboard_text();
         snapshot.restore()?;
 
         let Some(text) = copied_text? else {
@@ -165,7 +166,7 @@ impl ClipboardSnapshot {
         ) {
             ClipboardSnapshotMode::Empty => ClipboardSnapshotKind::Empty,
             ClipboardSnapshotMode::UnicodeText => {
-                let Some(text) = read_unicode_clipboard()? else {
+                let Some(text) = read_unicode_clipboard_text()? else {
                     return Err(SelectedTextRuntimeError::ClipboardSnapshotFailed);
                 };
                 ClipboardSnapshotKind::UnicodeText(text)
@@ -257,7 +258,7 @@ fn clipboard_snapshot_matches(
     match expected {
         ClipboardSnapshotKind::Empty => Ok(unsafe { CountClipboardFormats() } == 0),
         ClipboardSnapshotKind::UnicodeText(expected_text) => {
-            let actual = read_unicode_clipboard()?;
+            let actual = read_unicode_clipboard_text()?;
             Ok(actual.as_deref() == Some(expected_text.as_str()))
         }
         ClipboardSnapshotKind::FileDrop(expected_file) => {
@@ -306,7 +307,27 @@ fn wait_for_clipboard_change(previous: u32, timeout: Duration) -> bool {
     false
 }
 
-fn read_unicode_clipboard() -> Result<Option<String>, SelectedTextRuntimeError> {
+pub(super) fn read_observable_clipboard_text() -> Result<Option<String>, SelectedTextRuntimeError> {
+    let format_count = unsafe { CountClipboardFormats() };
+    let unicode_text_available = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT as u32) } != 0;
+    let file_drop_available = unsafe { IsClipboardFormatAvailable(CF_HDROP as u32) } != 0;
+    let image_available = unsafe {
+        IsClipboardFormatAvailable(CF_DIBV5 as u32) != 0
+            || IsClipboardFormatAvailable(CF_DIB as u32) != 0
+    };
+    if classify_clipboard_snapshot(
+        format_count,
+        unicode_text_available,
+        file_drop_available,
+        image_available,
+    ) != ClipboardSnapshotMode::UnicodeText
+    {
+        return Ok(None);
+    }
+    read_unicode_clipboard_text()
+}
+
+fn read_unicode_clipboard_text() -> Result<Option<String>, SelectedTextRuntimeError> {
     if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT as u32) } == 0 {
         return Ok(None);
     }

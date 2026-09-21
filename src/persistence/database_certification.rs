@@ -4,8 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
-use crate::lexicon::UserTermProtection;
-
 use super::{AppSettings, ClipboardHistoryLimit, Database, DatabaseError, UndoHotkey};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -40,7 +38,7 @@ impl Drop for TempDatabasePath {
 fn certification_fresh_database_has_only_the_required_application_tables() {
     let path = TempDatabasePath::new("schema");
     let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 4);
+    assert_eq!(database.schema_version().unwrap(), 1);
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -67,76 +65,27 @@ fn certification_fresh_database_has_only_the_required_application_tables() {
             "dictionary_words",
             "languages",
             "text_history",
-            "user_terms",
+            "user_words",
         ]
     );
     assert!(!tables.iter().any(|table| table == "schema_migrations"));
 }
 
 #[test]
-fn certification_user_terms_are_language_neutral_in_canonical_schema() {
+fn certification_user_words_are_language_neutral_in_canonical_schema() {
     let path = TempDatabasePath::new("language-neutral-user-terms");
     let database = Database::open(path.as_path()).unwrap();
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
-    let mut statement = raw.prepare("PRAGMA table_info(user_terms)").unwrap();
+    let mut statement = raw.prepare("PRAGMA table_info(user_words)").unwrap();
     let columns: Vec<String> = statement
         .query_map([], |row| row.get(1))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
     assert!(!columns.iter().any(|column| column == "language_id"));
-}
-
-#[test]
-fn certification_schema_v2_migrates_to_default_pause_undo_hotkey() {
-    let path = TempDatabasePath::new("v2-undo-hotkey");
-    let raw = Connection::open(path.as_path()).unwrap();
-    raw.execute_batch(
-        "CREATE TABLE app_settings (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), clipboard_history_limit INTEGER NOT NULL CHECK (clipboard_history_limit > 0)) STRICT;\nINSERT INTO app_settings (singleton, clipboard_history_limit) VALUES (1, 321);\nCREATE TABLE user_terms (id INTEGER PRIMARY KEY, term TEXT NOT NULL CHECK (length(term) > 0), normalized_term TEXT NOT NULL UNIQUE CHECK (length(normalized_term) > 0), language_id INTEGER, protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0, 1)), use_count INTEGER NOT NULL DEFAULT 1 CHECK (use_count > 0), last_used_at_ms INTEGER NOT NULL) STRICT;\nPRAGMA user_version = 2;",
-    )
-    .unwrap();
-    drop(raw);
-
-    let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 4);
-    let settings = database.settings().unwrap();
-    assert_eq!(settings.clipboard_history_limit().get(), 321);
-    assert_eq!(settings.undo_hotkey(), UndoHotkey::Pause);
-}
-
-#[test]
-fn certification_schema_v3_migrates_pause_and_language_neutral_user_terms_without_data_loss() {
-    let path = TempDatabasePath::new("v3-pause-user-terms");
-    let raw = Connection::open(path.as_path()).unwrap();
-    raw.execute_batch(
-        "CREATE TABLE app_settings (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), clipboard_history_limit INTEGER NOT NULL CHECK (clipboard_history_limit > 0), undo_hotkey TEXT NOT NULL DEFAULT 'print_screen') STRICT;\nINSERT INTO app_settings (singleton, clipboard_history_limit, undo_hotkey) VALUES (1, 444, 'print_screen');\nCREATE TABLE user_terms (id INTEGER PRIMARY KEY, term TEXT NOT NULL CHECK (length(term) > 0), normalized_term TEXT NOT NULL UNIQUE CHECK (length(normalized_term) > 0), language_id INTEGER, protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0, 1)), use_count INTEGER NOT NULL DEFAULT 1 CHECK (use_count > 0), last_used_at_ms INTEGER NOT NULL) STRICT;\nINSERT INTO user_terms (id, term, normalized_term, language_id, protected, use_count, last_used_at_ms) VALUES (7, 'QuantileEntryStrategy', 'quantileentrystrategy', 42, 1, 3, 900);\nPRAGMA user_version = 3;",
-    )
-    .unwrap();
-    drop(raw);
-
-    let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 4);
-    let settings = database.settings().unwrap();
-    assert_eq!(settings.clipboard_history_limit().get(), 444);
-    assert_eq!(settings.undo_hotkey(), UndoHotkey::Pause);
-    let lexicon = database.load_user_lexicon().unwrap();
-    let term = lexicon.exact("quantileentrystrategy").unwrap();
-    assert_eq!(term.term(), "QuantileEntryStrategy");
-    assert_eq!(term.use_count(), 3);
-    assert_eq!(term.last_used_at_ms(), 900);
-    assert_eq!(term.protection(), UserTermProtection::Protected);
-    drop(database);
-
-    let raw = Connection::open(path.as_path()).unwrap();
-    let mut statement = raw.prepare("PRAGMA table_info(user_terms)").unwrap();
-    let columns: Vec<String> = statement
-        .query_map([], |row| row.get(1))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert!(!columns.iter().any(|column| column == "language_id"));
+    assert!(!columns.iter().any(|column| column == "protected"));
 }
 
 #[test]
@@ -160,7 +109,7 @@ fn certification_unknown_stored_undo_hotkey_fails_closed() {
 }
 
 #[test]
-fn certification_seed_dictionaries_build_runtime_language_packs() {
+fn certification_dictionary_surface_rows_build_runtime_language_packs() {
     let database = Database::open_in_memory().unwrap();
     let packs = database.load_enabled_language_packs().unwrap();
     assert_eq!(packs.len(), 2);
@@ -168,7 +117,7 @@ fn certification_seed_dictionaries_build_runtime_language_packs() {
     let russian = packs
         .iter()
         .find(|pack| pack.id().as_str() == "ru")
-        .expect("Russian seed language must be enabled");
+        .expect("Russian dictionary language must be enabled");
     assert!(russian.contains_normalized("для"));
     assert!(russian.contains_normalized("жизнь"));
     assert_eq!(russian.transforms().len(), 1);
@@ -176,35 +125,34 @@ fn certification_seed_dictionaries_build_runtime_language_packs() {
     let english = packs
         .iter()
         .find(|pack| pack.id().as_str() == "en")
-        .expect("English seed language must be enabled");
+        .expect("English dictionary language must be enabled");
     assert!(english.contains_normalized("hello"));
     assert!(english.contains_normalized("world"));
     assert_eq!(english.transforms().len(), 1);
 }
 
 #[test]
-fn certification_user_terms_survive_reopen_and_rebuild_ranked_runtime_snapshot() {
+fn certification_user_words_survive_reopen_and_rebuild_ranked_runtime_snapshot() {
     let path = TempDatabasePath::new("user-terms");
     {
         let database = Database::open(path.as_path()).unwrap();
         database
-            .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 100)
+            .record_user_word("QuantileEntryStrategy", 100)
             .unwrap();
         database
-            .record_user_term("QuantileEntryStrategy1", UserTermProtection::Protected, 200)
+            .record_user_word("QuantileEntryStrategy1", 200)
             .unwrap();
         database
-            .record_user_term("quantileentrystrategy1", UserTermProtection::Normal, 150)
+            .record_user_word("quantileentrystrategy1", 150)
             .unwrap();
     }
 
     let reopened = Database::open(path.as_path()).unwrap();
     let lexicon = reopened.load_user_lexicon().unwrap();
-    let protected = lexicon.exact("quantileentrystrategy1").unwrap();
-    assert_eq!(protected.term(), "QuantileEntryStrategy1");
-    assert_eq!(protected.protection(), UserTermProtection::Protected);
-    assert_eq!(protected.use_count(), 2);
-    assert_eq!(protected.last_used_at_ms(), 200);
+    let learned = lexicon.exact("quantileentrystrategy1").unwrap();
+    assert_eq!(learned.term(), "QuantileEntryStrategy1");
+    assert_eq!(learned.use_count(), 2);
+    assert_eq!(learned.last_used_at_ms(), 200);
     assert_eq!(
         lexicon
             .prefix_matches("QuantileEntry", 2)
@@ -216,7 +164,7 @@ fn certification_user_terms_survive_reopen_and_rebuild_ranked_runtime_snapshot()
 }
 
 #[test]
-fn certification_correction_undo_persists_protected_original_across_reopen() {
+fn certification_correction_undo_persists_original_as_user_word_across_reopen() {
     let path = TempDatabasePath::new("correction-undo");
     let event = {
         let database = Database::open(path.as_path()).unwrap();
@@ -235,9 +183,8 @@ fn certification_correction_undo_persists_protected_original_across_reopen() {
 
     let reopened = Database::open(path.as_path()).unwrap();
     let lexicon = reopened.load_user_lexicon().unwrap();
-    let protected = lexicon.exact("quantileentrystrategy1").unwrap();
-    assert_eq!(protected.term(), "QuantileEntryStrategy1");
-    assert_eq!(protected.protection(), UserTermProtection::Protected);
+    let learned = lexicon.exact("quantileentrystrategy1").unwrap();
+    assert_eq!(learned.term(), "QuantileEntryStrategy1");
     assert!(matches!(
         reopened.prepare_correction_undo(event),
         Err(DatabaseError::CorrectionEventAlreadyUndone(_))
@@ -325,7 +272,7 @@ fn certification_newer_database_schema_fails_closed() {
         error,
         DatabaseError::SchemaTooNew {
             found: 999,
-            supported: 4
+            supported: 1
         }
     ));
 }

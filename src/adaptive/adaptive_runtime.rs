@@ -6,9 +6,9 @@ use std::thread::{self, JoinHandle};
 use crate::correction::{
     Confidence, CorrectionDecision, CorrectionEngine, LexicalCorrectionProvider, LexicalSnapshot,
 };
-use crate::input::{InputBuffer, InputEvent, InputOutcome};
+use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome};
 use crate::language::normalize_word;
-use crate::lexicon::{UserLexicon, UserTermProtection};
+use crate::lexicon::UserLexicon;
 use crate::persistence::{CorrectionEventId, CorrectionUndoPlan, Database, DatabaseError};
 use crate::replacement::{ReplacementAction, ReplacementEngine, ReplacementOutcome, UndoOutcome};
 
@@ -240,11 +240,15 @@ impl LearningClient {
 pub struct AdaptiveLexicalRuntime {
     snapshots: LexicalSnapshotStore,
     learning: LearningClient,
+    minimum_confidence: Confidence,
     worker: Option<JoinHandle<()>>,
 }
 
 impl AdaptiveLexicalRuntime {
-    pub fn start(database: Database) -> Result<Self, AdaptiveRuntimeError> {
+    pub fn start(
+        database: Database,
+        minimum_confidence: Confidence,
+    ) -> Result<Self, AdaptiveRuntimeError> {
         let languages = database.load_enabled_language_packs()?;
         let user_lexicon = database.load_user_lexicon()?;
         let snapshot = LexicalSnapshot::try_new(languages, user_lexicon)
@@ -258,11 +262,18 @@ impl AdaptiveLexicalRuntime {
         };
         let worker_snapshots = snapshots.clone();
         let worker = thread::spawn(move || {
-            learning_worker(database, worker_snapshots, receiver, last_error)
+            learning_worker(
+                database,
+                worker_snapshots,
+                receiver,
+                last_error,
+                minimum_confidence,
+            )
         });
         Ok(Self {
             snapshots,
             learning,
+            minimum_confidence,
             worker: Some(worker),
         })
     }
@@ -275,8 +286,8 @@ impl AdaptiveLexicalRuntime {
         self.learning.clone()
     }
 
-    pub fn session(&self, minimum_confidence: Confidence) -> AdaptiveCorrectionSession {
-        AdaptiveCorrectionSession::new(self.snapshots(), self.learning(), minimum_confidence)
+    pub fn session(&self) -> AdaptiveCorrectionSession {
+        AdaptiveCorrectionSession::new(self.snapshots(), self.learning(), self.minimum_confidence)
     }
 
     pub fn flush(&self) -> Result<(), AdaptiveRuntimeError> {
@@ -452,22 +463,15 @@ fn learning_worker(
     snapshots: LexicalSnapshotStore,
     receiver: mpsc::Receiver<LearningCommand>,
     last_error: Arc<Mutex<Option<String>>>,
+    minimum_confidence: Confidence,
 ) {
     while let Ok(command) = receiver.recv() {
         let result = match command {
             LearningCommand::ObserveToken { token, used_at_ms } => {
-                observe_user_term(&database, &snapshots, &token, used_at_ms)
+                observe_user_word(&database, &snapshots, &token, used_at_ms)
             }
             LearningCommand::ObserveText { text, used_at_ms } => {
-                let mut result = Ok(());
-                for token in extract_tokens(&text) {
-                    if let Err(error) = observe_user_term(&database, &snapshots, token, used_at_ms)
-                    {
-                        result = Err(error);
-                        break;
-                    }
-                }
-                result
+                observe_user_text(&database, &snapshots, &text, used_at_ms, minimum_confidence)
             }
             LearningCommand::RecordCorrection {
                 observed_text,
@@ -530,21 +534,53 @@ fn learning_worker(
     }
 }
 
-fn observe_user_term(
+fn observe_user_text(
+    database: &Database,
+    snapshots: &LexicalSnapshotStore,
+    text: &str,
+    used_at_ms: i64,
+    minimum_confidence: Confidence,
+) -> Result<(), AdaptiveRuntimeError> {
+    let snapshot = snapshots.load()?;
+    let provider = LexicalCorrectionProvider::from_snapshot(Arc::clone(&snapshot));
+    let correction = CorrectionEngine::new(provider, minimum_confidence);
+    let mut changed = false;
+    let persist_result = (|| {
+        for token in extract_tokens(text) {
+            let completed = CompletedToken::new(token, Boundary::Character(' '));
+            if correction.decide(&completed) == CorrectionDecision::Keep
+                && should_record_user_word(token, &snapshot)
+            {
+                database.record_user_word(token, used_at_ms)?;
+                changed = true;
+            }
+        }
+        Ok(())
+    })();
+
+    // record_user_word writes canonical state before returning. If a later token fails, refresh
+    // from the rows that did commit so the live snapshot never silently lags canonical SQLite.
+    if changed {
+        snapshots.replace_user_lexicon(database.load_user_lexicon()?)?;
+    }
+    persist_result
+}
+
+fn observe_user_word(
     database: &Database,
     snapshots: &LexicalSnapshotStore,
     token: &str,
     used_at_ms: i64,
 ) -> Result<(), AdaptiveRuntimeError> {
     let snapshot = snapshots.load()?;
-    if !should_record_user_term(token, &snapshot) {
+    if !should_record_user_word(token, &snapshot) {
         return Ok(());
     }
-    database.record_user_term(token, UserTermProtection::Normal, used_at_ms)?;
+    database.record_user_word(token, used_at_ms)?;
     snapshots.replace_user_lexicon(database.load_user_lexicon()?)
 }
 
-fn should_record_user_term(token: &str, snapshot: &LexicalSnapshot) -> bool {
+fn should_record_user_word(token: &str, snapshot: &LexicalSnapshot) -> bool {
     let normalized = normalize_word(token);
     if normalized.is_empty() {
         return false;
@@ -559,31 +595,7 @@ fn should_record_user_term(token: &str, snapshot: &LexicalSnapshot) -> bool {
     {
         return false;
     }
-    is_technical_identifier(token)
-}
-
-fn is_technical_identifier(token: &str) -> bool {
-    let mut has_alpha = false;
-    let mut has_lower = false;
-    let mut has_upper = false;
-    let mut has_digit = false;
-    let mut has_identifier_separator = false;
-    for character in token.chars() {
-        if character.is_alphabetic() {
-            has_alpha = true;
-            has_lower |= character.is_lowercase();
-            has_upper |= character.is_uppercase();
-        } else if character.is_ascii_digit() {
-            has_digit = true;
-        } else if matches!(character, '_' | '-') {
-            has_identifier_separator = true;
-        }
-    }
-    has_alpha
-        && (has_digit
-            || has_identifier_separator
-            || has_lower && has_upper
-            || has_upper && token.chars().filter(|c| c.is_alphabetic()).count() >= 2)
+    token.chars().any(char::is_alphabetic)
 }
 
 fn extract_tokens(text: &str) -> impl Iterator<Item = &str> {

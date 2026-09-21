@@ -59,7 +59,7 @@ fn plain_punctuation_is_a_boundary_but_layout_ambiguous_physical_key_is_deferred
 }
 
 #[test]
-fn invalidation_fails_closed_and_discards_all_tracked_state() {
+fn invalidation_discards_old_state_but_first_fresh_character_restarts_tracking() {
     let mut buffer = InputBuffer::new();
     buffer.process(InputEvent::typed_character('[', PhysicalKey::LeftBracket));
     buffer.process(InputEvent::character('a'));
@@ -70,16 +70,21 @@ fn invalidation_fails_closed_and_discards_all_tracked_state() {
     );
     assert!(buffer.current_token().is_empty());
 
-    buffer.process(InputEvent::character('x'));
-    buffer.process(InputEvent::typed_character(',', PhysicalKey::Comma));
-    assert!(buffer.current_token().is_empty());
-
+    // Backspace cannot establish ownership because it may edit text that predates invalidation.
     assert_eq!(
-        buffer.process(InputEvent::character(' ')),
+        buffer.process(InputEvent::Backspace),
         InputOutcome::Continue
     );
+    assert!(buffer.current_token().is_empty());
+
     buffer.process(InputEvent::character('x'));
-    assert_eq!(buffer.current_token(), "x");
+    buffer.process(InputEvent::typed_character(',', PhysicalKey::Comma));
+    assert_eq!(buffer.current_token(), "x,");
+
+    let InputOutcome::Completed(token) = buffer.process(InputEvent::character(' ')) else {
+        panic!("freshly typed text should complete normally after invalidation");
+    };
+    assert_eq!(token.text(), "x,");
 }
 
 #[test]

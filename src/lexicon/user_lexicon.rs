@@ -6,31 +6,17 @@ use crate::language::normalize_word;
 
 use super::{DeleteIndex, MAX_INDEX_DELETIONS};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserTermProtection {
-    Normal,
-    Protected,
-}
-
-impl UserTermProtection {
-    pub const fn is_protected(self) -> bool {
-        matches!(self, Self::Protected)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserTerm {
+pub struct UserWord {
     term: String,
     normalized_term: String,
-    protection: UserTermProtection,
     use_count: u32,
     last_used_at_ms: i64,
 }
 
-impl UserTerm {
+impl UserWord {
     pub fn try_new(
         term: impl Into<String>,
-        protection: UserTermProtection,
         use_count: u32,
         last_used_at_ms: i64,
     ) -> Result<Self, UserLexiconError> {
@@ -52,7 +38,6 @@ impl UserTerm {
         Ok(Self {
             term,
             normalized_term,
-            protection,
             use_count,
             last_used_at_ms,
         })
@@ -64,10 +49,6 @@ impl UserTerm {
 
     pub fn normalized_term(&self) -> &str {
         &self.normalized_term
-    }
-
-    pub const fn protection(&self) -> UserTermProtection {
-        self.protection
     }
 
     pub const fn use_count(&self) -> u32 {
@@ -89,10 +70,10 @@ pub enum UserLexiconError {
 impl Display for UserLexiconError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTerm => formatter.write_str("invalid user term"),
-            Self::InvalidUseCount => formatter.write_str("user term use count must be positive"),
+            Self::InvalidTerm => formatter.write_str("invalid user word"),
+            Self::InvalidUseCount => formatter.write_str("user word use count must be positive"),
             Self::DuplicateNormalizedTerm(term) => {
-                write!(formatter, "duplicate normalized user term: {term:?}")
+                write!(formatter, "duplicate normalized user word: {term:?}")
             }
         }
     }
@@ -102,14 +83,14 @@ impl Error for UserLexiconError {}
 
 #[derive(Debug, Clone)]
 pub struct UserLexicon {
-    entries: Vec<UserTerm>,
+    entries: Vec<UserWord>,
     exact_index: HashMap<String, usize>,
     delete_index: DeleteIndex,
     max_use_count: u32,
 }
 
 impl UserLexicon {
-    pub fn try_new(mut entries: Vec<UserTerm>) -> Result<Self, UserLexiconError> {
+    pub fn try_new(mut entries: Vec<UserWord>) -> Result<Self, UserLexiconError> {
         entries.sort_by(|left, right| left.normalized_term.cmp(&right.normalized_term));
 
         let mut exact_index = HashMap::with_capacity(entries.len());
@@ -131,7 +112,7 @@ impl UserLexicon {
                 .map(|(index, entry)| (index, entry.normalized_term())),
             MAX_INDEX_DELETIONS,
         );
-        let max_use_count = entries.iter().map(UserTerm::use_count).max().unwrap_or(1);
+        let max_use_count = entries.iter().map(UserWord::use_count).max().unwrap_or(1);
 
         Ok(Self {
             entries,
@@ -149,13 +130,13 @@ impl UserLexicon {
         self.exact_index.contains_key(normalized_term)
     }
 
-    pub fn exact(&self, normalized_term: &str) -> Option<&UserTerm> {
+    pub fn exact(&self, normalized_term: &str) -> Option<&UserWord> {
         self.exact_index
             .get(normalized_term)
             .map(|index| &self.entries[*index])
     }
 
-    pub fn candidate_entries(&self, observed: &str, max_deletions: usize) -> Vec<&UserTerm> {
+    pub fn candidate_entries(&self, observed: &str, max_deletions: usize) -> Vec<&UserWord> {
         self.delete_index
             .candidate_indices(observed, max_deletions)
             .into_iter()
@@ -163,7 +144,7 @@ impl UserLexicon {
             .collect()
     }
 
-    pub fn prefix_matches(&self, prefix: &str, limit: usize) -> Vec<&UserTerm> {
+    pub fn prefix_matches(&self, prefix: &str, limit: usize) -> Vec<&UserWord> {
         if limit == 0 {
             return Vec::new();
         }
@@ -184,12 +165,6 @@ impl UserLexicon {
                 .last_used_at_ms
                 .cmp(&left.last_used_at_ms)
                 .then_with(|| right.use_count.cmp(&left.use_count))
-                .then_with(|| {
-                    right
-                        .protection
-                        .is_protected()
-                        .cmp(&left.protection.is_protected())
-                })
                 .then_with(|| left.term.cmp(&right.term))
         });
         matches.truncate(limit);

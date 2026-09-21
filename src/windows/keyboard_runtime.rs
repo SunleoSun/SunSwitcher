@@ -91,7 +91,7 @@ struct RuntimeState {
 impl RuntimeState {
     fn new(mut processor: Box<dyn InputProcessor>, undo_hotkey: UndoHotkey) -> Self {
         // The runtime cannot prove where the caret is when a hook is attached. Start fail-closed;
-        // the input owner may resume tracking after it observes an unambiguous boundary.
+        // stale text is discarded, while the first newly typed character may establish fresh ownership.
         let _ = processor.process(InputEvent::Invalidate);
         Self {
             processor,
@@ -477,7 +477,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             if next_result != 0 {
                 // A downstream hook suppressed the boundary that completed our token, so the
                 // application's visible caret/text state no longer has the boundary we assumed.
-                // Stay desynchronized until a later unambiguous boundary reaches the stream.
+                // Stay desynchronized with respect to prior text; a later fresh character or
+                // unambiguous boundary may establish a new owned span.
                 notify_runtime_replacement_outcome(ReplacementOutcome::Aborted);
                 invalidate_runtime_tracking();
                 return next_result;

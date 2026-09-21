@@ -84,7 +84,7 @@ fn certification_edit_then_complete_reports_the_final_visible_token() {
 }
 
 #[test]
-fn certification_cursor_or_unknown_editing_action_prevents_stale_completion() {
+fn certification_invalidation_discards_stale_text_and_tracks_the_first_fresh_token() {
     let mut buffer = InputBuffer::new();
     for character in "дял".chars() {
         buffer.process(InputEvent::character(character));
@@ -94,28 +94,18 @@ fn certification_cursor_or_unknown_editing_action_prevents_stale_completion() {
         InputOutcome::Invalidated
     );
 
-    // Text typed while the caret context is unknown must not become a partial owned token.
+    // The old token is no longer owned. A fresh typed character starts a new owned span
+    // immediately, so cursor/focus changes do not sacrifice the first word typed afterwards.
     for character in "привте".chars() {
         assert_eq!(
             buffer.process(InputEvent::character(character)),
             InputOutcome::Continue
         );
     }
-    assert!(buffer.current_token().is_empty());
+    assert_eq!(buffer.current_token(), "привте");
 
-    // The first unambiguous boundary re-establishes a known token start for subsequent input.
-    assert_eq!(
-        buffer.process(InputEvent::character(' ')),
-        InputOutcome::Continue
-    );
-    for character in "дял".chars() {
-        assert_eq!(
-            buffer.process(InputEvent::character(character)),
-            InputOutcome::Continue
-        );
-    }
     let InputOutcome::Completed(token) = buffer.process(InputEvent::character(' ')) else {
-        panic!("expected tracking to resume after an unambiguous boundary");
+        panic!("fresh token should complete without a leading synchronization boundary");
     };
-    assert_eq!(token.text(), "дял");
+    assert_eq!(token.text(), "привте");
 }

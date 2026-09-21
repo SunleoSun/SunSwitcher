@@ -1,6 +1,5 @@
 use super::{Confidence, CorrectionDecision, CorrectionEngine, LexicalCorrectionProvider};
 use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome, PhysicalKey};
-use crate::lexicon::UserTermProtection;
 use crate::persistence::Database;
 
 fn engine() -> CorrectionEngine<LexicalCorrectionProvider> {
@@ -158,19 +157,54 @@ fn certification_valid_bilingual_words_and_unknown_noise_fail_closed() {
 }
 
 #[test]
+fn certification_valid_surface_forms_are_not_collapsed_to_seed_lemmas() {
+    for observed in [
+        "слову",
+        "словом",
+        "словах",
+        "ошибке",
+        "программы",
+        "языков",
+        "русскому",
+        "людей",
+        "words",
+        "working",
+        "languages",
+        "examples",
+    ] {
+        assert_eq!(
+            replacement_for(observed),
+            None,
+            "valid surface form {observed:?}"
+        );
+    }
+}
+
+#[test]
+fn certification_typos_of_surface_forms_preserve_the_inflected_target() {
+    for (observed, expected) in [("слвоу", "слову"), ("wrods", "words")] {
+        assert_eq!(
+            replacement_for(observed).as_deref(),
+            Some(expected),
+            "{observed:?}"
+        );
+    }
+}
+
+#[test]
 fn certification_case_survives_cross_layout_correction() {
     assert_eq!(replacement_for("Lkz").as_deref(), Some("Для"));
     assert_eq!(replacement_for("РУДДЩ").as_deref(), Some("HELLO"));
 }
 
 #[test]
-fn certification_user_lexicon_corrects_technical_identifiers_and_protects_exact_terms() {
+fn certification_user_lexicon_corrects_typos_and_keeps_exact_user_words() {
     let database = Database::open_in_memory().unwrap();
     database
-        .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 100)
+        .record_user_word("QuantileEntryStrategy", 100)
         .unwrap();
     database
-        .record_user_term("QuantileEntryStrategy1", UserTermProtection::Protected, 200)
+        .record_user_word("QuantileEntryStrategy1", 200)
         .unwrap();
     let engine = CorrectionEngine::new(
         LexicalCorrectionProvider::try_new(
@@ -191,6 +225,6 @@ fn certification_user_lexicon_corrects_technical_identifiers_and_protects_exact_
         Some("QuantileEntryStrategy")
     );
 
-    let protected = CompletedToken::new("QuantileEntryStrategy1", Boundary::Character(' '));
-    assert_eq!(engine.decide(&protected), CorrectionDecision::Keep);
+    let exact_user_word = CompletedToken::new("QuantileEntryStrategy1", Boundary::Character(' '));
+    assert_eq!(engine.decide(&exact_user_word), CorrectionDecision::Keep);
 }

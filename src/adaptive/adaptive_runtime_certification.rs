@@ -6,7 +6,6 @@ use rusqlite::Connection;
 
 use crate::correction::Confidence;
 use crate::input::InputEvent;
-use crate::lexicon::UserTermProtection;
 use crate::persistence::Database;
 use crate::replacement::{ReplacementOutcome, UndoOutcome};
 
@@ -57,9 +56,33 @@ fn type_token(
 }
 
 #[test]
+fn certification_first_word_after_invalidation_is_corrected_without_leading_boundary() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        session.process(InputEvent::Invalidate, 50).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    let correction = type_token(&mut session, "дял", 100);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!("first fresh token after invalidation must still reach lexical correction");
+    };
+    assert_eq!(action.replacement().as_str(), "для");
+}
+
+#[test]
 fn certification_typed_technical_term_refreshes_live_snapshot_and_corrects_later_typo() {
-    let runtime = AdaptiveLexicalRuntime::start(Database::open_in_memory().unwrap()).unwrap();
-    let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
 
     assert_eq!(
         type_token(&mut session, "QuantileEntryStrategy", 100),
@@ -83,15 +106,86 @@ fn certification_typed_technical_term_refreshes_live_snapshot_and_corrects_later
 }
 
 #[test]
+fn certification_typed_plain_word_becomes_a_typo_target_after_one_kept_use() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        type_token(&mut session, "мурзаплекс", 100),
+        AdaptiveCorrectionDirective::Pass
+    );
+    runtime.flush().unwrap();
+
+    let correction = type_token(&mut session, "мурзапелкс", 200);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!("a kept user word must become available to later typo correction");
+    };
+    assert_eq!(action.replacement().as_str(), "мурзаплекс");
+}
+
+#[test]
+fn certification_copied_plain_word_becomes_a_typo_target_after_text_observation() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    runtime.learning().observe_text("мурзаплекс", 100).unwrap();
+    runtime.flush().unwrap();
+    let mut session = runtime.session();
+
+    let correction = type_token(&mut session, "мурзапелкс", 200);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!("a copied user word must become available to later typo correction");
+    };
+    assert_eq!(action.replacement().as_str(), "мурзаплекс");
+}
+
+#[test]
+fn certification_copied_text_does_not_learn_tokens_the_same_corrector_would_replace() {
+    let database = Database::open_in_memory().unwrap();
+    database
+        .record_user_word("QuantileEntryStrategy", 10)
+        .unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+
+    runtime
+        .learning()
+        .observe_text("мурзаплекс дял QuanntileEntrySrtategy", 100)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert!(snapshot.user_lexicon().contains_normalized("мурзаплекс"));
+    assert!(!snapshot.user_lexicon().contains_normalized("дял"));
+    assert!(
+        !snapshot
+            .user_lexicon()
+            .contains_normalized("quanntileentrysrtategy")
+    );
+    assert!(
+        snapshot
+            .user_lexicon()
+            .contains_normalized("quantileentrystrategy")
+    );
+}
+
+#[test]
 fn certification_correction_history_records_only_an_applied_replacement() {
     let path = TempDatabasePath::new("replacement-outcome");
     {
         let database = Database::open(path.as_path()).unwrap();
         database
-            .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 10)
+            .record_user_word("QuantileEntryStrategy", 10)
             .unwrap();
-        let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-        let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut session = runtime.session();
         assert!(matches!(
             type_token(&mut session, "QuanntileEntrySrtategy", 100),
             AdaptiveCorrectionDirective::Replace(_)
@@ -113,8 +207,9 @@ fn certification_correction_history_records_only_an_applied_replacement() {
 
     {
         let database = Database::open(path.as_path()).unwrap();
-        let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-        let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut session = runtime.session();
         assert!(matches!(
             type_token(&mut session, "QuanntileEntrySrtategy", 200),
             AdaptiveCorrectionDirective::Replace(_)
@@ -144,10 +239,11 @@ fn certification_intervening_input_cancels_pending_correction_persistence() {
     {
         let database = Database::open(path.as_path()).unwrap();
         database
-            .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 10)
+            .record_user_word("QuantileEntryStrategy", 10)
             .unwrap();
-        let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-        let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut session = runtime.session();
 
         assert!(matches!(
             type_token(&mut session, "QuanntileEntrySrtategy", 100),
@@ -173,13 +269,14 @@ fn certification_intervening_input_cancels_pending_correction_persistence() {
 }
 
 #[test]
-fn certification_immediate_hotkey_undo_restores_and_protects_the_original() {
+fn certification_immediate_hotkey_undo_restores_and_learns_the_original() {
     let database = Database::open_in_memory().unwrap();
     database
-        .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 10)
+        .record_user_word("QuantileEntryStrategy", 10)
         .unwrap();
-    let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-    let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
 
     let correction = type_token(&mut session, "QuanntileEntrySrtategy", 100);
     let AdaptiveCorrectionDirective::Replace(action) = correction else {
@@ -200,22 +297,22 @@ fn certification_immediate_hotkey_undo_restores_and_protects_the_original() {
     runtime.flush().unwrap();
 
     let snapshot = runtime.snapshots().load().unwrap();
-    let protected = snapshot
+    let learned = snapshot
         .user_lexicon()
         .exact("quanntileentrysrtategy")
         .unwrap();
-    assert_eq!(protected.term(), "QuanntileEntrySrtategy");
-    assert_eq!(protected.protection(), UserTermProtection::Protected);
+    assert_eq!(learned.term(), "QuanntileEntrySrtategy");
 }
 
 #[test]
 fn certification_intervening_input_disarms_immediate_undo() {
     let database = Database::open_in_memory().unwrap();
     database
-        .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 10)
+        .record_user_word("QuantileEntryStrategy", 10)
         .unwrap();
-    let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-    let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
 
     assert!(matches!(
         type_token(&mut session, "QuanntileEntrySrtategy", 100),
@@ -239,10 +336,11 @@ fn certification_intervening_input_cancels_inflight_undo_commit() {
     {
         let database = Database::open(path.as_path()).unwrap();
         database
-            .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 10)
+            .record_user_word("QuantileEntryStrategy", 10)
             .unwrap();
-        let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-        let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut session = runtime.session();
 
         assert!(matches!(
             type_token(&mut session, "QuanntileEntrySrtategy", 100),
@@ -268,25 +366,26 @@ fn certification_intervening_input_cancels_inflight_undo_commit() {
             |row| row.get(0),
         )
         .unwrap();
-    let protected_count: i64 = raw
+    let learned_count: i64 = raw
         .query_row(
-            "SELECT count(*) FROM user_terms WHERE normalized_term = 'quanntileentrysrtategy' AND protected = 1",
+            "SELECT count(*) FROM user_words WHERE normalized_term = 'quanntileentrysrtategy'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(undone_at, None);
-    assert_eq!(protected_count, 0);
+    assert_eq!(learned_count, 0);
 }
 
 #[test]
 fn certification_nonexecuted_undo_can_be_retried_but_uncertain_undo_cannot() {
     let database = Database::open_in_memory().unwrap();
     database
-        .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 10)
+        .record_user_word("QuantileEntryStrategy", 10)
         .unwrap();
-    let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-    let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
 
     assert!(matches!(
         type_token(&mut session, "QuanntileEntrySrtategy", 100),
@@ -305,12 +404,13 @@ fn certification_nonexecuted_undo_can_be_retried_but_uncertain_undo_cannot() {
 }
 
 #[test]
-fn certification_undo_commit_protects_original_and_refreshes_live_snapshot() {
+fn certification_undo_commit_learns_original_and_refreshes_live_snapshot() {
     let database = Database::open_in_memory().unwrap();
     let event = database
         .record_correction_event("QuantileEntryStrategy1", "QuantileEntryStrategy", 100)
         .unwrap();
-    let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
 
     let plan = runtime.learning().prepare_undo(event).unwrap();
     assert_eq!(plan.original_text(), "QuantileEntryStrategy1");
@@ -319,29 +419,22 @@ fn certification_undo_commit_protects_original_and_refreshes_live_snapshot() {
     runtime.flush().unwrap();
 
     let snapshot = runtime.snapshots().load().unwrap();
-    let protected = snapshot
+    let learned = snapshot
         .user_lexicon()
         .exact("quantileentrystrategy1")
         .unwrap();
-    assert_eq!(protected.term(), "QuantileEntryStrategy1");
-    assert_eq!(
-        protected.protection(),
-        crate::lexicon::UserTermProtection::Protected
-    );
+    assert_eq!(learned.term(), "QuantileEntryStrategy1");
 }
 
 #[test]
-fn certification_existing_user_term_usage_refreshes_recency_without_sql_on_correction_lookup() {
+fn certification_existing_user_word_usage_refreshes_recency_without_sql_on_correction_lookup() {
     let database = Database::open_in_memory().unwrap();
     database
-        .record_user_term(
-            "QuantileEntryStrategy",
-            crate::lexicon::UserTermProtection::Normal,
-            10,
-        )
+        .record_user_word("QuantileEntryStrategy", 10)
         .unwrap();
-    let runtime = AdaptiveLexicalRuntime::start(database).unwrap();
-    let mut session = runtime.session(Confidence::try_new(0.80).unwrap());
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
 
     assert_eq!(
         type_token(&mut session, "QuantileEntryStrategy", 500),

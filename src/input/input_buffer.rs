@@ -170,16 +170,20 @@ impl InputBuffer {
     pub fn process(&mut self, event: InputEvent) -> InputOutcome {
         if !self.synchronized {
             return match event {
-                InputEvent::Character(character) if !is_token_character(character) => {
+                InputEvent::Character(character) if is_token_character(character) => {
+                    // Invalidation discards ownership of everything that existed before it, but a
+                    // newly observed character is text SunSwitcher can own from this point forward.
                     self.synchronized = true;
+                    self.token.push(character.produced());
+                    self.physical_keys.push(character.physical_key());
                     InputOutcome::Continue
                 }
-                InputEvent::Boundary(_) => {
+                InputEvent::Character(_) | InputEvent::Boundary(_) => {
                     self.synchronized = true;
                     InputOutcome::Continue
                 }
                 InputEvent::Invalidate => InputOutcome::Invalidated,
-                InputEvent::Character(_) | InputEvent::Backspace => InputOutcome::Continue,
+                InputEvent::Backspace => InputOutcome::Continue,
             };
         }
 

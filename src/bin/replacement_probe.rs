@@ -14,6 +14,7 @@ mod windows_probe {
     use sunswitcher::input::InputEvent;
     use sunswitcher::persistence::{Database, UndoHotkey};
     use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome};
+    use sunswitcher::windows::ClipboardTextListener;
     use sunswitcher::windows::{
         InputProcessor, RuntimeDirective, UndoDirective, request_global_keyboard_hook_stop,
         run_global_keyboard_hook,
@@ -27,7 +28,7 @@ mod windows_probe {
         println!("Bilingual lexical provider: Russian + English, including wrong-layout typos.");
         println!("Examples: дял/ддля/ддляя/lkz/llkz/lzk -> для | hlelo/helllo/руддщ -> hello");
         println!(
-            "The hook is global. After focusing/clicking another application, press Space once to establish a safe token boundary, then type an example followed by Space/Enter/Tab."
+            "The hook is global. Focusing/clicking discards stale tracked text; the first newly typed character starts a fresh token immediately. Type an example followed by Space/Enter/Tab."
         );
         println!("Undo hotkey: Pause (PS), with no modifiers.");
         println!("Stop with Ctrl+C in this console.");
@@ -78,6 +79,7 @@ mod windows_probe {
     }
 
     struct ProbeProcessor {
+        _clipboard_listener: ClipboardTextListener,
         _runtime: AdaptiveLexicalRuntime,
         session: AdaptiveCorrectionSession,
     }
@@ -89,12 +91,20 @@ mod windows_probe {
                 .settings()
                 .map_err(|error| error.to_string())?
                 .undo_hotkey();
-            let runtime =
-                AdaptiveLexicalRuntime::start(database).map_err(|error| error.to_string())?;
-            let session =
-                runtime.session(Confidence::try_new(0.80).expect("valid probe threshold"));
+            let minimum_confidence = Confidence::try_new(0.80).expect("valid probe threshold");
+            let runtime = AdaptiveLexicalRuntime::start(database, minimum_confidence)
+                .map_err(|error| error.to_string())?;
+            let learning = runtime.learning();
+            let clipboard_listener = ClipboardTextListener::start(move |text| {
+                if let Err(error) = learning.observe_text(text, now_ms()) {
+                    eprintln!("clipboard learning skipped: {error}");
+                }
+            })
+            .map_err(|error| format!("clipboard listener failed: {error:?}"))?;
+            let session = runtime.session();
             Ok((
                 Self {
+                    _clipboard_listener: clipboard_listener,
                     _runtime: runtime,
                     session,
                 },
