@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::input::PhysicalKey;
-
-const INDEX_MAX_DELETIONS: usize = 2;
+use crate::lexicon::{DeleteIndex, MAX_INDEX_DELETIONS};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LanguageId(String);
@@ -181,7 +180,7 @@ pub struct LanguagePack {
     id: LanguageId,
     entries: Vec<DictionaryEntry>,
     exact_index: HashMap<String, usize>,
-    delete_index: HashMap<String, Vec<usize>>,
+    delete_index: DeleteIndex,
     transforms: Vec<KeyboardLayoutMap>,
     max_frequency: u32,
 }
@@ -217,13 +216,16 @@ impl LanguagePack {
             .unwrap_or(1);
 
         let mut exact_index = HashMap::new();
-        let mut delete_index: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, entry) in entries.iter().enumerate() {
             exact_index.insert(entry.word.clone(), index);
-            for form in deletion_forms(entry.word(), INDEX_MAX_DELETIONS) {
-                delete_index.entry(form).or_default().push(index);
-            }
         }
+        let delete_index = DeleteIndex::build(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (index, entry.word())),
+            MAX_INDEX_DELETIONS,
+        );
 
         Ok(Self {
             id,
@@ -252,16 +254,8 @@ impl LanguagePack {
     }
 
     pub fn candidate_entries(&self, observed: &str, max_deletions: usize) -> Vec<&DictionaryEntry> {
-        let mut indices = HashSet::new();
-        for form in deletion_forms(observed, max_deletions.min(INDEX_MAX_DELETIONS)) {
-            if let Some(matches) = self.delete_index.get(&form) {
-                indices.extend(matches.iter().copied());
-            }
-        }
-
-        let mut indices: Vec<_> = indices.into_iter().collect();
-        indices.sort_unstable();
-        indices
+        self.delete_index
+            .candidate_indices(observed, max_deletions)
             .into_iter()
             .map(|index| &self.entries[index])
             .collect()
@@ -270,34 +264,6 @@ impl LanguagePack {
 
 pub fn normalize_word(word: &str) -> String {
     word.chars().flat_map(char::to_lowercase).collect()
-}
-
-fn deletion_forms(word: &str, max_deletions: usize) -> HashSet<String> {
-    let mut seen = HashSet::from([word.to_owned()]);
-    let mut frontier = vec![word.to_owned()];
-
-    for _ in 0..max_deletions {
-        let mut next = Vec::new();
-        for value in frontier {
-            let characters: Vec<char> = value.chars().collect();
-            for skip in 0..characters.len() {
-                let candidate: String = characters
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, character)| (index != skip).then_some(*character))
-                    .collect();
-                if seen.insert(candidate.clone()) {
-                    next.push(candidate);
-                }
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-
-    seen
 }
 
 #[cfg(test)]

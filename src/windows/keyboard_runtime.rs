@@ -10,8 +10,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx, VK_BACK, VK_CAPITAL, VK_CONTROL,
     VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU,
     VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
-    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB, VK_UP,
+    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
@@ -22,19 +22,34 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::input::{Boundary, InputEvent, PhysicalKey, TypedCharacter};
-use crate::replacement::ReplacementAction;
+use crate::persistence::UndoHotkey;
+use crate::replacement::{ReplacementAction, ReplacementOutcome, UndoOutcome};
 
 const SUNSWITCHER_INJECTED_MARKER: usize = 0x5355_4E53_5749_5443;
 const TO_UNICODE_DO_NOT_CHANGE_STATE: u32 = 0x4;
 
 pub trait InputProcessor: Send + 'static {
     fn process(&mut self, event: InputEvent) -> RuntimeDirective;
+
+    fn replacement_outcome(&mut self, _outcome: ReplacementOutcome) {}
+
+    fn undo(&mut self) -> UndoDirective {
+        UndoDirective::Pass
+    }
+
+    fn undo_outcome(&mut self, _outcome: UndoOutcome) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeDirective {
     Pass,
     Replace(ReplacementAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoDirective {
+    Pass,
+    Restore(ReplacementAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,15 +64,32 @@ pub enum RuntimeError {
     InjectionFailed { expected: u32, sent: u32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InputOwnershipStamp {
+    input_revision: u64,
+    foreground_window_id: usize,
+}
+
+impl InputOwnershipStamp {
+    pub(super) const fn new(input_revision: u64, foreground_window_id: usize) -> Self {
+        Self {
+            input_revision,
+            foreground_window_id,
+        }
+    }
+}
+
 struct RuntimeState {
     processor: Box<dyn InputProcessor>,
     keyboard_state: [u8; 256],
     suppressed_keyup_vk: Option<u32>,
     foreground_window_id: usize,
+    undo_hotkey: UndoHotkey,
+    input_revision: u64,
 }
 
 impl RuntimeState {
-    fn new(mut processor: Box<dyn InputProcessor>) -> Self {
+    fn new(mut processor: Box<dyn InputProcessor>, undo_hotkey: UndoHotkey) -> Self {
         // The runtime cannot prove where the caret is when a hook is attached. Start fail-closed;
         // the input owner may resume tracking after it observes an unambiguous boundary.
         let _ = processor.process(InputEvent::Invalidate);
@@ -66,6 +98,8 @@ impl RuntimeState {
             keyboard_state: initial_keyboard_state(),
             suppressed_keyup_vk: None,
             foreground_window_id: current_foreground_window_id(),
+            undo_hotkey,
+            input_revision: 0,
         }
     }
 
@@ -85,6 +119,18 @@ impl RuntimeState {
             || self.keyboard_state[VK_LWIN as usize] & 0x80 != 0
             || self.keyboard_state[VK_RWIN as usize] & 0x80 != 0
     }
+
+    fn undo_hotkey_matches(&self, vk_code: u32) -> bool {
+        undo_hotkey_matches(self.undo_hotkey, vk_code, &self.keyboard_state)
+    }
+
+    fn note_external_input(&mut self) {
+        self.input_revision = self.input_revision.wrapping_add(1);
+    }
+
+    const fn ownership_stamp(&self) -> InputOwnershipStamp {
+        InputOwnershipStamp::new(self.input_revision, self.foreground_window_id)
+    }
 }
 
 static RUNTIME: Mutex<Option<RuntimeState>> = Mutex::new(None);
@@ -95,14 +141,17 @@ const WM_SUNSWITCHER_STOP: u32 = WM_USER + 0x535;
 struct RuntimeRegistration;
 
 impl RuntimeRegistration {
-    fn install(processor: impl InputProcessor) -> Result<Self, RuntimeError> {
+    fn install(
+        processor: impl InputProcessor,
+        undo_hotkey: UndoHotkey,
+    ) -> Result<Self, RuntimeError> {
         let mut runtime = RUNTIME
             .lock()
             .map_err(|_| RuntimeError::RuntimeStateUnavailable)?;
         if runtime.is_some() {
             return Err(RuntimeError::AlreadyRunning);
         }
-        *runtime = Some(RuntimeState::new(Box::new(processor)));
+        *runtime = Some(RuntimeState::new(Box::new(processor), undo_hotkey));
         Ok(Self)
     }
 }
@@ -215,8 +264,11 @@ fn sync_generic_modifier(state: &mut [u8; 256], generic: u16, left: u16, right: 
     }
 }
 
-pub fn run_global_keyboard_hook(processor: impl InputProcessor) -> Result<(), RuntimeError> {
-    let _runtime_registration = RuntimeRegistration::install(processor)?;
+pub fn run_global_keyboard_hook(
+    processor: impl InputProcessor,
+    undo_hotkey: UndoHotkey,
+) -> Result<(), RuntimeError> {
+    let _runtime_registration = RuntimeRegistration::install(processor, undo_hotkey)?;
 
     unsafe {
         let keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), null_mut(), 0);
@@ -310,6 +362,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         if let Ok(mut runtime_slot) = RUNTIME.lock()
             && let Some(runtime) = runtime_slot.as_mut()
         {
+            runtime.note_external_input();
             if next_result == 0 {
                 runtime.update_key_state(event.vkCode, is_key_down);
             }
@@ -326,6 +379,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
         };
 
+        runtime.note_external_input();
         if is_key_down {
             let foreground_window_id = current_foreground_window_id();
             if runtime.sync_foreground_window(foreground_window_id) {
@@ -334,6 +388,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         }
 
         runtime.update_key_state(event.vkCode, is_key_down);
+        let ownership_stamp = runtime.ownership_stamp();
 
         if is_key_up {
             let suppress = runtime.suppressed_keyup_vk == Some(event.vkCode);
@@ -341,11 +396,19 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 runtime.suppressed_keyup_vk = None;
             }
             HookEventState::KeyUp { suppress }
+        } else if runtime.undo_hotkey_matches(event.vkCode) {
+            HookEventState::UndoHotkey { ownership_stamp }
         } else {
             let directive = classify_key_down(event, runtime)
                 .map(|input_event| runtime.processor.process(input_event))
                 .unwrap_or(RuntimeDirective::Pass);
-            HookEventState::KeyDown(directive)
+            match directive {
+                RuntimeDirective::Pass => HookEventState::KeyDownPass,
+                RuntimeDirective::Replace(action) => HookEventState::KeyDownReplace {
+                    action,
+                    ownership_stamp,
+                },
+            }
         }
     };
 
@@ -354,14 +417,59 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
             if suppress { 1 } else { next_result }
         }
-        HookEventState::KeyDown(RuntimeDirective::Pass) => {
+        HookEventState::KeyDownPass => {
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
             if next_result != 0 {
                 invalidate_runtime_tracking();
             }
             next_result
         }
-        HookEventState::KeyDown(RuntimeDirective::Replace(action)) => {
+        HookEventState::UndoHotkey { ownership_stamp } => {
+            let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+            if next_result != 0 {
+                invalidate_runtime_tracking();
+                return next_result;
+            }
+            if !runtime_input_ownership_unchanged(ownership_stamp) {
+                invalidate_runtime_tracking();
+                return 1;
+            }
+
+            // Resolve the Undo only after downstream hooks return. A downstream hook may inject
+            // input re-entrantly or change the foreground window while handling Pause; those
+            // changes must disarm the immediate Undo before we decide it is still safe to execute.
+            let directive = RUNTIME
+                .lock()
+                .ok()
+                .and_then(|mut runtime_slot| {
+                    runtime_slot
+                        .as_mut()
+                        .map(|runtime| runtime.processor.undo())
+                })
+                .unwrap_or(UndoDirective::Pass);
+            if let UndoDirective::Restore(action) = directive {
+                let injection_result = inject_replacement(&action);
+                let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
+                let outcome = undo_outcome_after_injection(&injection_result, ownership_unchanged);
+                notify_runtime_undo_outcome(outcome);
+                if outcome == UndoOutcome::Uncertain {
+                    invalidate_runtime_tracking();
+                }
+                if let Err(error) = injection_result {
+                    eprintln!("SunSwitcher undo injection failed: {error:?}");
+                }
+            }
+            if let Ok(mut runtime_slot) = RUNTIME.lock()
+                && let Some(runtime) = runtime_slot.as_mut()
+            {
+                runtime.suppressed_keyup_vk = Some(event.vkCode);
+            }
+            1
+        }
+        HookEventState::KeyDownReplace {
+            action,
+            ownership_stamp,
+        } => {
             // Let downstream hooks observe the real physical event before SunSwitcher suppresses
             // it from the target application. This keeps other low-level hook state machines in
             // sync instead of starving them of the boundary key that triggered replacement.
@@ -370,11 +478,22 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 // A downstream hook suppressed the boundary that completed our token, so the
                 // application's visible caret/text state no longer has the boundary we assumed.
                 // Stay desynchronized until a later unambiguous boundary reaches the stream.
+                notify_runtime_replacement_outcome(ReplacementOutcome::Aborted);
+                invalidate_runtime_tracking();
+                return next_result;
+            }
+            if !runtime_input_ownership_unchanged(ownership_stamp) {
+                // Downstream hook work re-entered SunSwitcher and changed observable input/caret
+                // ownership. The old action can no longer safely delete text at the current caret.
+                notify_runtime_replacement_outcome(ReplacementOutcome::Aborted);
                 invalidate_runtime_tracking();
                 return next_result;
             }
 
             let injection_result = inject_replacement(&action);
+            let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
+            let replacement_outcome =
+                replacement_outcome_after_injection(&injection_result, ownership_unchanged);
             if let Some(vk_code) =
                 keyup_suppression_after_injection(event.vkCode, &injection_result)
             {
@@ -382,10 +501,18 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                     && let Some(runtime) = runtime_slot.as_mut()
                 {
                     runtime.suppressed_keyup_vk = Some(vk_code);
+                    runtime.processor.replacement_outcome(replacement_outcome);
+                    if replacement_outcome == ReplacementOutcome::Aborted {
+                        let _ = runtime.processor.process(InputEvent::Invalidate);
+                    }
                 }
                 return 1;
             }
 
+            notify_runtime_replacement_outcome(replacement_outcome);
+            if replacement_outcome == ReplacementOutcome::Aborted {
+                invalidate_runtime_tracking();
+            }
             if let Err(error) = injection_result {
                 eprintln!("SunSwitcher replacement injection failed: {error:?}");
             }
@@ -396,8 +523,33 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
 
 #[derive(Debug)]
 enum HookEventState {
-    KeyDown(RuntimeDirective),
-    KeyUp { suppress: bool },
+    KeyDownPass,
+    KeyDownReplace {
+        action: ReplacementAction,
+        ownership_stamp: InputOwnershipStamp,
+    },
+    UndoHotkey {
+        ownership_stamp: InputOwnershipStamp,
+    },
+    KeyUp {
+        suppress: bool,
+    },
+}
+
+fn notify_runtime_undo_outcome(outcome: UndoOutcome) {
+    if let Ok(mut runtime_slot) = RUNTIME.lock()
+        && let Some(runtime) = runtime_slot.as_mut()
+    {
+        runtime.processor.undo_outcome(outcome);
+    }
+}
+
+fn notify_runtime_replacement_outcome(outcome: ReplacementOutcome) {
+    if let Ok(mut runtime_slot) = RUNTIME.lock()
+        && let Some(runtime) = runtime_slot.as_mut()
+    {
+        runtime.processor.replacement_outcome(outcome);
+    }
 }
 
 fn invalidate_runtime_tracking() {
@@ -405,6 +557,48 @@ fn invalidate_runtime_tracking() {
         && let Some(runtime) = runtime_slot.as_mut()
     {
         let _ = runtime.processor.process(InputEvent::Invalidate);
+    }
+}
+
+fn runtime_input_ownership_unchanged(expected: InputOwnershipStamp) -> bool {
+    let current_foreground_window_id = current_foreground_window_id();
+    RUNTIME
+        .lock()
+        .ok()
+        .and_then(|runtime_slot| {
+            runtime_slot.as_ref().map(|runtime| {
+                input_ownership_matches(
+                    expected,
+                    runtime.input_revision,
+                    runtime.foreground_window_id,
+                    current_foreground_window_id,
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+pub(super) fn input_ownership_matches(
+    expected: InputOwnershipStamp,
+    current_revision: u64,
+    tracked_foreground_window_id: usize,
+    current_foreground_window_id: usize,
+) -> bool {
+    current_revision == expected.input_revision
+        && tracked_foreground_window_id == expected.foreground_window_id
+        && current_foreground_window_id == expected.foreground_window_id
+}
+
+pub(super) fn undo_hotkey_matches(
+    hotkey: UndoHotkey,
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> bool {
+    let no_modifiers = [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+        .into_iter()
+        .all(|key| keyboard_state[key as usize] & 0x80 == 0);
+    match hotkey {
+        UndoHotkey::Pause => vk_code == VK_PAUSE as u32 && no_modifiers,
     }
 }
 
@@ -418,6 +612,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: L
         && let Ok(mut runtime_slot) = RUNTIME.lock()
         && let Some(runtime) = runtime_slot.as_mut()
     {
+        runtime.note_external_input();
         let _ = runtime.processor.process(InputEvent::Invalidate);
     }
     unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) }
@@ -543,6 +738,31 @@ pub(super) fn physical_key_from_vk(vk_code: u32) -> PhysicalKey {
 
 fn inject_replacement(action: &ReplacementAction) -> Result<(), RuntimeError> {
     send_inputs(&build_replacement_inputs(action))
+}
+
+pub(super) fn undo_outcome_after_injection(
+    injection_result: &Result<(), RuntimeError>,
+    state_unchanged: bool,
+) -> UndoOutcome {
+    if !state_unchanged {
+        return UndoOutcome::Uncertain;
+    }
+    match injection_result {
+        Ok(()) => UndoOutcome::Applied,
+        Err(RuntimeError::InjectionFailed { sent: 0, .. }) => UndoOutcome::NotExecuted,
+        Err(_) => UndoOutcome::Uncertain,
+    }
+}
+
+pub(super) fn replacement_outcome_after_injection(
+    injection_result: &Result<(), RuntimeError>,
+    state_unchanged: bool,
+) -> ReplacementOutcome {
+    if injection_result.is_ok() && state_unchanged {
+        ReplacementOutcome::Applied
+    } else {
+        ReplacementOutcome::Aborted
+    }
 }
 
 pub(super) fn keyup_suppression_after_injection(

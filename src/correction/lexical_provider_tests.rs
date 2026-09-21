@@ -1,11 +1,15 @@
 use super::lexical_provider::weighted_damerau_cost;
 use super::{CorrectionCandidateProvider, LexicalCorrectionProvider};
 use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome, PhysicalKey};
-use crate::language::{english_language_pack, russian_language_pack};
+use crate::persistence::Database;
 
 fn provider() -> LexicalCorrectionProvider {
-    LexicalCorrectionProvider::try_new(vec![russian_language_pack(), english_language_pack()])
-        .unwrap()
+    let database = Database::open_in_memory().unwrap();
+    LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap()
 }
 
 fn completed_physical_token(text: &str) -> CompletedToken {

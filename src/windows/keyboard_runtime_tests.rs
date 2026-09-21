@@ -1,20 +1,22 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_BACK, VK_CONTROL, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
-    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_TAB,
+    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_SHIFT, VK_TAB,
 };
 
 use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
 
 use super::keyboard_runtime::{
-    KeyDownDisposition, RuntimeError, build_ctrl_chord_inputs, build_replacement_inputs,
-    foreground_change_requires_invalidation, injected_marker, is_foreign_injected_keyboard_event,
-    is_shift_modifier_key, is_toggle_key, keyup_suppression_after_injection,
-    mouse_message_invalidates_tracking, physical_key_from_vk, preclassify_key_down,
+    InputOwnershipStamp, KeyDownDisposition, RuntimeError, build_ctrl_chord_inputs,
+    build_replacement_inputs, foreground_change_requires_invalidation, injected_marker,
+    input_ownership_matches, is_foreign_injected_keyboard_event, is_shift_modifier_key,
+    is_toggle_key, keyup_suppression_after_injection, mouse_message_invalidates_tracking,
+    physical_key_from_vk, preclassify_key_down, undo_hotkey_matches, undo_outcome_after_injection,
     update_keyboard_state,
 };
 use crate::correction::{CorrectionDecision, ReplacementText};
 use crate::input::{Boundary, CompletedToken, InputEvent, PhysicalKey};
-use crate::replacement::ReplacementEngine;
+use crate::persistence::UndoHotkey;
+use crate::replacement::{ReplacementEngine, UndoOutcome};
 
 fn action(
     source: &str,
@@ -67,6 +69,33 @@ fn foreign_injected_keyboard_events_fail_closed_but_owned_injection_does_not() {
 }
 
 #[test]
+fn pause_undo_hotkey_requires_an_unmodified_keypress() {
+    let mut state = [0u8; 256];
+    assert!(undo_hotkey_matches(
+        UndoHotkey::Pause,
+        VK_PAUSE as u32,
+        &state
+    ));
+    assert!(!undo_hotkey_matches(UndoHotkey::Pause, b'A' as u32, &state));
+
+    state[VK_SHIFT as usize] = 0x80;
+    assert!(!undo_hotkey_matches(
+        UndoHotkey::Pause,
+        VK_PAUSE as u32,
+        &state
+    ));
+}
+
+#[test]
+fn in_flight_ownership_requires_same_revision_and_foreground_window() {
+    let stamp = InputOwnershipStamp::new(7, 42);
+    assert!(input_ownership_matches(stamp, 7, 42, 42));
+    assert!(!input_ownership_matches(stamp, 8, 42, 42));
+    assert!(!input_ownership_matches(stamp, 7, 42, 99));
+    assert!(!input_ownership_matches(stamp, 7, 99, 42));
+}
+
+#[test]
 fn foreground_window_change_requires_invalidation() {
     assert!(!foreground_change_requires_invalidation(100, 100));
     assert!(foreground_change_requires_invalidation(100, 200));
@@ -92,6 +121,40 @@ fn command_modified_editing_keys_preempt_normal_special_key_semantics() {
     assert_eq!(
         preclassify_key_down(VK_TAB as u32, false),
         KeyDownDisposition::Event(InputEvent::Boundary(Boundary::Tab))
+    );
+}
+
+#[test]
+fn undo_injection_distinguishes_no_effect_from_uncertain_partial_effect() {
+    let not_executed = Err(RuntimeError::InjectionFailed {
+        expected: 8,
+        sent: 0,
+    });
+    let uncertain = Err(RuntimeError::InjectionFailed {
+        expected: 8,
+        sent: 2,
+    });
+    let applied: Result<(), RuntimeError> = Ok(());
+
+    assert_eq!(
+        undo_outcome_after_injection(&not_executed, true),
+        UndoOutcome::NotExecuted
+    );
+    assert_eq!(
+        undo_outcome_after_injection(&uncertain, true),
+        UndoOutcome::Uncertain
+    );
+    assert_eq!(
+        undo_outcome_after_injection(&applied, true),
+        UndoOutcome::Applied
+    );
+    assert_eq!(
+        undo_outcome_after_injection(&applied, false),
+        UndoOutcome::Uncertain
+    );
+    assert_eq!(
+        undo_outcome_after_injection(&not_executed, false),
+        UndoOutcome::Uncertain
     );
 }
 

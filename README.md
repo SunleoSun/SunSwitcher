@@ -2,7 +2,7 @@
 
 Windows keyboard correction experiment implemented in Rust.
 
-The current focus is proving reliable Windows text replacement before adding language/layout switching, dictionaries, persistence, or UI.
+The current focus is reliable Windows text replacement plus a local SQLite persistence foundation for clipboard history, language data, user vocabulary, correction history, and future completion memory.
 
 ## Typed-word replacement probe
 
@@ -16,7 +16,9 @@ Keep the probe running and focus any Windows text field. Focusing/clicking inval
 - `тчо` -> `что`
 - `hlelo`, `helllo`, `руддщ` -> `hello`
 
-The typed-word probe now uses the language-agnostic lexical provider with separate Russian and English language packs. The current built-in dictionaries are deliberately small seed lexicons for architecture/certification rather than production-complete dictionaries. Candidate lookup uses a two-deletion index and weighted Damerau-style scoring: adjacent transpositions are cheap, accidental repeated-key deletions are cheaper than generic edits, and a keyboard-layout transform may be combined with those typo edits in the same candidate path.
+Immediately after an automatic correction completed by an ordinary character boundary such as Space or punctuation, press plain `Pause` (`PS` on this keyboard) to Undo it. The default binding is stored in SQLite settings so a later UI can change it. Undo is deliberately immediate-only: any intervening typing, mouse/focus change, or other uncertain input disarms it, and corrections completed with Enter/Tab are not reversed by this hotkey because those keys can have application-specific side effects. Plain Pause is consumed as the SunSwitcher command; modified Pause combinations remain available to Windows/other applications.
+
+The typed-word probe now loads the Russian and English seed dictionaries from SQLite into language-agnostic runtime `LanguagePack` snapshots. The seed lexicons are deliberately small architecture/certification data rather than production-complete dictionaries; their keyboard-layout transforms remain language-layer behavior, while dictionary words/frequencies are canonical database rows. Candidate lookup uses a shared two-deletion in-memory index and weighted Damerau-style scoring: adjacent transpositions are cheap, accidental repeated-key deletions are cheaper than generic edits, and a keyboard-layout transform may be combined with those typo edits in the same candidate path. User vocabulary is persisted separately in `user_terms` and rebuilt as an immutable `UserLexicon`; it preserves canonical spellings such as `QuantileEntryStrategy`, protects exact user terms from speculative correction, supplies typo candidates, and already exposes recency-ranked prefix matches for future autocomplete.
 
 Representative certified examples include `дял`, `ддля`, `ддляя` -> `для`; `hlelo`, `helllo` -> `hello`; and wrong-layout-plus-typo inputs such as `lkz`, `llkz`, `lzk` -> `для` and `руддщ`, `рдудщ`, `рудддщ` -> `hello`. The Windows input contract also keeps the physical identity of layout-ambiguous OEM keys, so wrong-layout Russian words that appear in English layout with punctuation-looking characters are supported: `;bpym` -> `жизнь`, `'[j` -> `эхо`, `j,]trn` -> `объект`, `,scnhj` -> `быстро`, and `k.lb` -> `люди`. Literal punctuation remains literal (`hello,` stays unchanged, while `hlelo,` -> `hello,`), including punctuation that appears only after layout conversion (`руддщб` -> `hello,`, `рдудщб` -> `hello,`). A token that is already an exact dictionary word in any configured language is kept unchanged.
 

@@ -5,7 +5,7 @@ pub use correction_engine::{
     Confidence, ConfidenceError, CorrectionCandidate, CorrectionCandidateProvider,
     CorrectionDecision, CorrectionEngine, ReplacementText, ReplacementTextError,
 };
-pub use lexical_provider::{LexicalCorrectionProvider, LexicalProviderError};
+pub use lexical_provider::{LexicalCorrectionProvider, LexicalProviderError, LexicalSnapshot};
 
 #[cfg(test)]
 mod correction_engine_certification;

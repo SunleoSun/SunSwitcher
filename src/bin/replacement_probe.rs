@@ -5,14 +5,17 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 mod windows_probe {
-    use sunswitcher::correction::{
-        Confidence, CorrectionDecision, CorrectionEngine, LexicalCorrectionProvider,
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sunswitcher::adaptive::{
+        AdaptiveCorrectionDirective, AdaptiveCorrectionSession, AdaptiveLexicalRuntime,
     };
-    use sunswitcher::input::{InputBuffer, InputEvent, InputOutcome};
-    use sunswitcher::language::{english_language_pack, russian_language_pack};
-    use sunswitcher::replacement::ReplacementEngine;
+    use sunswitcher::correction::Confidence;
+    use sunswitcher::input::InputEvent;
+    use sunswitcher::persistence::{Database, UndoHotkey};
+    use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome};
     use sunswitcher::windows::{
-        InputProcessor, RuntimeDirective, request_global_keyboard_hook_stop,
+        InputProcessor, RuntimeDirective, UndoDirective, request_global_keyboard_hook_stop,
         run_global_keyboard_hook,
     };
     use windows_sys::Win32::System::Console::{
@@ -26,6 +29,7 @@ mod windows_probe {
         println!(
             "The hook is global. After focusing/clicking another application, press Space once to establish a safe token boundary, then type an example followed by Space/Enter/Tab."
         );
+        println!("Undo hotkey: Pause (PS), with no modifiers.");
         println!("Stop with Ctrl+C in this console.");
 
         let Ok(_console_handler) = ConsoleControlHandler::install() else {
@@ -33,8 +37,14 @@ mod windows_probe {
             return;
         };
 
-        let processor = ProbeProcessor::new();
-        if let Err(error) = run_global_keyboard_hook(processor) {
+        let (processor, undo_hotkey) = match ProbeProcessor::new() {
+            Ok(processor) => processor,
+            Err(error) => {
+                eprintln!("Could not load the probe language snapshot from SQLite: {error}");
+                return;
+            }
+        };
+        if let Err(error) = run_global_keyboard_hook(processor, undo_hotkey) {
             eprintln!("replacement probe stopped: {error:?}");
             return;
         }
@@ -68,48 +78,77 @@ mod windows_probe {
     }
 
     struct ProbeProcessor {
-        input: InputBuffer,
-        corrections: CorrectionEngine<LexicalCorrectionProvider>,
-        replacements: ReplacementEngine,
+        _runtime: AdaptiveLexicalRuntime,
+        session: AdaptiveCorrectionSession,
     }
 
     impl ProbeProcessor {
-        fn new() -> Self {
-            Self {
-                input: InputBuffer::new(),
-                corrections: CorrectionEngine::new(
-                    LexicalCorrectionProvider::try_new(vec![
-                        russian_language_pack(),
-                        english_language_pack(),
-                    ])
-                    .expect("probe has configured languages"),
-                    Confidence::try_new(0.80).expect("valid probe threshold"),
-                ),
-                replacements: ReplacementEngine::new(),
-            }
+        fn new() -> Result<(Self, UndoHotkey), String> {
+            let database = Database::open_in_memory().map_err(|error| error.to_string())?;
+            let undo_hotkey = database
+                .settings()
+                .map_err(|error| error.to_string())?
+                .undo_hotkey();
+            let runtime =
+                AdaptiveLexicalRuntime::start(database).map_err(|error| error.to_string())?;
+            let session =
+                runtime.session(Confidence::try_new(0.80).expect("valid probe threshold"));
+            Ok((
+                Self {
+                    _runtime: runtime,
+                    session,
+                },
+                undo_hotkey,
+            ))
         }
+    }
+
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
     }
 
     impl InputProcessor for ProbeProcessor {
         fn process(&mut self, event: InputEvent) -> RuntimeDirective {
-            let InputOutcome::Completed(token) = self.input.process(event) else {
-                return RuntimeDirective::Pass;
-            };
-
-            let decision = self.corrections.decide(&token);
-            if matches!(decision, CorrectionDecision::Keep) {
-                return RuntimeDirective::Pass;
+            match self.session.process(event, now_ms()) {
+                Ok(AdaptiveCorrectionDirective::Pass) => RuntimeDirective::Pass,
+                Ok(AdaptiveCorrectionDirective::Replace(action)) => {
+                    println!("[REPLACE] -> {:?}", action.replacement().as_str());
+                    RuntimeDirective::Replace(action)
+                }
+                Err(error) => {
+                    eprintln!("adaptive correction skipped: {error}");
+                    RuntimeDirective::Pass
+                }
             }
+        }
 
-            let Some(action) = self.replacements.plan(&token, decision) else {
-                return RuntimeDirective::Pass;
-            };
-            println!(
-                "[REPLACE] {:?} -> {:?}",
-                token.text(),
-                action.replacement().as_str()
-            );
-            RuntimeDirective::Replace(action)
+        fn replacement_outcome(&mut self, outcome: ReplacementOutcome) {
+            if let Err(error) = self.session.replacement_outcome(outcome) {
+                eprintln!("adaptive correction outcome was not persisted: {error}");
+            }
+        }
+
+        fn undo(&mut self) -> UndoDirective {
+            match self.session.request_undo(now_ms()) {
+                Ok(Some(action)) => {
+                    println!("[UNDO] -> {:?}", action.replacement().as_str());
+                    UndoDirective::Restore(action)
+                }
+                Ok(None) => UndoDirective::Pass,
+                Err(error) => {
+                    eprintln!("adaptive undo skipped: {error}");
+                    UndoDirective::Pass
+                }
+            }
+        }
+
+        fn undo_outcome(&mut self, outcome: UndoOutcome) {
+            if let Err(error) = self.session.undo_outcome(outcome) {
+                eprintln!("adaptive undo outcome was not persisted: {error}");
+            }
         }
     }
 }

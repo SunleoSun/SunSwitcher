@@ -1,12 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::input::CompletedToken;
-use crate::language::{DictionaryEntry, LanguagePack, normalize_word};
+use crate::language::{KeyboardLayoutMap, LanguagePack, normalize_word};
+use crate::lexicon::{MAX_INDEX_DELETIONS, UserLexicon};
 
 use super::{Confidence, CorrectionCandidate, CorrectionCandidateProvider, ReplacementText};
-
-const MAX_INDEX_DELETIONS: usize = 2;
 const REPEATED_DELETE_COST: f32 = 0.45;
 const TRANSPOSE_COST: f32 = 0.75;
 
@@ -16,20 +16,74 @@ pub enum LexicalProviderError {
 }
 
 #[derive(Debug, Clone)]
-pub struct LexicalCorrectionProvider {
-    languages: Vec<LanguagePack>,
+pub struct LexicalSnapshot {
+    languages: Arc<[LanguagePack]>,
+    user_lexicon: Arc<UserLexicon>,
 }
 
-impl LexicalCorrectionProvider {
-    pub fn try_new(languages: Vec<LanguagePack>) -> Result<Self, LexicalProviderError> {
+impl LexicalSnapshot {
+    pub fn try_new(
+        languages: Vec<LanguagePack>,
+        user_lexicon: UserLexicon,
+    ) -> Result<Self, LexicalProviderError> {
         if languages.is_empty() {
             return Err(LexicalProviderError::NoLanguages);
         }
-        Ok(Self { languages })
+        Ok(Self {
+            languages: languages.into(),
+            user_lexicon: Arc::new(user_lexicon),
+        })
     }
 
     pub fn languages(&self) -> &[LanguagePack] {
         &self.languages
+    }
+
+    pub fn user_lexicon(&self) -> &UserLexicon {
+        &self.user_lexicon
+    }
+
+    pub(crate) fn with_user_lexicon(&self, user_lexicon: UserLexicon) -> Self {
+        Self {
+            languages: Arc::clone(&self.languages),
+            user_lexicon: Arc::new(user_lexicon),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LexicalCorrectionProvider {
+    snapshot: Arc<LexicalSnapshot>,
+}
+
+impl LexicalCorrectionProvider {
+    pub fn try_new(
+        languages: Vec<LanguagePack>,
+        user_lexicon: UserLexicon,
+    ) -> Result<Self, LexicalProviderError> {
+        Ok(Self {
+            snapshot: Arc::new(LexicalSnapshot::try_new(languages, user_lexicon)?),
+        })
+    }
+
+    pub fn from_snapshot(snapshot: Arc<LexicalSnapshot>) -> Self {
+        Self { snapshot }
+    }
+
+    pub fn languages(&self) -> &[LanguagePack] {
+        self.snapshot.languages()
+    }
+
+    pub fn user_lexicon(&self) -> &UserLexicon {
+        self.snapshot.user_lexicon()
+    }
+
+    fn contains_normalized(&self, normalized: &str) -> bool {
+        self.user_lexicon().contains_normalized(normalized)
+            || self
+                .languages()
+                .iter()
+                .any(|language| language.contains_normalized(normalized))
     }
 }
 
@@ -42,16 +96,10 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
         }
 
         let literal_view = LiteralWordView::from_token(token);
-        if self
-            .languages
-            .iter()
-            .any(|language| language.contains_normalized(&normalized))
-            || literal_view.as_ref().is_some_and(|view| {
-                let core = normalize_word(&view.core);
-                self.languages
-                    .iter()
-                    .any(|language| language.contains_normalized(&core))
-            })
+        if self.contains_normalized(&normalized)
+            || literal_view
+                .as_ref()
+                .is_some_and(|view| self.contains_normalized(&normalize_word(&view.core)))
         {
             // A literal word that is already valid in any configured language wins over
             // speculative cross-layout interpretation. This is especially important for
@@ -64,7 +112,7 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
         };
         let mut best_by_replacement: HashMap<String, RankedCandidate> = HashMap::new();
 
-        for language in &self.languages {
+        for language in self.languages() {
             for variant in language_variants(language, token, &literal_view) {
                 let max_edit_cost = max_edit_cost(variant.text.chars().count());
                 for entry in language.candidate_entries(&variant.text, MAX_INDEX_DELETIONS) {
@@ -88,26 +136,65 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                     let confidence = candidate_confidence(
                         edit_cost,
                         variant.layout_penalty,
-                        entry,
+                        entry.word().chars().count(),
+                        entry.frequency(),
                         language.max_frequency(),
                     );
-                    let ranked = RankedCandidate {
-                        replacement: replacement.clone(),
+                    insert_ranked_candidate(
+                        &mut best_by_replacement,
+                        RankedCandidate {
+                            replacement,
+                            confidence,
+                            edit_cost,
+                            layout_penalty: variant.layout_penalty,
+                            frequency: entry.frequency(),
+                        },
+                    );
+                }
+            }
+        }
+
+        for variant in user_variants(self.languages(), token, &literal_view) {
+            let max_edit_cost = max_edit_cost(variant.text.chars().count());
+            for entry in self
+                .user_lexicon()
+                .candidate_entries(&variant.text, MAX_INDEX_DELETIONS)
+            {
+                let edit_cost = weighted_damerau_cost(&variant.text, entry.normalized_term());
+                if edit_cost > max_edit_cost + f32::EPSILON {
+                    continue;
+                }
+                if edit_cost == 0.0 && variant.layout_penalty == 0.0 {
+                    continue;
+                }
+
+                let replacement = format!(
+                    "{}{}{}",
+                    variant.literal_prefix,
+                    entry.term(),
+                    variant.literal_suffix
+                );
+                if replacement == observed {
+                    continue;
+                }
+
+                let confidence = candidate_confidence(
+                    edit_cost,
+                    variant.layout_penalty,
+                    entry.normalized_term().chars().count(),
+                    entry.use_count(),
+                    self.user_lexicon().max_use_count(),
+                );
+                insert_ranked_candidate(
+                    &mut best_by_replacement,
+                    RankedCandidate {
+                        replacement,
                         confidence,
                         edit_cost,
                         layout_penalty: variant.layout_penalty,
-                        frequency: entry.frequency(),
-                    };
-
-                    best_by_replacement
-                        .entry(replacement)
-                        .and_modify(|current| {
-                            if ranked.is_better_than(current) {
-                                *current = ranked.clone();
-                            }
-                        })
-                        .or_insert(ranked);
-                }
+                        frequency: entry.use_count(),
+                    },
+                );
             }
         }
 
@@ -201,6 +288,28 @@ fn language_variants(
     token: &CompletedToken,
     literal_view: &LiteralWordView,
 ) -> Vec<ObservedVariant> {
+    observed_variants(language.transforms().iter(), token, literal_view)
+}
+
+fn user_variants(
+    languages: &[LanguagePack],
+    token: &CompletedToken,
+    literal_view: &LiteralWordView,
+) -> Vec<ObservedVariant> {
+    observed_variants(
+        languages
+            .iter()
+            .flat_map(|language| language.transforms().iter()),
+        token,
+        literal_view,
+    )
+}
+
+fn observed_variants<'a>(
+    transforms: impl IntoIterator<Item = &'a KeyboardLayoutMap>,
+    token: &CompletedToken,
+    literal_view: &LiteralWordView,
+) -> Vec<ObservedVariant> {
     let mut variants = Vec::new();
     push_variant(
         &mut variants,
@@ -213,7 +322,7 @@ fn language_variants(
         },
     );
 
-    for transform in language.transforms() {
+    for transform in transforms {
         if let Some(transformed) =
             transform.transform_with_physical(token.text(), token.physical_keys())
             && let Some(transformed_view) = LiteralWordView::from_transformed(&transformed)
@@ -275,6 +384,20 @@ impl RankedCandidate {
     }
 }
 
+fn insert_ranked_candidate(
+    candidates: &mut HashMap<String, RankedCandidate>,
+    ranked: RankedCandidate,
+) {
+    candidates
+        .entry(ranked.replacement.clone())
+        .and_modify(|current| {
+            if ranked.is_better_than(current) {
+                *current = ranked.clone();
+            }
+        })
+        .or_insert(ranked);
+}
+
 fn max_edit_cost(observed_chars: usize) -> f32 {
     match observed_chars {
         0..=2 => 0.0,
@@ -287,14 +410,15 @@ fn max_edit_cost(observed_chars: usize) -> f32 {
 fn candidate_confidence(
     edit_cost: f32,
     layout_penalty: f32,
-    entry: &DictionaryEntry,
-    max_frequency: u32,
+    target_chars: usize,
+    weight: u32,
+    max_weight: u32,
 ) -> Confidence {
     let total_cost = edit_cost + layout_penalty;
-    let length_scale = entry.word().chars().count().max(3) as f32 + 1.5;
+    let length_scale = target_chars.max(3) as f32 + 1.5;
     let quality = (1.0 - total_cost / length_scale).clamp(0.0, 1.0);
-    let frequency_ratio = (entry.frequency() as f32 / max_frequency.max(1) as f32).sqrt();
-    let score = (quality * 0.96 + frequency_ratio * 0.04).clamp(0.0, 0.999);
+    let weight_ratio = (weight as f32 / max_weight.max(1) as f32).sqrt();
+    let score = (quality * 0.96 + weight_ratio * 0.04).clamp(0.0, 0.999);
     Confidence::try_new(score).expect("lexical confidence is clamped to the typed range")
 }
 

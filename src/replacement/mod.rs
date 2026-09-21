@@ -1,7 +1,9 @@
 mod replacement_engine;
 mod selected_replacement;
 
-pub use replacement_engine::{ReplacementAction, ReplacementEngine};
+pub use replacement_engine::{
+    ReplacementAction, ReplacementEngine, ReplacementOutcome, UndoOutcome,
+};
 pub use selected_replacement::{
     SelectedReplacementAction, SelectedReplacementEngine, SelectedReplacementText,
     SelectedReplacementTextError, SelectedText, SelectedTextDecision, SelectedTextError,

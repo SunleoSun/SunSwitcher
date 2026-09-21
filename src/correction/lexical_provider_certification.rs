@@ -1,11 +1,14 @@
 use super::{Confidence, CorrectionDecision, CorrectionEngine, LexicalCorrectionProvider};
 use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome, PhysicalKey};
-use crate::language::{english_language_pack, russian_language_pack};
+use crate::lexicon::UserTermProtection;
+use crate::persistence::Database;
 
 fn engine() -> CorrectionEngine<LexicalCorrectionProvider> {
+    let database = Database::open_in_memory().unwrap();
+    let languages = database.load_enabled_language_packs().unwrap();
+    let user_lexicon = database.load_user_lexicon().unwrap();
     CorrectionEngine::new(
-        LexicalCorrectionProvider::try_new(vec![russian_language_pack(), english_language_pack()])
-            .unwrap(),
+        LexicalCorrectionProvider::try_new(languages, user_lexicon).unwrap(),
         Confidence::try_new(0.80).unwrap(),
     )
 }
@@ -158,4 +161,36 @@ fn certification_valid_bilingual_words_and_unknown_noise_fail_closed() {
 fn certification_case_survives_cross_layout_correction() {
     assert_eq!(replacement_for("Lkz").as_deref(), Some("Для"));
     assert_eq!(replacement_for("РУДДЩ").as_deref(), Some("HELLO"));
+}
+
+#[test]
+fn certification_user_lexicon_corrects_technical_identifiers_and_protects_exact_terms() {
+    let database = Database::open_in_memory().unwrap();
+    database
+        .record_user_term("QuantileEntryStrategy", UserTermProtection::Normal, 100)
+        .unwrap();
+    database
+        .record_user_term("QuantileEntryStrategy1", UserTermProtection::Protected, 200)
+        .unwrap();
+    let engine = CorrectionEngine::new(
+        LexicalCorrectionProvider::try_new(
+            database.load_enabled_language_packs().unwrap(),
+            database.load_user_lexicon().unwrap(),
+        )
+        .unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    );
+
+    let typo = CompletedToken::new("QuanntileEntrySrtategy", Boundary::Character(' '));
+    assert_eq!(
+        match engine.decide(&typo) {
+            CorrectionDecision::Replace(replacement) => Some(replacement.as_str().to_owned()),
+            CorrectionDecision::Keep => None,
+        }
+        .as_deref(),
+        Some("QuantileEntryStrategy")
+    );
+
+    let protected = CompletedToken::new("QuantileEntryStrategy1", Boundary::Character(' '));
+    assert_eq!(engine.decide(&protected), CorrectionDecision::Keep);
 }
