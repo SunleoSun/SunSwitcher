@@ -6,7 +6,7 @@ use super::{
 fn default_settings_use_the_explicit_clipboard_history_limit() {
     let database = Database::open_in_memory().expect("fresh in-memory database should open");
 
-    assert_eq!(database.schema_version().unwrap(), 3);
+    assert_eq!(database.schema_version().unwrap(), 4);
     assert_eq!(
         database.settings().unwrap().clipboard_history_limit(),
         ClipboardHistoryLimit::DEFAULT

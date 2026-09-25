@@ -1,35 +1,53 @@
 ---
-description: Maps canonical RU/EN dictionary surface-form ownership, runtime exact/delete indexes, inflection protection, and bootstrap persistence; read before changing system dictionaries, grammatical-form handling, or lexical candidate generation.
+description: Maps canonical built-in RU/EN FST dictionary ownership, full-vocabulary exact/completion lookup, bounded correction subsets, custom-language fallback, source regeneration, and validation; read before changing system dictionaries, grammatical-form handling, or lexical candidate generation.
 ---
 
 # Language Dictionaries
 
 ## Purpose
 
-System language dictionaries are the canonical vocabulary used to decide whether a token is already valid and to generate typo candidates. The persistence layer stores normalized surface forms and frequencies; `LanguagePack` turns those rows into immutable exact/delete indexes for the keyboard hot path.
+Built-in Russian and English dictionaries are immutable FST assets under `assets/dictionaries/`. They are the canonical shipped vocabulary for exact validity and system-word completion. Language morphology is represented by accepted surface forms; runtime suffix heuristics or a second spellchecker are not allowed.
+
+## Built-in asset contract
+
+Each built-in language has two FSTs with the same stored frequency scale:
+
+- `ru.fst` / `en.fst`: full accepted alphabetic surface vocabulary. Exact validity and completion query these assets directly.
+- `ru-correction.fst` / `en-correction.fst`: frequency-filtered subsets used only to build the typo `DeleteIndex`, so startup does not expand/index millions of rare forms.
+
+Current full counts are 3,022,339 Russian forms and 88,750 English forms. Current correction subsets use score >= 4001 (approximately Zipf >= 4.00) and contain 9,484 Russian and 7,021 English forms. A correction-sidecar entry must exist in the full FST with exactly the same frequency or `LanguagePack` rejects the asset.
+
+`LanguagePack` owns one shared immutable `LanguageDictionaryData`: the full `fst::Map`, the materialized correction entries/delete index, and the correction-set maximum frequency. `LanguagePack` clones are cheap through `Arc`. `contains_normalized` uses the full FST. `candidate_entries` uses only the correction delete index. `prefix_matches` streams the full FST prefix range but retains only the requested bounded top-frequency results, avoiding materializing every match for broad prefixes.
 
 ## Surface forms, not suffix heuristics
 
-A dictionary row represents an accepted surface form. Russian cases, numbers, genders, and adjective forms and English plural/verb inflections that should be accepted must exist as exact rows, for example `слово`, `слову`, `словом`, `words`, and `working`. The correction provider must not infer "valid morphology" from ad-hoc suffix rules because that would create a second language-specific correction authority and can protect real typos. For broad automatic Russian endings, expand the same canonical surface-form dictionary from a real morphology source/paradigm corpus rather than adding runtime suffix heuristics; the current embedded seed is representative, not a complete Russian morphology lexicon.
+A valid grammatical form must exist exactly in the full asset. Russian cases/numbers/genders/adjective/verb forms and English plural/verb inflections are protected because the source dictionaries enumerate them. Exact membership is checked before typo candidate generation, so a valid inflected form is kept even when it is one edit from a more frequent lemma. Rare forms remain exact-valid even when deliberately excluded from typo generation by the correction frequency threshold.
 
-Exact dictionary membership is checked before typo candidate generation. Therefore a valid grammatical form must be kept unchanged even when it is one edit away from a more frequent lemma. Surface forms also participate in the same delete-index typo correction, so a typo of an inflected form can correct back to that inflected form rather than being collapsed to the lemma.
+Dictionary assets contain alphabetic words only. Hyphenated Russian forms and apostrophe-bearing English forms are excluded because current token ownership treats such punctuation as boundaries rather than part of one lexical token. The offline producer and Rust FST builder both enforce this contract.
 
-## Ownership boundary
+## Sources and regeneration
 
-SQLite `languages` and `dictionary_words` are the persistent lexical authority. `src/persistence/database.rs` owns bootstrap rows and stored-row validation. `src/language/language_pack.rs` owns immutable runtime indexes. `src/correction/lexical_provider.rs` consumes those indexes and remains language-agnostic. RU/EN keyboard-layout maps remain in `src/language/russian.rs` and `src/language/english.rs`; they are not dictionary data. `KeyboardLayoutMap::transform_text` remains a directional source-to-target transform: mapped symbols are converted, nonalphabetic separators are preserved, and unmapped alphabetic characters fail closed. The Windows hook reserves the physical OEM3 (`/ё) key as layout-switch service input: it is ignored by token tracking before translation, so pressing the configured layout-switch key cannot prefix the next lexical token with ` or ё. The layout maps still understand those symbols for explicit text transformation. `switch_keyboard_layout_text` owns explicit Double Shift semantics by applying the directional maps per character, so mixed-layout text flips every recognized physical-layout symbol instead of requiring the whole string to belong to one source layout. The target `LanguageId` is selected by a unique majority of per-character target-language mappings; an exact tie or conflicting per-character mapping fails closed. The returned typed `KeyboardLayoutSwitch` remains the single source for both transformed text and the OS input-language request. `TextCasePattern` is the shared owner for simple lower/upper/title casing: correction and completion match normalized identity but adapt output casing to the user's observed text instead of inheriting incidental stored capitalization. Mixed identifiers retain their canonical internal casing outside the exact prefix typed by the user.
+`tools/dictionaries/build_scored_sources.py` is the deterministic source-to-TSV producer. Pinned generation dependencies are in `tools/dictionaries/requirements.txt`.
 
-While no released database compatibility contract exists, shipped vocabulary lives directly in the single bootstrap schema. Once a schema version is shipped to real users, later dictionary additions that must reach existing databases should use forward migrations rather than silently depending on a fresh install.
+- Russian surface forms: OpenCorpora morphological data (CC BY-SA 3.0) via pinned `pymorphy3-dicts-ru==2.4.417150.4580142` and `pymorphy3==2.0.6`.
+- English surface forms: SCOWLv2 commit `7e99edab8e32f9f9ea2b15f249ca8d4d67237410`, American size-60 word list, variant level 1, special categories disabled.
+- Frequency ranking: `wordfreq==3.1.1`, stored as `max(1, round(zipf_frequency * 1000) + 1)`; generated frequency metadata carries wordfreq's upstream attribution/share-alike obligations documented in `assets/dictionaries/THIRD_PARTY_NOTICES.txt`.
 
-## Scope
+The producer lowercases, keeps alphabetic forms, deduplicates, sorts, and writes scored TSV. `src/bin/dictionary_builder.rs` validates the normalized/sorted/unique/positive-frequency contract and builds FSTs; its optional minimum-frequency argument builds correction sidecars. Source notices and exact regeneration commands live in `assets/dictionaries/README.md` and `THIRD_PARTY_NOTICES.txt`.
 
-The current built-in dictionary is still a representative embedded lexicon, not a production-complete natural-language corpus. When a broader licensed dictionary is introduced, import its accepted surface forms into the same canonical `dictionary_words` contract rather than adding a parallel spellchecker or morphology authority.
+## Persistence and layout ownership
+
+SQLite `languages` remains the enablement/configuration authority. Built-in `ru`/`en` vocabulary content does not live in SQLite after schema v4; `Database::load_enabled_language_packs` resolves enabled RU/EN IDs to the built-in assets. `dictionary_words` remains the fallback vocabulary store for enabled custom/non-built-in language IDs, preserving the existing extensibility contract without creating two RU/EN authorities.
+
+Keyboard-layout maps remain in `src/language/russian.rs` and `src/language/english.rs`; they are not dictionary data. `KeyboardLayoutMap::transform_text`, mixed-layout Double Shift behavior, and `TextCasePattern` remain independent typed behavior owners.
 
 ## Validation
 
-Changes to shipped dictionary data should certify that fresh databases contain the intended rows, valid representative surface forms are kept exactly, and representative typos can still correct to the intended surface form. After a persistent compatibility baseline is released, add upgrade-path certification as well. Finish with the full lexical-provider and persistence certifications plus the normal project validation suite.
+High-value checks cover representative Russian inflections and `ё`, English inflections, separation of full exact vocabulary from the correction subset, correction-sidecar/full-asset consistency, schema-v4 removal of legacy RU/EN rows, custom-language SQLite fallback, lexical correction behavior, completion behavior, and the normal full Rust validation suite.
 
 ## Related memory
 
 - `components/persistence`
-- `main/core-project-principles`
 - `components/user-lexicon`
+- `components/completion`
+- `main/core-project-principles`

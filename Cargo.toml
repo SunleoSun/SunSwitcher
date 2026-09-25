@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["glow"] }
+fst = "0.4.7"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 uiautomation = "0.25.1"
 winit = { version = "0.30.13", default-features = false }
@@ -26,3 +27,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
 ] }
+
+[profile.test]
+opt-level = 2

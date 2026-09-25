@@ -1,0 +1,38 @@
+Russian surface-form data: OpenCorpora
+=======================================
+
+The Russian morphological dictionary consumed by SunSwitcher ultimately comes from OpenCorpora:
+https://opencorpora.org/?page=downloads
+
+OpenCorpora data is licensed under Creative Commons Attribution-ShareAlike 3.0 (CC BY-SA 3.0):
+https://creativecommons.org/licenses/by-sa/3.0/
+
+OpenCorpora requires attribution and ShareAlike for works based on its data. The pinned generation path uses `pymorphy3-dicts-ru 2.4.417150.4580142` via `pymorphy3 2.0.6`; the pymorphy3-dicts build/package project itself is MIT-licensed, but that does not replace the OpenCorpora data license.
+
+pymorphy3-dicts project: https://github.com/no-plagiarism/pymorphy3-dicts
+Package author metadata: Danylo Halaiko
+
+English surface-form data: SCOWLv2
+==================================
+
+SCOWLv2, commit 7e99edab8e32f9f9ea2b15f249ca8d4d67237410
+Copyright 2000-2026 by Kevin Atkinson
+
+Permission to use, copy, modify, distribute, and sell any part of SCOWLv2, or word lists created from it, is hereby granted without fee, provided that the above copyright notice appears in all copies and that both the above copyright notice and this notice appear in supporting documentation. Kevin Atkinson makes no representations about the suitability of this database for any purpose. It is provided "as is" without express or implied warranty.
+
+SCOWL is derived from many sources, most of which are in the Public Domain. Data from the Corpus of Contemporary American English (COCA) was also used.
+
+The generated English word list uses size 60, American spelling, variant level 1, and disables special categories. SCOWL states that for an official non-Australian speller dictionary the notice above is sufficient; this asset does not use Australian spelling or a list larger than size 80.
+
+Frequency metadata: wordfreq
+============================
+
+wordfreq 3.1.1
+Copyright 2022 Robyn Speer
+Upstream: https://github.com/rspeer/wordfreq
+
+wordfreq code is licensed under the Apache License 2.0. Its NOTICE states that included data files may be redistributed under Creative Commons Attribution-ShareAlike 4.0 (CC BY-SA 4.0), with additional source-specific attribution requirements. SunSwitcher derives the numeric frequency values stored in the generated FST assets from `wordfreq.zipf_frequency`, so redistribution of these generated assets must preserve the applicable wordfreq data attribution/share-alike obligations.
+
+Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
+CC BY-SA 4.0: https://creativecommons.org/licenses/by-sa/4.0/
+wordfreq attribution details: https://github.com/rspeer/wordfreq/blob/master/NOTICE.md

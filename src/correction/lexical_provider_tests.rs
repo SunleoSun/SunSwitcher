@@ -79,6 +79,33 @@ fn punctuation_created_by_layout_transform_is_not_counted_as_a_typo() {
 }
 
 #[test]
+fn exact_wrong_layout_candidate_uses_the_full_builtin_dictionary() {
+    let provider = provider();
+    let russian = provider
+        .languages()
+        .iter()
+        .find(|language| language.id().as_str() == "ru")
+        .unwrap();
+    for (observed, expected) in [("'[j", "эхо"), ("`krf", "ёлка")] {
+        let token = completed_physical_token(observed);
+        let transformed =
+            russian.transforms()[0].transform_with_physical(token.text(), token.physical_keys());
+        assert_eq!(transformed.as_deref(), Some(expected), "{observed:?}");
+        assert!(
+            russian.exact_entry(expected).is_some(),
+            "missing exact {expected:?}"
+        );
+        let candidates = provider.candidates(&token);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.replacement().as_str() == expected),
+            "{observed:?} -> {expected:?}, candidates={candidates:?}"
+        );
+    }
+}
+
+#[test]
 fn provider_preserves_simple_case_pattern() {
     let provider = provider();
     let title = CompletedToken::new("Lkz", Boundary::Character(' '));

@@ -6,12 +6,12 @@ use rusqlite::{Connection, TransactionBehavior, params};
 
 use crate::completion::sequence::{SequenceCandidate, SequenceHistory, SequenceHistoryError};
 use crate::language::{
-    DictionaryEntry, LanguageId, LanguagePack, LanguagePackError, language_pack_from_entries,
-    normalize_word,
+    DictionaryEntry, LanguageId, LanguagePack, LanguagePackError, builtin_language_pack,
+    language_pack_from_entries, normalize_word,
 };
 use crate::lexicon::{UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 const SCHEMA_V1: &str = r#"
 CREATE TABLE app_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -254,6 +254,13 @@ CREATE TABLE completion_hidden_words (
 const SCHEMA_V3: &str = r#"
 DELETE FROM user_words WHERE instr(term, char(96)) > 0;
 DELETE FROM text_history WHERE instr(text, char(96)) > 0;
+"#;
+
+// Built-in RU/EN vocabulary moved to compact immutable FST assets. Keeping the old seed rows would
+// create a second system-dictionary authority with different frequency semantics.
+const SCHEMA_V4: &str = r#"
+DELETE FROM dictionary_words
+WHERE language_id IN (SELECT id FROM languages WHERE code IN ('ru', 'en'));
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,6 +561,12 @@ impl Database {
 
         let mut packs = Vec::with_capacity(languages.len());
         for (database_id, code) in languages {
+            let id = LanguageId::try_new(code)?;
+            if let Some(pack) = builtin_language_pack(&id)? {
+                packs.push(pack);
+                continue;
+            }
+
             let mut word_statement = self.connection.prepare(
                 "SELECT term, normalized_term, frequency FROM dictionary_words WHERE language_id = ?1 ORDER BY id",
             )?;
@@ -578,7 +591,6 @@ impl Database {
                 entries.push(DictionaryEntry::try_new(term, frequency)?);
             }
 
-            let id = LanguageId::try_new(code)?;
             packs.push(language_pack_from_entries(id, entries)?);
         }
         Ok(packs)
@@ -883,6 +895,14 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V3)?;
         transaction.pragma_update(None, "user_version", 3)?;
+        transaction.commit()?;
+        version = 3;
+    }
+
+    if version < 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V4)?;
+        transaction.pragma_update(None, "user_version", 4)?;
         transaction.commit()?;
     }
 

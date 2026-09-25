@@ -88,6 +88,22 @@ impl LexicalCorrectionProvider {
                 .any(|language| language.contains_normalized(normalized))
     }
 
+    fn has_exact_cross_layout_interpretation(&self, token: &CompletedToken) -> bool {
+        self.languages().iter().any(|language| {
+            language.transforms().iter().any(|transform| {
+                let Some(transformed) =
+                    transform.transform_with_physical(token.text(), token.physical_keys())
+                else {
+                    return false;
+                };
+                let Some(view) = LiteralWordView::from_transformed(&transformed) else {
+                    return false;
+                };
+                language.contains_normalized(&normalize_word(&view.core))
+            })
+        })
+    }
+
     pub fn canonical_learning_term(&self, token: &CompletedToken) -> String {
         if let Some(view) = LiteralWordView::from_token(token) {
             return view.core;
@@ -109,14 +125,16 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
         }
 
         let literal_view = LiteralWordView::from_token(token);
+        let literal_core_is_valid = literal_view
+            .as_ref()
+            .is_some_and(|view| self.contains_normalized(&normalize_word(&view.core)));
         if self.contains_normalized(&normalized)
-            || literal_view
-                .as_ref()
-                .is_some_and(|view| self.contains_normalized(&normalize_word(&view.core)))
+            || (literal_core_is_valid && !self.has_exact_cross_layout_interpretation(token))
         {
             // A literal word that is already valid in any configured language wins over
-            // speculative cross-layout interpretation. This is especially important for
-            // ordinary text followed by deferred punctuation such as "hello,".
+            // speculative cross-layout interpretation. Deferred punctuation such as "hello,"
+            // is therefore preserved unless the complete physical token has an exact
+            // cross-layout dictionary interpretation of its own.
             return Vec::new();
         }
 
@@ -127,42 +145,25 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
 
         for language in self.languages() {
             for variant in language_variants(language, token, &literal_view) {
-                let max_edit_cost = max_edit_cost(variant.text.chars().count());
-                for entry in language.candidate_entries(&variant.text, MAX_INDEX_DELETIONS) {
-                    let edit_cost = weighted_damerau_cost(&variant.text, entry.word());
-                    if edit_cost > max_edit_cost + f32::EPSILON {
-                        continue;
-                    }
-                    if edit_cost == 0.0 && variant.layout_penalty == 0.0 {
-                        continue;
-                    }
-
-                    let corrected = variant.case_pattern.apply(entry.word());
-                    let replacement = format!(
-                        "{}{}{}",
-                        variant.literal_prefix, corrected, variant.literal_suffix
-                    );
-                    if replacement == observed {
-                        continue;
-                    }
-
-                    let confidence = candidate_confidence(
-                        edit_cost,
-                        variant.layout_penalty,
-                        entry.word().chars().count(),
-                        entry.frequency(),
-                        language.max_frequency(),
-                    );
-                    insert_ranked_candidate(
+                if let Some(entry) = language.exact_entry(&variant.text) {
+                    consider_language_entry(
                         &mut best_by_replacement,
-                        RankedCandidate {
-                            replacement,
-                            confidence,
-                            edit_cost,
-                            layout_penalty: variant.layout_penalty,
-                            frequency: entry.frequency(),
-                            target_language: variant.target_language.clone(),
-                        },
+                        observed,
+                        language,
+                        &variant,
+                        &entry,
+                    );
+                }
+                for entry in language.candidate_entries(&variant.text, MAX_INDEX_DELETIONS) {
+                    if entry.word() == variant.text {
+                        continue;
+                    }
+                    consider_language_entry(
+                        &mut best_by_replacement,
+                        observed,
+                        language,
+                        &variant,
+                        entry,
                     );
                 }
             }
@@ -396,6 +397,49 @@ fn push_variant(variants: &mut Vec<ObservedVariant>, candidate: ObservedVariant)
     } else {
         variants.push(candidate);
     }
+}
+
+fn consider_language_entry(
+    candidates: &mut HashMap<String, RankedCandidate>,
+    observed: &str,
+    language: &LanguagePack,
+    variant: &ObservedVariant,
+    entry: &crate::language::DictionaryEntry,
+) {
+    let edit_cost = weighted_damerau_cost(&variant.text, entry.word());
+    if edit_cost > max_edit_cost(variant.text.chars().count()) + f32::EPSILON
+        || (edit_cost == 0.0 && variant.layout_penalty == 0.0)
+    {
+        return;
+    }
+
+    let corrected = variant.case_pattern.apply(entry.word());
+    let replacement = format!(
+        "{}{}{}",
+        variant.literal_prefix, corrected, variant.literal_suffix
+    );
+    if replacement == observed {
+        return;
+    }
+
+    let confidence = candidate_confidence(
+        edit_cost,
+        variant.layout_penalty,
+        entry.word().chars().count(),
+        entry.frequency(),
+        language.max_frequency(),
+    );
+    insert_ranked_candidate(
+        candidates,
+        RankedCandidate {
+            replacement,
+            confidence,
+            edit_cost,
+            layout_penalty: variant.layout_penalty,
+            frequency: entry.frequency(),
+            target_language: variant.target_language.clone(),
+        },
+    );
 }
 
 #[derive(Debug, Clone)]

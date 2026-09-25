@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 
 use crate::input::PhysicalKey;
 use crate::lexicon::{DeleteIndex, MAX_INDEX_DELETIONS};
@@ -10,6 +13,7 @@ pub struct LanguageId(String);
 pub enum LanguagePackError {
     InvalidLanguageId,
     InvalidDictionaryEntry,
+    InvalidDictionaryAsset,
     InvalidLayoutMap,
     EmptyDictionary,
 }
@@ -191,14 +195,19 @@ fn single_uppercase(character: char) -> Option<char> {
     uppercase.next().is_none().then_some(first)
 }
 
+#[derive(Debug)]
+struct LanguageDictionaryData {
+    dictionary: Map<Vec<u8>>,
+    correction_entries: Vec<DictionaryEntry>,
+    delete_index: DeleteIndex,
+    max_frequency: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct LanguagePack {
     id: LanguageId,
-    entries: Vec<DictionaryEntry>,
-    exact_index: HashMap<String, usize>,
-    delete_index: DeleteIndex,
+    data: Arc<LanguageDictionaryData>,
     transforms: Vec<KeyboardLayoutMap>,
-    max_frequency: u32,
 }
 
 impl LanguagePack {
@@ -225,31 +234,102 @@ impl LanguagePack {
 
         let mut entries: Vec<_> = deduplicated.into_values().collect();
         entries.sort_by(|left, right| left.word.cmp(&right.word));
-        let max_frequency = entries
+        let dictionary = build_dictionary_map(&entries)?;
+        Self::from_dictionary(id, dictionary, entries, transforms)
+    }
+
+    pub fn try_from_fst_bytes(
+        id: LanguageId,
+        dictionary_bytes: Vec<u8>,
+        correction_bytes: Vec<u8>,
+        transforms: Vec<KeyboardLayoutMap>,
+    ) -> Result<Self, LanguagePackError> {
+        let dictionary =
+            Map::new(dictionary_bytes).map_err(|_| LanguagePackError::InvalidDictionaryAsset)?;
+        if dictionary.is_empty() {
+            return Err(LanguagePackError::EmptyDictionary);
+        }
+        let correction_dictionary =
+            Map::new(correction_bytes).map_err(|_| LanguagePackError::InvalidDictionaryAsset)?;
+        if correction_dictionary.is_empty() {
+            return Err(LanguagePackError::InvalidDictionaryAsset);
+        }
+
+        let mut correction_entries = Vec::with_capacity(correction_dictionary.len());
+        let mut max_frequency = 1_u32;
+        let mut stream = correction_dictionary.stream();
+        while let Some((key, stored_frequency)) = stream.next() {
+            let word =
+                std::str::from_utf8(key).map_err(|_| LanguagePackError::InvalidDictionaryAsset)?;
+            let frequency = u32::try_from(stored_frequency)
+                .map_err(|_| LanguagePackError::InvalidDictionaryAsset)?;
+            if frequency == 0 || normalize_word(word) != word {
+                return Err(LanguagePackError::InvalidDictionaryAsset);
+            }
+            if dictionary.get(word) != Some(stored_frequency) {
+                return Err(LanguagePackError::InvalidDictionaryAsset);
+            }
+            max_frequency = max_frequency.max(frequency);
+            correction_entries.push(DictionaryEntry {
+                word: word.to_owned(),
+                frequency,
+            });
+        }
+        Self::from_dictionary_with_max(
+            id,
+            dictionary,
+            correction_entries,
+            transforms,
+            max_frequency,
+        )
+    }
+
+    fn from_dictionary(
+        id: LanguageId,
+        dictionary: Map<Vec<u8>>,
+        correction_entries: Vec<DictionaryEntry>,
+        transforms: Vec<KeyboardLayoutMap>,
+    ) -> Result<Self, LanguagePackError> {
+        let max_frequency = correction_entries
             .iter()
             .map(DictionaryEntry::frequency)
             .max()
             .unwrap_or(1);
+        Self::from_dictionary_with_max(
+            id,
+            dictionary,
+            correction_entries,
+            transforms,
+            max_frequency,
+        )
+    }
 
-        let mut exact_index = HashMap::new();
-        for (index, entry) in entries.iter().enumerate() {
-            exact_index.insert(entry.word.clone(), index);
+    fn from_dictionary_with_max(
+        id: LanguageId,
+        dictionary: Map<Vec<u8>>,
+        correction_entries: Vec<DictionaryEntry>,
+        transforms: Vec<KeyboardLayoutMap>,
+        max_frequency: u32,
+    ) -> Result<Self, LanguagePackError> {
+        if correction_entries.is_empty() {
+            return Err(LanguagePackError::EmptyDictionary);
         }
         let delete_index = DeleteIndex::build(
-            entries
+            correction_entries
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| (index, entry.word())),
             MAX_INDEX_DELETIONS,
         );
-
         Ok(Self {
             id,
-            entries,
-            exact_index,
-            delete_index,
+            data: Arc::new(LanguageDictionaryData {
+                dictionary,
+                correction_entries,
+                delete_index,
+                max_frequency,
+            }),
             transforms,
-            max_frequency,
         })
     }
 
@@ -258,7 +338,16 @@ impl LanguagePack {
     }
 
     pub fn contains_normalized(&self, word: &str) -> bool {
-        self.exact_index.contains_key(word)
+        self.data.dictionary.contains_key(word)
+    }
+
+    pub fn exact_entry(&self, normalized_word: &str) -> Option<DictionaryEntry> {
+        let stored_frequency = self.data.dictionary.get(normalized_word)?;
+        let frequency = u32::try_from(stored_frequency).ok()?;
+        Some(DictionaryEntry {
+            word: normalized_word.to_owned(),
+            frequency,
+        })
     }
 
     pub fn transforms(&self) -> &[KeyboardLayoutMap] {
@@ -266,10 +355,10 @@ impl LanguagePack {
     }
 
     pub fn max_frequency(&self) -> u32 {
-        self.max_frequency
+        self.data.max_frequency
     }
 
-    pub fn prefix_matches(&self, prefix: &str, limit: usize) -> Vec<&DictionaryEntry> {
+    pub fn prefix_matches(&self, prefix: &str, limit: usize) -> Vec<DictionaryEntry> {
         if limit == 0 {
             return Vec::new();
         }
@@ -278,28 +367,65 @@ impl LanguagePack {
             return Vec::new();
         }
 
-        let mut entries: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.word().starts_with(&normalized_prefix))
-            .collect();
-        entries.sort_by(|left, right| {
-            right
-                .frequency()
-                .cmp(&left.frequency())
-                .then_with(|| left.word().cmp(right.word()))
-        });
-        entries.truncate(limit);
+        let prefix_bytes = normalized_prefix.as_bytes();
+        let mut stream = self.data.dictionary.range().ge(prefix_bytes).into_stream();
+        let mut entries: Vec<DictionaryEntry> = Vec::with_capacity(limit);
+        while let Some((key, stored_frequency)) = stream.next() {
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Ok(word) = std::str::from_utf8(key) else {
+                break;
+            };
+            let Ok(frequency) = u32::try_from(stored_frequency) else {
+                break;
+            };
+
+            if entries.len() == limit {
+                let worst = entries.last().expect("limit is non-zero");
+                if frequency < worst.frequency()
+                    || (frequency == worst.frequency() && word >= worst.word())
+                {
+                    continue;
+                }
+            }
+
+            entries.push(DictionaryEntry {
+                word: word.to_owned(),
+                frequency,
+            });
+            entries.sort_by(|left, right| {
+                right
+                    .frequency()
+                    .cmp(&left.frequency())
+                    .then_with(|| left.word().cmp(right.word()))
+            });
+            entries.truncate(limit);
+        }
         entries
     }
 
     pub fn candidate_entries(&self, observed: &str, max_deletions: usize) -> Vec<&DictionaryEntry> {
-        self.delete_index
+        self.data
+            .delete_index
             .candidate_indices(observed, max_deletions)
             .into_iter()
-            .map(|index| &self.entries[index])
+            .map(|index| &self.data.correction_entries[index])
             .collect()
     }
+}
+
+fn build_dictionary_map(entries: &[DictionaryEntry]) -> Result<Map<Vec<u8>>, LanguagePackError> {
+    let mut builder = MapBuilder::memory();
+    for entry in entries {
+        builder
+            .insert(entry.word(), u64::from(entry.frequency()))
+            .map_err(|_| LanguagePackError::InvalidDictionaryAsset)?;
+    }
+    let bytes = builder
+        .into_inner()
+        .map_err(|_| LanguagePackError::InvalidDictionaryAsset)?;
+    Map::new(bytes).map_err(|_| LanguagePackError::InvalidDictionaryAsset)
 }
 
 pub fn normalize_word(word: &str) -> String {
@@ -326,6 +452,58 @@ mod tests {
                     .any(|entry| entry.word() == "для")
             );
         }
+    }
+
+    fn fst_bytes(entries: &[(&str, u32)]) -> Vec<u8> {
+        let mut builder = MapBuilder::memory();
+        for (word, frequency) in entries {
+            builder.insert(word, u64::from(*frequency)).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn fst_dictionary_separates_full_membership_from_correction_candidates() {
+        let pack = LanguagePack::try_from_fst_bytes(
+            LanguageId::try_new("test").unwrap(),
+            fst_bytes(&[("hello", 100), ("help", 90), ("hero", 80), ("zoo", 5)]),
+            fst_bytes(&[("hello", 100), ("help", 90)]),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(pack.contains_normalized("zoo"));
+        assert!(
+            pack.candidate_entries("hellp", 2)
+                .iter()
+                .any(|entry| entry.word() == "hello")
+        );
+        assert!(
+            pack.candidate_entries("zop", 2)
+                .iter()
+                .all(|entry| entry.word() != "zoo")
+        );
+        assert_eq!(
+            pack.prefix_matches("he", 2)
+                .iter()
+                .map(DictionaryEntry::word)
+                .collect::<Vec<_>>(),
+            ["hello", "help"]
+        );
+    }
+
+    #[test]
+    fn fst_correction_asset_must_match_the_full_dictionary() {
+        let result = LanguagePack::try_from_fst_bytes(
+            LanguageId::try_new("test").unwrap(),
+            fst_bytes(&[("hello", 100)]),
+            fst_bytes(&[("hello", 99)]),
+            Vec::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(LanguagePackError::InvalidDictionaryAsset)
+        ));
     }
 
     #[test]
