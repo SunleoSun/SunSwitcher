@@ -17,7 +17,7 @@ fn replacement_for(input: &str) -> Option<String> {
     replacement_for_token(token)
 }
 
-fn replacement_for_physical_input(input: &str) -> Option<String> {
+fn decision_for_physical_input(input: &str) -> CorrectionDecision {
     let mut buffer = InputBuffer::new();
     for character in input.chars() {
         let physical_key = PhysicalKey::from_layout_symbol(character);
@@ -29,7 +29,14 @@ fn replacement_for_physical_input(input: &str) -> Option<String> {
     let InputOutcome::Completed(token) = buffer.process(InputEvent::character(' ')) else {
         panic!("expected token completion for {input:?}");
     };
-    replacement_for_token(token)
+    engine().decide(&token)
+}
+
+fn replacement_for_physical_input(input: &str) -> Option<String> {
+    match decision_for_physical_input(input) {
+        CorrectionDecision::Keep => None,
+        CorrectionDecision::Replace(replacement) => Some(replacement.as_str().to_owned()),
+    }
 }
 
 fn replacement_for_token(token: CompletedToken) -> Option<String> {
@@ -84,6 +91,37 @@ fn certification_wrong_layout_and_typo_can_be_corrected_in_one_candidate_path() 
             "{observed:?}"
         );
     }
+}
+
+#[test]
+fn certification_wrong_layout_decision_keeps_its_target_language() {
+    let CorrectionDecision::Replace(to_russian) = decision_for_physical_input("lkz") else {
+        panic!("wrong-layout Russian word must be replaced");
+    };
+    assert_eq!(to_russian.as_str(), "для");
+    assert_eq!(
+        to_russian.target_language().map(|id| id.as_str()),
+        Some("ru")
+    );
+
+    let CorrectionDecision::Replace(to_english) = decision_for_physical_input("руддщ") else {
+        panic!("wrong-layout English word must be replaced");
+    };
+    assert_eq!(to_english.as_str(), "hello");
+    assert_eq!(
+        to_english.target_language().map(|id| id.as_str()),
+        Some("en")
+    );
+
+    let Some(same_layout) = replacement_for("дял") else {
+        panic!("same-layout typo must be corrected");
+    };
+    assert_eq!(same_layout, "для");
+    let token = CompletedToken::new("дял", Boundary::Character(' '));
+    let CorrectionDecision::Replace(same_layout) = engine().decide(&token) else {
+        panic!("same-layout typo must be corrected");
+    };
+    assert_eq!(same_layout.target_language(), None);
 }
 
 #[test]

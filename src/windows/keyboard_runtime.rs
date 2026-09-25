@@ -2,31 +2,40 @@ use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx, VK_BACK, VK_CAPITAL, VK_CONTROL,
-    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
-    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT,
-    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB, VK_UP,
+    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, INPUT, INPUT_KEYBOARD,
+    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx, VK_BACK, VK_CAPITAL,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_OEM_1, VK_OEM_3, VK_OEM_4,
+    VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN,
+    VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW,
+    PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
 };
 
+use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
 use crate::input::{Boundary, InputEvent, PhysicalKey, TypedCharacter};
+use crate::language::{KeyboardLayoutSwitch, LanguageId};
 use crate::persistence::UndoHotkey;
-use crate::replacement::{ReplacementAction, ReplacementOutcome, UndoOutcome};
+use crate::replacement::{
+    ReplacementAction, ReplacementOutcome, SelectedReplacementEngine, SelectedReplacementText,
+    SelectedTextDecision, UndoOutcome,
+};
+
+use super::selected_text_runtime::SelectedTextSession;
 
 const SUNSWITCHER_INJECTED_MARKER: usize = 0x5355_4E53_5749_5443;
 const TO_UNICODE_DO_NOT_CHANGE_STATE: u32 = 0x4;
+const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 
 pub trait InputProcessor: Send + 'static {
     fn process(&mut self, event: InputEvent) -> RuntimeDirective;
@@ -37,7 +46,23 @@ pub trait InputProcessor: Send + 'static {
         UndoDirective::Pass
     }
 
+    fn delete_user_word(&mut self, _text: &str) {}
+
     fn undo_outcome(&mut self, _outcome: UndoOutcome) {}
+
+    fn completion_active(&self) -> bool {
+        false
+    }
+
+    fn switch_layout_text(&self, _text: &str) -> Option<KeyboardLayoutSwitch> {
+        None
+    }
+
+    fn completion_command(&mut self, _command: CompletionCommand) -> CompletionCommandResult {
+        CompletionCommandResult::Pass
+    }
+
+    fn completion_word_outcome(&mut self, _outcome: CompletionApplyOutcome) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +75,19 @@ pub enum RuntimeDirective {
 pub enum UndoDirective {
     Pass,
     Restore(ReplacementAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PauseHotkeyAction {
+    DeleteSelectedUserWord(String),
+    UndoPreviousCorrection,
+}
+
+pub(super) fn pause_hotkey_action(selected_text: Option<&str>) -> PauseHotkeyAction {
+    match selected_text {
+        Some(text) => PauseHotkeyAction::DeleteSelectedUserWord(text.to_owned()),
+        None => PauseHotkeyAction::UndoPreviousCorrection,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,13 +117,93 @@ impl InputOwnershipStamp {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SuppressedKeyUpRoute {
+    DownstreamThenSuppress,
+    SunSwitcherOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SuppressedKeyUp {
+    vk_code: u32,
+    route: SuppressedKeyUpRoute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DoubleShiftEvent {
+    None,
+    Consume,
+    Trigger,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct DoubleShiftTracker {
+    last_plain_release: Option<Instant>,
+    current_press_plain: bool,
+    second_press_active: bool,
+}
+
+impl DoubleShiftTracker {
+    pub(super) fn observe(
+        &mut self,
+        vk_code: u32,
+        is_key_down: bool,
+        was_key_down: bool,
+        now: Instant,
+    ) -> DoubleShiftEvent {
+        if is_shift_modifier_key(vk_code) {
+            if is_key_down {
+                if was_key_down {
+                    return if self.second_press_active {
+                        DoubleShiftEvent::Consume
+                    } else {
+                        DoubleShiftEvent::None
+                    };
+                }
+                let is_double = self.last_plain_release.take().is_some_and(|previous| {
+                    now.saturating_duration_since(previous) <= DOUBLE_SHIFT_WINDOW
+                });
+                self.second_press_active = is_double;
+                self.current_press_plain = !is_double;
+                return if is_double {
+                    DoubleShiftEvent::Consume
+                } else {
+                    DoubleShiftEvent::None
+                };
+            }
+
+            if was_key_down {
+                if self.second_press_active {
+                    self.second_press_active = false;
+                    self.current_press_plain = false;
+                    self.last_plain_release = None;
+                    return DoubleShiftEvent::Trigger;
+                }
+                if self.current_press_plain {
+                    self.last_plain_release = Some(now);
+                }
+                self.current_press_plain = false;
+            }
+            return DoubleShiftEvent::None;
+        }
+
+        if is_key_down {
+            self.current_press_plain = false;
+            self.second_press_active = false;
+            self.last_plain_release = None;
+        }
+        DoubleShiftEvent::None
+    }
+}
+
 struct RuntimeState {
     processor: Box<dyn InputProcessor>,
     keyboard_state: [u8; 256],
-    suppressed_keyup_vk: Option<u32>,
+    suppressed_keyups: Vec<SuppressedKeyUp>,
     foreground_window_id: usize,
     undo_hotkey: UndoHotkey,
     input_revision: u64,
+    double_shift: DoubleShiftTracker,
 }
 
 impl RuntimeState {
@@ -96,10 +214,11 @@ impl RuntimeState {
         Self {
             processor,
             keyboard_state: initial_keyboard_state(),
-            suppressed_keyup_vk: None,
+            suppressed_keyups: Vec::with_capacity(2),
             foreground_window_id: current_foreground_window_id(),
             undo_hotkey,
             input_revision: 0,
+            double_shift: DoubleShiftTracker::default(),
         }
     }
 
@@ -118,6 +237,42 @@ impl RuntimeState {
             || self.keyboard_state[VK_MENU as usize] & 0x80 != 0
             || self.keyboard_state[VK_LWIN as usize] & 0x80 != 0
             || self.keyboard_state[VK_RWIN as usize] & 0x80 != 0
+    }
+
+    fn completion_hotkey_command(&self, vk_code: u32) -> Option<CompletionCommand> {
+        let command = completion_hotkey_command(vk_code, &self.keyboard_state)?;
+        if command == CompletionCommand::AcceptNextWord && !self.owns_alt_modifier() {
+            return None;
+        }
+        Some(command)
+    }
+
+    fn suppress_keyup(&mut self, vk_code: u32, route: SuppressedKeyUpRoute) {
+        if let Some(existing) = self
+            .suppressed_keyups
+            .iter_mut()
+            .find(|suppressed| suppressed.vk_code == vk_code)
+        {
+            existing.route = route;
+            return;
+        }
+        self.suppressed_keyups
+            .push(SuppressedKeyUp { vk_code, route });
+    }
+
+    fn take_suppressed_keyup(&mut self, vk_code: u32) -> Option<SuppressedKeyUpRoute> {
+        let index = self
+            .suppressed_keyups
+            .iter()
+            .position(|suppressed| suppressed.vk_code == vk_code)?;
+        Some(self.suppressed_keyups.swap_remove(index).route)
+    }
+
+    fn owns_alt_modifier(&self) -> bool {
+        self.suppressed_keyups.iter().any(|suppressed| {
+            suppressed.route == SuppressedKeyUpRoute::SunSwitcherOnly
+                && is_alt_modifier_key(suppressed.vk_code)
+        })
     }
 
     fn undo_hotkey_matches(&self, vk_code: u32) -> bool {
@@ -387,17 +542,40 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             }
         }
 
+        let was_key_down = (event.vkCode as usize) < runtime.keyboard_state.len()
+            && runtime.keyboard_state[event.vkCode as usize] & 0x80 != 0;
+        let double_shift = if is_physical_keyboard_event(event.flags) {
+            runtime
+                .double_shift
+                .observe(event.vkCode, is_key_down, was_key_down, Instant::now())
+        } else {
+            DoubleShiftEvent::None
+        };
         runtime.update_key_state(event.vkCode, is_key_down);
         let ownership_stamp = runtime.ownership_stamp();
 
-        if is_key_up {
-            let suppress = runtime.suppressed_keyup_vk == Some(event.vkCode);
-            if suppress {
-                runtime.suppressed_keyup_vk = None;
+        if double_shift == DoubleShiftEvent::Trigger {
+            let _ = runtime.take_suppressed_keyup(event.vkCode);
+            HookEventState::DoubleShift
+        } else if is_key_up {
+            HookEventState::KeyUp {
+                suppression: runtime.take_suppressed_keyup(event.vkCode),
             }
-            HookEventState::KeyUp { suppress }
+        } else if double_shift == DoubleShiftEvent::Consume
+            || completion_modifier_is_sunswitcher_only(
+                runtime.processor.completion_active(),
+                event.vkCode,
+            )
+        {
+            runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
+            HookEventState::SunSwitcherOnlyKeyDown
         } else if runtime.undo_hotkey_matches(event.vkCode) {
             HookEventState::UndoHotkey { ownership_stamp }
+        } else if let Some(command) = runtime.completion_hotkey_command(event.vkCode) {
+            HookEventState::CompletionHotkey {
+                command,
+                ownership_stamp,
+            }
         } else {
             let directive = classify_key_down(event, runtime)
                 .map(|input_event| runtime.processor.process(input_event))
@@ -413,9 +591,21 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
     };
 
     match state {
-        HookEventState::KeyUp { suppress } => {
+        HookEventState::KeyUp { suppression } => {
+            if !suppressed_keyup_calls_downstream(suppression) {
+                return 1;
+            }
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
-            if suppress { 1 } else { next_result }
+            if suppression.is_some() {
+                1
+            } else {
+                next_result
+            }
+        }
+        HookEventState::SunSwitcherOnlyKeyDown => 1,
+        HookEventState::DoubleShift => {
+            switch_selected_or_previous_text();
+            1
         }
         HookEventState::KeyDownPass => {
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
@@ -423,6 +613,86 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 invalidate_runtime_tracking();
             }
             next_result
+        }
+        HookEventState::CompletionHotkey {
+            command,
+            ownership_stamp,
+        } => {
+            if !runtime_input_ownership_unchanged(ownership_stamp) {
+                invalidate_runtime_tracking();
+                return 1;
+            }
+
+            // Resolve autocomplete ownership before touching the downstream hook chain. If the
+            // popup consumes this key, the physical keydown/keyup belongs to SunSwitcher only and
+            // must never reach the foreground application. Only an inactive completion session
+            // returns Pass and is then forwarded normally.
+            let result = RUNTIME
+                .lock()
+                .ok()
+                .and_then(|mut runtime_slot| {
+                    runtime_slot
+                        .as_mut()
+                        .map(|runtime| runtime.processor.completion_command(command))
+                })
+                .unwrap_or(CompletionCommandResult::Pass);
+            match result {
+                CompletionCommandResult::Pass => {
+                    debug_assert!(completion_result_passes_through(&result));
+                    let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+                    if next_result != 0 {
+                        invalidate_runtime_tracking();
+                    }
+                    next_result
+                }
+                CompletionCommandResult::Consumed
+                | CompletionCommandResult::DeletePrediction(_) => {
+                    if let Ok(mut runtime_slot) = RUNTIME.lock()
+                        && let Some(runtime) = runtime_slot.as_mut()
+                    {
+                        runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
+                    }
+                    1
+                }
+                CompletionCommandResult::AcceptSuffix(suffix) => {
+                    let injection_result = inject_completion_suffix(&suffix);
+                    let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
+                    invalidate_runtime_tracking();
+                    if let Ok(mut runtime_slot) = RUNTIME.lock()
+                        && let Some(runtime) = runtime_slot.as_mut()
+                    {
+                        runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
+                    }
+                    if let Err(error) = injection_result {
+                        eprintln!("SunSwitcher completion injection failed: {error:?}");
+                    } else if !ownership_unchanged {
+                        eprintln!("SunSwitcher completion ownership changed during injection");
+                    }
+                    1
+                }
+                CompletionCommandResult::AcceptWord(word) => {
+                    let injection_result = inject_completion_word(&word);
+                    let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
+                    let outcome = if injection_result.is_ok() && ownership_unchanged {
+                        CompletionApplyOutcome::Applied
+                    } else {
+                        CompletionApplyOutcome::Uncertain
+                    };
+                    if let Ok(mut runtime_slot) = RUNTIME.lock()
+                        && let Some(runtime) = runtime_slot.as_mut()
+                    {
+                        runtime.processor.completion_word_outcome(outcome);
+                        runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
+                    }
+                    if outcome == CompletionApplyOutcome::Uncertain {
+                        invalidate_runtime_tracking();
+                    }
+                    if let Err(error) = injection_result {
+                        eprintln!("SunSwitcher completion word injection failed: {error:?}");
+                    }
+                    1
+                }
+            }
         }
         HookEventState::UndoHotkey { ownership_stamp } => {
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
@@ -435,34 +705,48 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 return 1;
             }
 
-            // Resolve the Undo only after downstream hooks return. A downstream hook may inject
-            // input re-entrantly or change the foreground window while handling Pause; those
-            // changes must disarm the immediate Undo before we decide it is still safe to execute.
-            let directive = RUNTIME
-                .lock()
-                .ok()
-                .and_then(|mut runtime_slot| {
-                    runtime_slot
-                        .as_mut()
-                        .map(|runtime| runtime.processor.undo())
-                })
-                .unwrap_or(UndoDirective::Pass);
-            if let UndoDirective::Restore(action) = directive {
-                let injection_result = inject_replacement(&action);
-                let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
-                let outcome = undo_outcome_after_injection(&injection_result, ownership_unchanged);
-                notify_runtime_undo_outcome(outcome);
-                if outcome == UndoOutcome::Uncertain {
-                    invalidate_runtime_tracking();
+            let selected_text = SelectedTextSession::capture_existing_selection()
+                .map(|session| session.selected_text().as_str().to_owned());
+            match pause_hotkey_action(selected_text.as_deref()) {
+                PauseHotkeyAction::DeleteSelectedUserWord(text) => {
+                    if let Ok(mut runtime_slot) = RUNTIME.lock()
+                        && let Some(runtime) = runtime_slot.as_mut()
+                    {
+                        runtime.processor.delete_user_word(&text);
+                    }
                 }
-                if let Err(error) = injection_result {
-                    eprintln!("SunSwitcher undo injection failed: {error:?}");
+                PauseHotkeyAction::UndoPreviousCorrection => {
+                    // Resolve Undo only after downstream hooks return. A downstream hook may inject
+                    // input re-entrantly or change the foreground window while handling Pause.
+                    let directive = RUNTIME
+                        .lock()
+                        .ok()
+                        .and_then(|mut runtime_slot| {
+                            runtime_slot
+                                .as_mut()
+                                .map(|runtime| runtime.processor.undo())
+                        })
+                        .unwrap_or(UndoDirective::Pass);
+                    if let UndoDirective::Restore(action) = directive {
+                        let injection_result = inject_replacement(&action);
+                        let ownership_unchanged =
+                            runtime_input_ownership_unchanged(ownership_stamp);
+                        let outcome =
+                            undo_outcome_after_injection(&injection_result, ownership_unchanged);
+                        notify_runtime_undo_outcome(outcome);
+                        if outcome == UndoOutcome::Uncertain {
+                            invalidate_runtime_tracking();
+                        }
+                        if let Err(error) = injection_result {
+                            eprintln!("SunSwitcher undo injection failed: {error:?}");
+                        }
+                    }
                 }
             }
             if let Ok(mut runtime_slot) = RUNTIME.lock()
                 && let Some(runtime) = runtime_slot.as_mut()
             {
-                runtime.suppressed_keyup_vk = Some(event.vkCode);
+                runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::DownstreamThenSuppress);
             }
             1
         }
@@ -495,13 +779,22 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
             let replacement_outcome =
                 replacement_outcome_after_injection(&injection_result, ownership_unchanged);
+            if replacement_outcome == ReplacementOutcome::Applied
+                && let Some(target_language) = action.target_language()
+                && !request_foreground_keyboard_layout(target_language)
+            {
+                eprintln!(
+                    "SunSwitcher could not switch the foreground keyboard layout after automatic correction to {:?}",
+                    target_language.as_str()
+                );
+            }
             if let Some(vk_code) =
                 keyup_suppression_after_injection(event.vkCode, &injection_result)
             {
                 if let Ok(mut runtime_slot) = RUNTIME.lock()
                     && let Some(runtime) = runtime_slot.as_mut()
                 {
-                    runtime.suppressed_keyup_vk = Some(vk_code);
+                    runtime.suppress_keyup(vk_code, SuppressedKeyUpRoute::DownstreamThenSuppress);
                     runtime.processor.replacement_outcome(replacement_outcome);
                     if replacement_outcome == ReplacementOutcome::Aborted {
                         let _ = runtime.processor.process(InputEvent::Invalidate);
@@ -524,6 +817,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
 
 #[derive(Debug)]
 enum HookEventState {
+    SunSwitcherOnlyKeyDown,
+    DoubleShift,
     KeyDownPass,
     KeyDownReplace {
         action: ReplacementAction,
@@ -532,9 +827,125 @@ enum HookEventState {
     UndoHotkey {
         ownership_stamp: InputOwnershipStamp,
     },
-    KeyUp {
-        suppress: bool,
+    CompletionHotkey {
+        command: CompletionCommand,
+        ownership_stamp: InputOwnershipStamp,
     },
+    KeyUp {
+        suppression: Option<SuppressedKeyUpRoute>,
+    },
+}
+
+fn switch_selected_or_previous_text() {
+    let session = match SelectedTextSession::capture_existing_selection() {
+        Some(session) => Some(session),
+        None => match SelectedTextSession::capture_previous_word() {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("SunSwitcher previous-word capture failed: {error:?}");
+                None
+            }
+        },
+    };
+    let Some(session) = session else {
+        invalidate_runtime_tracking();
+        return;
+    };
+
+    let source = session.selected_text().clone();
+    let switch = RUNTIME.lock().ok().and_then(|runtime_slot| {
+        runtime_slot
+            .as_ref()
+            .and_then(|runtime| runtime.processor.switch_layout_text(source.as_str()))
+    });
+    let Some(switch) = switch else {
+        if let Err(error) = session.finish_without_replacement() {
+            eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
+        }
+        invalidate_runtime_tracking();
+        return;
+    };
+
+    let replacement = match SelectedReplacementText::try_new(switch.text().to_owned()) {
+        Ok(replacement) => replacement,
+        Err(_) => {
+            if let Err(error) = session.finish_without_replacement() {
+                eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
+            }
+            invalidate_runtime_tracking();
+            return;
+        }
+    };
+    let Some(action) =
+        SelectedReplacementEngine::new().plan(source, SelectedTextDecision::Replace(replacement))
+    else {
+        if let Err(error) = session.finish_without_replacement() {
+            eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
+        }
+        invalidate_runtime_tracking();
+        return;
+    };
+
+    match session.apply_layout_switch(&action) {
+        Ok(()) => {
+            if !request_foreground_keyboard_layout(switch.target_language()) {
+                eprintln!(
+                    "SunSwitcher could not switch the foreground keyboard layout to {:?}",
+                    switch.target_language().as_str()
+                );
+            }
+        }
+        Err(error) => eprintln!("SunSwitcher layout switch failed: {error:?}"),
+    }
+    invalidate_runtime_tracking();
+}
+
+fn request_foreground_keyboard_layout(language: &LanguageId) -> bool {
+    let target_primary = match language.as_str() {
+        "en" => 0x09usize,
+        "ru" => 0x19usize,
+        _ => return false,
+    };
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return false;
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(foreground, null_mut()) };
+    let current_layout = unsafe { GetKeyboardLayout(thread_id) };
+    if ((current_layout as usize) & 0xffff) & 0x03ff == target_primary {
+        return true;
+    }
+
+    let count = unsafe { GetKeyboardLayoutList(0, null_mut()) };
+    if count <= 0 {
+        return false;
+    }
+    let mut layouts = vec![null_mut(); count as usize];
+    let copied = unsafe { GetKeyboardLayoutList(count, layouts.as_mut_ptr()) };
+    if copied <= 0 {
+        return false;
+    }
+
+    let mut target_layout = None;
+    for layout in layouts.into_iter().take(copied as usize) {
+        let primary = ((layout as usize) & 0xffff) & 0x03ff;
+        if primary == target_primary {
+            target_layout = Some(layout);
+            break;
+        }
+    }
+    let Some(target_layout) = target_layout else {
+        return false;
+    };
+
+    unsafe {
+        PostMessageW(
+            foreground,
+            WM_INPUTLANGCHANGEREQUEST,
+            0,
+            target_layout as LPARAM,
+        ) != 0
+    }
 }
 
 fn notify_runtime_undo_outcome(outcome: UndoOutcome) {
@@ -603,6 +1014,10 @@ pub(super) fn undo_hotkey_matches(
     }
 }
 
+pub(super) fn is_physical_keyboard_event(flags: u32) -> bool {
+    flags & LLKHF_INJECTED == 0
+}
+
 pub(super) fn is_foreign_injected_keyboard_event(flags: u32, extra_info: usize) -> bool {
     flags & LLKHF_INJECTED != 0 && extra_info != SUNSWITCHER_INJECTED_MARKER
 }
@@ -640,7 +1055,7 @@ pub(super) fn preclassify_key_down(
     // Shift is part of ordinary text entry. It must not invalidate an already tracked token,
     // otherwise shifted punctuation (for example "!") would erase the token just before its
     // boundary arrives.
-    if is_shift_modifier_key(vk_code) {
+    if is_modifier_key(vk_code) {
         return KeyDownDisposition::Ignore;
     }
 
@@ -649,6 +1064,13 @@ pub(super) fn preclassify_key_down(
     // special-key interpretation so SunSwitcher never reinterprets them as ordinary editing.
     if command_modifier_active {
         return KeyDownDisposition::Event(InputEvent::Invalidate);
+    }
+
+    // OEM3 is reserved as SunSwitcher's layout-switch service key. Depending on the active
+    // layout Windows translates the same physical key to ` or ё, but neither symbol belongs
+    // to the tracked token because the key is used to change input language externally.
+    if vk_code == VK_OEM_3 as u32 {
+        return KeyDownDisposition::Ignore;
     }
     if vk_code == VK_BACK as u32 {
         return KeyDownDisposition::Event(InputEvent::Backspace);
@@ -682,6 +1104,64 @@ pub(super) fn is_shift_modifier_key(vk_code: u32) -> bool {
     [VK_SHIFT, VK_LSHIFT, VK_RSHIFT]
         .into_iter()
         .any(|key| vk_code == key as u32)
+}
+
+fn is_alt_modifier_key(vk_code: u32) -> bool {
+    [VK_MENU, VK_LMENU, VK_RMENU]
+        .into_iter()
+        .any(|key| vk_code == key as u32)
+}
+
+pub(super) fn completion_modifier_is_sunswitcher_only(
+    completion_active: bool,
+    vk_code: u32,
+) -> bool {
+    completion_active && is_alt_modifier_key(vk_code)
+}
+
+fn is_modifier_key(vk_code: u32) -> bool {
+    is_shift_modifier_key(vk_code)
+        || [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_LWIN, VK_RWIN]
+            .into_iter()
+            .any(|key| vk_code == key as u32)
+        || is_alt_modifier_key(vk_code)
+}
+
+pub(super) fn completion_result_passes_through(result: &CompletionCommandResult) -> bool {
+    matches!(result, CompletionCommandResult::Pass)
+}
+
+pub(super) const fn suppressed_keyup_calls_downstream(
+    suppression: Option<SuppressedKeyUpRoute>,
+) -> bool {
+    !matches!(suppression, Some(SuppressedKeyUpRoute::SunSwitcherOnly))
+}
+
+pub(super) fn completion_hotkey_command(
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> Option<CompletionCommand> {
+    let alt = keyboard_state[VK_MENU as usize] & 0x80 != 0;
+    let ctrl = keyboard_state[VK_CONTROL as usize] & 0x80 != 0;
+    let shift = keyboard_state[VK_SHIFT as usize] & 0x80 != 0;
+    let win = keyboard_state[VK_LWIN as usize] & 0x80 != 0
+        || keyboard_state[VK_RWIN as usize] & 0x80 != 0;
+
+    if alt && !ctrl && !shift && !win && vk_code == VK_RIGHT as u32 {
+        return Some(CompletionCommand::AcceptNextWord);
+    }
+    if alt || ctrl || shift || win {
+        return None;
+    }
+
+    match vk_code as u16 {
+        VK_ESCAPE => Some(CompletionCommand::Dismiss),
+        VK_UP => Some(CompletionCommand::Previous),
+        VK_DOWN => Some(CompletionCommand::Next),
+        VK_RETURN | VK_TAB => Some(CompletionCommand::Accept),
+        VK_DELETE => Some(CompletionCommand::DeleteSelected),
+        _ => None,
+    }
 }
 
 fn is_state_invalidating_key(vk_code: u32) -> bool {
@@ -777,6 +1257,27 @@ pub(super) fn inject_selected_text(text: &str) -> Result<(), RuntimeError> {
     send_inputs(&build_selected_text_inputs(text))
 }
 
+fn inject_completion_suffix(text: &str) -> Result<(), RuntimeError> {
+    send_inputs(&build_completion_suffix_inputs(text))
+}
+
+fn inject_completion_word(text: &str) -> Result<(), RuntimeError> {
+    send_inputs(&build_completion_word_inputs(text))
+}
+
+pub(super) fn build_completion_suffix_inputs(text: &str) -> Vec<INPUT> {
+    let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
+    for unit in text.encode_utf16() {
+        inputs.push(unicode_input(unit, false));
+        inputs.push(unicode_input(unit, true));
+    }
+    inputs
+}
+
+pub(super) fn build_completion_word_inputs(text: &str) -> Vec<INPUT> {
+    build_completion_suffix_inputs(text)
+}
+
 pub(super) fn build_selected_text_inputs(text: &str) -> Vec<INPUT> {
     if text.is_empty() {
         return vec![
@@ -795,6 +1296,39 @@ pub(super) fn build_selected_text_inputs(text: &str) -> Vec<INPUT> {
 
 pub(super) fn inject_ctrl_chord(key: u16) -> Result<(), RuntimeError> {
     send_inputs(&build_ctrl_chord_inputs(key))
+}
+
+pub(super) fn inject_ctrl_shift_chord(key: u16) -> Result<(), RuntimeError> {
+    send_inputs(&build_ctrl_shift_chord_inputs(key))
+}
+
+pub(super) fn inject_key_press(key: u16) -> Result<(), RuntimeError> {
+    send_inputs(&[virtual_key_input(key, false), virtual_key_input(key, true)])
+}
+
+pub(super) fn inject_previous_word_selection() -> Result<(), RuntimeError> {
+    send_inputs(&build_previous_word_selection_inputs())
+}
+
+pub(super) fn build_previous_word_selection_inputs() -> Vec<INPUT> {
+    let mut inputs = vec![
+        virtual_key_input(VK_LEFT, false),
+        virtual_key_input(VK_LEFT, true),
+    ];
+    inputs.extend(build_ctrl_chord_inputs(VK_RIGHT));
+    inputs.extend(build_ctrl_shift_chord_inputs(VK_LEFT));
+    inputs
+}
+
+pub(super) fn build_ctrl_shift_chord_inputs(key: u16) -> Vec<INPUT> {
+    vec![
+        virtual_key_input(VK_CONTROL, false),
+        virtual_key_input(VK_SHIFT, false),
+        virtual_key_input(key, false),
+        virtual_key_input(key, true),
+        virtual_key_input(VK_SHIFT, true),
+        virtual_key_input(VK_CONTROL, true),
+    ]
 }
 
 pub(super) fn build_ctrl_chord_inputs(key: u16) -> Vec<INPUT> {

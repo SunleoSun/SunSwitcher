@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::input::CompletedToken;
-use crate::language::{KeyboardLayoutMap, LanguagePack, normalize_word};
+use crate::language::{
+    KeyboardLayoutMap, LanguageId, LanguagePack, TextCasePattern, normalize_word,
+};
 use crate::lexicon::{MAX_INDEX_DELETIONS, UserLexicon};
 
 use super::{Confidence, CorrectionCandidate, CorrectionCandidateProvider, ReplacementText};
@@ -85,6 +87,17 @@ impl LexicalCorrectionProvider {
                 .iter()
                 .any(|language| language.contains_normalized(normalized))
     }
+
+    pub fn canonical_learning_term(&self, token: &CompletedToken) -> String {
+        if let Some(view) = LiteralWordView::from_token(token) {
+            return view.core;
+        }
+        if token.text().chars().any(char::is_alphanumeric) {
+            token.text().to_owned()
+        } else {
+            String::new()
+        }
+    }
 }
 
 impl CorrectionCandidateProvider for LexicalCorrectionProvider {
@@ -148,6 +161,7 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                             edit_cost,
                             layout_penalty: variant.layout_penalty,
                             frequency: entry.frequency(),
+                            target_language: variant.target_language.clone(),
                         },
                     );
                 }
@@ -168,11 +182,10 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                     continue;
                 }
 
+                let corrected = variant.case_pattern.apply(entry.term());
                 let replacement = format!(
                     "{}{}{}",
-                    variant.literal_prefix,
-                    entry.term(),
-                    variant.literal_suffix
+                    variant.literal_prefix, corrected, variant.literal_suffix
                 );
                 if replacement == observed {
                     continue;
@@ -193,6 +206,7 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                         edit_cost,
                         layout_penalty: variant.layout_penalty,
                         frequency: entry.use_count(),
+                        target_language: variant.target_language.clone(),
                     },
                 );
             }
@@ -212,7 +226,14 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
             .into_iter()
             .filter_map(|candidate| {
                 let replacement = ReplacementText::try_new(candidate.replacement).ok()?;
-                Some(CorrectionCandidate::new(replacement, candidate.confidence))
+                Some(match candidate.target_language {
+                    Some(target_language) => CorrectionCandidate::for_language(
+                        replacement,
+                        candidate.confidence,
+                        target_language,
+                    ),
+                    None => CorrectionCandidate::new(replacement, candidate.confidence),
+                })
             })
             .collect()
     }
@@ -280,7 +301,8 @@ struct ObservedVariant {
     layout_penalty: f32,
     literal_prefix: String,
     literal_suffix: String,
-    case_pattern: CasePattern,
+    case_pattern: TextCasePattern,
+    target_language: Option<LanguageId>,
 }
 
 fn language_variants(
@@ -288,7 +310,14 @@ fn language_variants(
     token: &CompletedToken,
     literal_view: &LiteralWordView,
 ) -> Vec<ObservedVariant> {
-    observed_variants(language.transforms().iter(), token, literal_view)
+    observed_variants(
+        language
+            .transforms()
+            .iter()
+            .map(|transform| (language.id(), transform)),
+        token,
+        literal_view,
+    )
 }
 
 fn user_variants(
@@ -297,16 +326,19 @@ fn user_variants(
     literal_view: &LiteralWordView,
 ) -> Vec<ObservedVariant> {
     observed_variants(
-        languages
-            .iter()
-            .flat_map(|language| language.transforms().iter()),
+        languages.iter().flat_map(|language| {
+            language
+                .transforms()
+                .iter()
+                .map(move |transform| (language.id(), transform))
+        }),
         token,
         literal_view,
     )
 }
 
 fn observed_variants<'a>(
-    transforms: impl IntoIterator<Item = &'a KeyboardLayoutMap>,
+    transforms: impl IntoIterator<Item = (&'a LanguageId, &'a KeyboardLayoutMap)>,
     token: &CompletedToken,
     literal_view: &LiteralWordView,
 ) -> Vec<ObservedVariant> {
@@ -318,11 +350,12 @@ fn observed_variants<'a>(
             layout_penalty: 0.0,
             literal_prefix: literal_view.prefix.clone(),
             literal_suffix: literal_view.suffix.clone(),
-            case_pattern: CasePattern::detect(&literal_view.core),
+            case_pattern: TextCasePattern::detect(&literal_view.core),
+            target_language: None,
         },
     );
 
-    for transform in transforms {
+    for (target_language, transform) in transforms {
         if let Some(transformed) =
             transform.transform_with_physical(token.text(), token.physical_keys())
             && let Some(transformed_view) = LiteralWordView::from_transformed(&transformed)
@@ -334,7 +367,8 @@ fn observed_variants<'a>(
                     layout_penalty: transform.penalty(),
                     literal_prefix: transformed_view.prefix,
                     literal_suffix: transformed_view.suffix,
-                    case_pattern: CasePattern::detect(&transformed_view.core),
+                    case_pattern: TextCasePattern::detect(&transformed_view.core),
+                    target_language: Some(target_language.clone()),
                 },
             );
         }
@@ -371,6 +405,7 @@ struct RankedCandidate {
     edit_cost: f32,
     layout_penalty: f32,
     frequency: u32,
+    target_language: Option<LanguageId>,
 }
 
 impl RankedCandidate {
@@ -470,53 +505,5 @@ fn source_delete_cost(source: &[char], index: usize) -> f32 {
         REPEATED_DELETE_COST
     } else {
         1.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CasePattern {
-    Lower,
-    Upper,
-    Title,
-    Mixed,
-}
-
-impl CasePattern {
-    fn detect(text: &str) -> Self {
-        let letters: Vec<char> = text
-            .chars()
-            .filter(|character| character.is_alphabetic())
-            .collect();
-        if letters.is_empty() || letters.iter().all(|character| character.is_lowercase()) {
-            return Self::Lower;
-        }
-        if letters.iter().all(|character| character.is_uppercase()) {
-            return Self::Upper;
-        }
-        if letters[0].is_uppercase()
-            && letters[1..]
-                .iter()
-                .all(|character| character.is_lowercase())
-        {
-            return Self::Title;
-        }
-        Self::Mixed
-    }
-
-    fn apply(self, canonical: &str) -> String {
-        match self {
-            Self::Lower | Self::Mixed => canonical.to_owned(),
-            Self::Upper => canonical.chars().flat_map(char::to_uppercase).collect(),
-            Self::Title => {
-                let mut characters = canonical.chars();
-                let Some(first) = characters.next() else {
-                    return String::new();
-                };
-                first
-                    .to_uppercase()
-                    .chain(characters.flat_map(char::to_lowercase))
-                    .collect()
-            }
-        }
     }
 }

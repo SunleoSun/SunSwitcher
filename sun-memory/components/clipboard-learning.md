@@ -15,7 +15,7 @@ SunSwitcher learns the same local user dictionary from text the user deliberatel
 
 `src/windows/clipboard_listener.rs` observes clipboard sequence changes, ignores stale startup contents, retries temporary clipboard lock failures, and forwards stable user-owned Unicode text to `LearningClient::observe_text`. Non-text clipboard states do not teach vocabulary.
 
-Clipboard text is not trusted as already-correct spelling. The adaptive worker runs each extracted token through the same `LexicalCorrectionProvider`, `CorrectionEngine`, and minimum confidence used for typed correction. Only tokens receiving `Keep` are eligible for `user_words`. If a copied token would be replaced (for example a known typo), the erroneous spelling is skipped; the correction target remains available from the system/user dictionary that generated that correction and is the canonical spelling future completion should expose.
+Clipboard text is not trusted as already-correct spelling. The adaptive worker runs each extracted token through the same `LexicalCorrectionProvider`, `CorrectionEngine`, and minimum confidence used for typed correction. Only tokens receiving `Keep` are eligible for `user_words`. Accepted words refresh the working lexical snapshot before the next token in the same clipboard payload, so a later typo cannot be learned merely because its target was first learned earlier in that copy. If a copied token would be replaced, the erroneous spelling is skipped for vocabulary and the correction target is used in the canonical sequence observation. Canonical tokens are expanded into bounded contiguous 2-5 word n-grams and upserted into `text_history`; the fact that a token required correction gives no ranking bonus.
 
 ## Internal clipboard suppression
 
@@ -23,11 +23,12 @@ Selected-text capture temporarily uses Ctrl+C and then restores the previous cli
 
 ## Validation
 
-Listener certification covers startup/no-change, stable user reads, internal mutation suppression and final restore suppression. Adaptive certification covers one kept copied word becoming a typo target and copied tokens that the corrector would replace not entering `user_words`.
+Listener certification covers startup/no-change, stable user reads, internal mutation suppression and final restore suppression. Adaptive certification covers one kept copied word becoming a typo target, copied tokens that the corrector would replace not entering `user_words`, canonical corrected sequence storage, and repeated sequence observations outranking a one-off corrected observation.
 
 ## Related memory
 
 - `components/adaptive-correction`
 - `components/user-lexicon`
 - `components/persistence`
+- `components/completion`
 - `main/core-project-principles`

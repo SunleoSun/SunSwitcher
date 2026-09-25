@@ -14,13 +14,19 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 
-use super::keyboard_runtime::{inject_ctrl_chord, inject_selected_text};
+use super::caret_locator::CaretLocator;
+use super::keyboard_runtime::{
+    inject_ctrl_chord, inject_ctrl_shift_chord, inject_key_press, inject_previous_word_selection,
+    inject_selected_text,
+};
 use crate::replacement::{SelectedReplacementAction, SelectedText};
 
 const COPY_TIMEOUT: Duration = Duration::from_millis(700);
 const CLIPBOARD_OPEN_TIMEOUT: Duration = Duration::from_millis(300);
 const RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const VK_C: u16 = b'C' as u16;
+const VK_LEFT_KEY: u16 = 0x25;
+const VK_RIGHT_KEY: u16 = 0x27;
 const PREFERRED_DROP_EFFECT_NAME: &str = "Preferred DropEffect";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,12 +48,54 @@ impl From<super::RuntimeError> for SelectedTextRuntimeError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedTextOrigin {
+    ExistingSelection,
+    PreviousWordSelection,
+    PreviousWordClipboard,
+}
+
 pub struct SelectedTextSession {
     selected: SelectedText,
+    origin: SelectedTextOrigin,
 }
 
 impl SelectedTextSession {
     pub fn capture() -> Result<Option<Self>, SelectedTextRuntimeError> {
+        Self::capture_current(SelectedTextOrigin::ExistingSelection)
+    }
+
+    pub fn capture_existing_selection() -> Option<Self> {
+        let text = CaretLocator::new().selected_text()?;
+        let selected = SelectedText::try_new(text).ok()?;
+        Some(Self {
+            selected,
+            origin: SelectedTextOrigin::ExistingSelection,
+        })
+    }
+
+    pub fn capture_previous_word() -> Result<Option<Self>, SelectedTextRuntimeError> {
+        inject_ctrl_shift_chord(VK_LEFT_KEY)?;
+        if let Some(mut session) = Self::capture_existing_selection() {
+            session.origin = SelectedTextOrigin::PreviousWordSelection;
+            return Ok(Some(session));
+        }
+        match Self::capture_current(SelectedTextOrigin::PreviousWordClipboard) {
+            Ok(Some(session)) => Ok(Some(session)),
+            Ok(None) => {
+                inject_key_press(VK_RIGHT_KEY)?;
+                Ok(None)
+            }
+            Err(error) => {
+                let _ = inject_key_press(VK_RIGHT_KEY);
+                Err(error)
+            }
+        }
+    }
+
+    fn capture_current(
+        origin: SelectedTextOrigin,
+    ) -> Result<Option<Self>, SelectedTextRuntimeError> {
         let mut snapshot = ClipboardSnapshot::capture()?;
         let _observation_guard = super::clipboard_listener::InternalClipboardMutationGuard::begin();
         let sequence_before_copy = unsafe { GetClipboardSequenceNumber() };
@@ -67,8 +115,17 @@ impl SelectedTextSession {
         let Ok(selected) = SelectedText::try_new(text) else {
             return Ok(None);
         };
+        let origin = if origin == SelectedTextOrigin::PreviousWordClipboard
+            && CaretLocator::new()
+                .selected_text()
+                .is_some_and(|current| current == selected.as_str())
+        {
+            SelectedTextOrigin::PreviousWordSelection
+        } else {
+            origin
+        };
 
-        Ok(Some(Self { selected }))
+        Ok(Some(Self { selected, origin }))
     }
 
     pub fn selected_text(&self) -> &SelectedText {
@@ -84,7 +141,38 @@ impl SelectedTextSession {
         Ok(())
     }
 
+    pub fn apply_layout_switch(
+        self,
+        action: &SelectedReplacementAction,
+    ) -> Result<(), SelectedTextRuntimeError> {
+        if action.source() != &self.selected {
+            return Err(SelectedTextRuntimeError::ActionDoesNotMatchSelection);
+        }
+
+        match self.origin {
+            SelectedTextOrigin::ExistingSelection | SelectedTextOrigin::PreviousWordSelection => {
+                // The selected range is still active: delete it explicitly instead of depending on
+                // Unicode SendInput replacement semantics, which differ between controls.
+                inject_selected_text("")?;
+            }
+            SelectedTextOrigin::PreviousWordClipboard => {
+                // Some terminal controls collapse the temporary Ctrl+Shift+Left selection while
+                // servicing Ctrl+C. Normalize from the original right-edge caret: step into the
+                // captured word, return to its right word-boundary, then select exactly that word.
+                // This avoids blind backspacing, which could consume the word before it if a
+                // selection happened to survive the copy.
+                inject_previous_word_selection()?;
+                inject_selected_text("")?;
+            }
+        }
+        inject_selected_text(action.replacement().as_str())?;
+        Ok(())
+    }
+
     pub fn finish_without_replacement(self) -> Result<(), SelectedTextRuntimeError> {
+        if self.origin == SelectedTextOrigin::PreviousWordSelection {
+            inject_key_press(VK_RIGHT_KEY)?;
+        }
         Ok(())
     }
 }

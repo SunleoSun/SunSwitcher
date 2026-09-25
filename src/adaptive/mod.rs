@@ -1,8 +1,8 @@
 mod adaptive_runtime;
 
 pub use adaptive_runtime::{
-    AdaptiveCorrectionDirective, AdaptiveCorrectionSession, AdaptiveLexicalRuntime,
-    AdaptiveRuntimeError, LearningClient, LexicalSnapshotStore,
+    AdaptiveCompletionSession, AdaptiveCorrectionDirective, AdaptiveCorrectionSession,
+    AdaptiveLexicalRuntime, AdaptiveRuntimeError, LearningClient, LexicalSnapshotStore,
 };
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ impl Drop for TempDatabasePath {
 fn certification_fresh_database_has_only_the_required_application_tables() {
     let path = TempDatabasePath::new("schema");
     let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 1);
+    assert_eq!(database.schema_version().unwrap(), 3);
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -61,6 +61,7 @@ fn certification_fresh_database_has_only_the_required_application_tables() {
             "clipboard_files",
             "clipboard_images",
             "clipboard_text",
+            "completion_hidden_words",
             "correction_events",
             "dictionary_words",
             "languages",
@@ -160,6 +161,111 @@ fn certification_user_words_survive_reopen_and_rebuild_ranked_runtime_snapshot()
             .map(|entry| entry.term())
             .collect::<Vec<_>>(),
         ["QuantileEntryStrategy1", "QuantileEntryStrategy"]
+    );
+}
+
+#[test]
+fn certification_text_history_accumulates_repetition_and_survives_reopen() {
+    let path = TempDatabasePath::new("text-history");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        database.record_text_history("hello world", 100).unwrap();
+        database.record_text_history("hello world", 200).unwrap();
+    }
+
+    let reopened = Database::open(path.as_path()).unwrap();
+    let history = reopened.load_text_history().unwrap();
+    let entry = history
+        .entries()
+        .iter()
+        .find(|entry| entry.text() == "hello world")
+        .unwrap();
+    assert_eq!(entry.use_count(), 2);
+    assert_eq!(entry.last_used_at_ms(), 200);
+}
+
+#[test]
+fn certification_hidden_completion_word_survives_reopen_without_deleting_dictionary_word() {
+    let path = TempDatabasePath::new("completion-hidden-word");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        database.hide_completion_word("HELLO").unwrap();
+    }
+
+    let reopened = Database::open(path.as_path()).unwrap();
+    let hidden = reopened.load_hidden_completion_words().unwrap();
+    assert!(hidden.contains("hello"));
+    let packs = reopened.load_enabled_language_packs().unwrap();
+    assert!(
+        packs
+            .iter()
+            .any(|pack| pack.id().as_str() == "en" && pack.contains_normalized("hello"))
+    );
+}
+
+#[test]
+fn certification_schema_v1_migrates_through_current_schema() {
+    let path = TempDatabasePath::new("schema-v1-to-v2");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        assert_eq!(database.schema_version().unwrap(), 3);
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    raw.execute("DROP TABLE completion_hidden_words", [])
+        .unwrap();
+    raw.pragma_update(None, "user_version", 1).unwrap();
+    drop(raw);
+
+    let migrated = Database::open(path.as_path()).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 3);
+    migrated.hide_completion_word("hello").unwrap();
+    assert!(
+        migrated
+            .load_hidden_completion_words()
+            .unwrap()
+            .contains("hello")
+    );
+}
+
+#[test]
+fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
+    let path = TempDatabasePath::new("schema-v2-grave-cleanup");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        assert_eq!(database.schema_version().unwrap(), 3);
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    raw.execute(
+        "INSERT INTO user_words (term, normalized_term, use_count, last_used_at_ms) VALUES ('`него', '`него', 2, 100)",
+        [],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO text_history (text, last_used_at_ms, use_count) VALUES ('hello `него', 100, 2)",
+        [],
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 2).unwrap();
+    drop(raw);
+
+    let migrated = Database::open(path.as_path()).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 3);
+    assert!(
+        migrated
+            .load_user_lexicon()
+            .unwrap()
+            .exact("`него")
+            .is_none()
+    );
+    assert!(
+        migrated
+            .load_text_history()
+            .unwrap()
+            .entries()
+            .iter()
+            .all(|entry| !entry.text().contains('`'))
     );
 }
 
@@ -272,7 +378,7 @@ fn certification_newer_database_schema_fails_closed() {
         error,
         DatabaseError::SchemaTooNew {
             found: 999,
-            supported: 1
+            supported: 3
         }
     ));
 }

@@ -5,16 +5,22 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 mod windows_probe {
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sunswitcher::adaptive::{
-        AdaptiveCorrectionDirective, AdaptiveCorrectionSession, AdaptiveLexicalRuntime,
+        AdaptiveCompletionSession, AdaptiveCorrectionDirective, AdaptiveCorrectionSession,
+        AdaptiveLexicalRuntime,
+    };
+    use sunswitcher::completion::{
+        CompletionApplyOutcome, CompletionCommand, CompletionCommandResult,
     };
     use sunswitcher::correction::Confidence;
     use sunswitcher::input::InputEvent;
+    use sunswitcher::language::{KeyboardLayoutSwitch, switch_keyboard_layout_text};
     use sunswitcher::persistence::{Database, UndoHotkey};
     use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome};
-    use sunswitcher::windows::ClipboardTextListener;
+    use sunswitcher::windows::{AutocompletePopupHandle, ClipboardTextListener};
     use sunswitcher::windows::{
         InputProcessor, RuntimeDirective, UndoDirective, request_global_keyboard_hook_stop,
         run_global_keyboard_hook,
@@ -30,7 +36,12 @@ mod windows_probe {
         println!(
             "The hook is global. Focusing/clicking discards stale tracked text; the first newly typed character starts a fresh token immediately. Type an example followed by Space/Enter/Tab."
         );
-        println!("Undo hotkey: Pause (PS), with no modifiers.");
+        println!(
+            "Pause: without a selection, undo the previous correction; with a selected word, remove it from learned user_words."
+        );
+        println!(
+            "Autocomplete: after 3 typed letters; Up/Down selects, Enter/Tab accepts all, Alt+Right accepts one word, Del removes the selected prediction, Esc closes. Double Shift switches the selected text or previous word between keyboard layouts."
+        );
         println!("Stop with Ctrl+C in this console.");
 
         let Ok(_console_handler) = ConsoleControlHandler::install() else {
@@ -80,13 +91,21 @@ mod windows_probe {
 
     struct ProbeProcessor {
         _clipboard_listener: ClipboardTextListener,
-        _runtime: AdaptiveLexicalRuntime,
+        runtime: AdaptiveLexicalRuntime,
         session: AdaptiveCorrectionSession,
+        completion: AdaptiveCompletionSession,
+        popup: AutocompletePopupHandle,
     }
 
     impl ProbeProcessor {
         fn new() -> Result<(Self, UndoHotkey), String> {
-            let database = Database::open_in_memory().map_err(|error| error.to_string())?;
+            let local_app_data = std::env::var_os("LOCALAPPDATA")
+                .ok_or_else(|| "LOCALAPPDATA is not available".to_owned())?;
+            let app_data_dir = PathBuf::from(local_app_data).join("SunSwitcher");
+            std::fs::create_dir_all(&app_data_dir)
+                .map_err(|error| format!("could not create app-data directory: {error}"))?;
+            let database_path = app_data_dir.join("sunswitcher.db");
+            let database = Database::open(&database_path).map_err(|error| error.to_string())?;
             let undo_hotkey = database
                 .settings()
                 .map_err(|error| error.to_string())?
@@ -102,14 +121,32 @@ mod windows_probe {
             })
             .map_err(|error| format!("clipboard listener failed: {error:?}"))?;
             let session = runtime.session();
+            let completion = runtime.completion_session();
+            let popup = AutocompletePopupHandle::start()
+                .map_err(|error| format!("autocomplete popup failed: {error}"))?;
+            println!("Adaptive state: {}", database_path.display());
             Ok((
                 Self {
                     _clipboard_listener: clipboard_listener,
-                    _runtime: runtime,
+                    runtime,
                     session,
+                    completion,
+                    popup,
                 },
                 undo_hotkey,
             ))
+        }
+    }
+
+    impl ProbeProcessor {
+        fn sync_popup(&self) {
+            self.popup.update(
+                self.completion
+                    .suggestions()
+                    .iter()
+                    .map(|suggestion| suggestion.text()),
+                self.completion.selected_index(),
+            );
         }
     }
 
@@ -121,8 +158,21 @@ mod windows_probe {
     }
 
     impl InputProcessor for ProbeProcessor {
+        fn completion_active(&self) -> bool {
+            self.completion.is_active()
+        }
+
+        fn switch_layout_text(&self, text: &str) -> Option<KeyboardLayoutSwitch> {
+            let snapshot = self.runtime.snapshots().load().ok()?;
+            switch_keyboard_layout_text(snapshot.languages(), text)
+        }
+
         fn process(&mut self, event: InputEvent) -> RuntimeDirective {
-            match self.session.process(event, now_ms()) {
+            let observed_at_ms = now_ms();
+            if let Err(error) = self.completion.process_event(event, observed_at_ms) {
+                eprintln!("adaptive completion skipped: {error}");
+            }
+            let directive = match self.session.process(event, observed_at_ms) {
                 Ok(AdaptiveCorrectionDirective::Pass) => RuntimeDirective::Pass,
                 Ok(AdaptiveCorrectionDirective::Replace(action)) => {
                     println!("[REPLACE] -> {:?}", action.replacement().as_str());
@@ -132,13 +182,44 @@ mod windows_probe {
                     eprintln!("adaptive correction skipped: {error}");
                     RuntimeDirective::Pass
                 }
+            };
+            if let Some(canonical) = self.session.take_resolved_completion_word() {
+                self.completion.canonicalize_last_context_word(&canonical);
             }
+            self.sync_popup();
+            directive
         }
 
         fn replacement_outcome(&mut self, outcome: ReplacementOutcome) {
             if let Err(error) = self.session.replacement_outcome(outcome) {
                 eprintln!("adaptive correction outcome was not persisted: {error}");
             }
+            if outcome == ReplacementOutcome::Applied
+                && let Some(canonical) = self.session.take_resolved_completion_word()
+            {
+                self.completion.canonicalize_last_context_word(&canonical);
+            }
+            self.sync_popup();
+        }
+
+        fn delete_user_word(&mut self, text: &str) {
+            if let Err(error) = self.runtime.learning().delete_user_word(text.to_owned()) {
+                eprintln!("user-word deletion skipped: {error}");
+                return;
+            }
+
+            let observed_at_ms = now_ms();
+            if let Err(error) = self.session.process(InputEvent::Invalidate, observed_at_ms) {
+                eprintln!("adaptive correction reset after user-word deletion skipped: {error}");
+            }
+            if let Err(error) = self
+                .completion
+                .process_event(InputEvent::Invalidate, observed_at_ms)
+            {
+                eprintln!("adaptive completion reset after user-word deletion skipped: {error}");
+            }
+            self.sync_popup();
+            println!("[USER WORD DELETE] {:?}", text);
         }
 
         fn undo(&mut self) -> UndoDirective {
@@ -159,6 +240,49 @@ mod windows_probe {
             if let Err(error) = self.session.undo_outcome(outcome) {
                 eprintln!("adaptive undo outcome was not persisted: {error}");
             }
+            if outcome == UndoOutcome::Applied
+                && let Some(canonical) = self.session.take_resolved_completion_word()
+            {
+                self.completion.canonicalize_last_context_word(&canonical);
+            }
+            self.sync_popup();
+        }
+
+        fn completion_command(&mut self, command: CompletionCommand) -> CompletionCommandResult {
+            let result = match self.completion.command(command) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("adaptive completion command skipped: {error}");
+                    CompletionCommandResult::Consumed
+                }
+            };
+            match &result {
+                CompletionCommandResult::AcceptSuffix(suffix) => {
+                    println!("[COMPLETE] +{:?}", suffix);
+                }
+                CompletionCommandResult::AcceptWord(word) => {
+                    println!("[COMPLETE WORD] +{:?}", word);
+                }
+                _ => {}
+            }
+            self.sync_popup();
+            result
+        }
+
+        fn completion_word_outcome(&mut self, outcome: CompletionApplyOutcome) {
+            let observed_at_ms = now_ms();
+            if outcome == CompletionApplyOutcome::Applied
+                && let Err(error) = self.session.process(InputEvent::Invalidate, observed_at_ms)
+            {
+                eprintln!("adaptive correction reset after completion skipped: {error}");
+            }
+            if let Err(error) = self
+                .completion
+                .word_acceptance_outcome(outcome, observed_at_ms)
+            {
+                eprintln!("adaptive completion word outcome skipped: {error}");
+            }
+            self.sync_popup();
         }
     }
 }

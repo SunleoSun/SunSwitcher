@@ -1,7 +1,11 @@
+mod autocomplete_popup;
+mod caret_locator;
 mod clipboard_listener;
 mod keyboard_runtime;
 mod selected_text_runtime;
 
+pub use autocomplete_popup::AutocompletePopupHandle;
+pub use caret_locator::{CaretAnchor, CaretLocator, CaretSource, PopupPlacement, popup_placement};
 pub use clipboard_listener::{ClipboardListenerError, ClipboardTextListener};
 pub use keyboard_runtime::{
     InputProcessor, RuntimeDirective, RuntimeError, UndoDirective,

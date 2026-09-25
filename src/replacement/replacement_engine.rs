@@ -19,6 +19,7 @@ pub struct ReplacementAction {
     delete_previous_chars: usize,
     replacement: ReplacementText,
     boundary: Boundary,
+    target_language: Option<crate::language::LanguageId>,
 }
 
 impl ReplacementAction {
@@ -32,6 +33,10 @@ impl ReplacementAction {
 
     pub fn boundary(&self) -> Boundary {
         self.boundary
+    }
+
+    pub fn target_language(&self) -> Option<&crate::language::LanguageId> {
+        self.target_language.as_ref()
     }
 }
 
@@ -51,11 +56,13 @@ impl ReplacementEngine {
         let CorrectionDecision::Replace(replacement) = decision else {
             return None;
         };
+        let (replacement, target_language) = replacement.into_parts();
 
         Some(ReplacementAction {
             delete_previous_chars: token.text().chars().count(),
             replacement,
             boundary: token.boundary(),
+            target_language,
         })
     }
 
@@ -72,6 +79,7 @@ impl ReplacementEngine {
             delete_previous_chars: applied.replacement().as_str().chars().count() + 1,
             replacement: original,
             boundary: Boundary::Character(boundary),
+            target_language: None,
         })
     }
 }

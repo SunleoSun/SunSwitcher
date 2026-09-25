@@ -112,6 +112,22 @@ impl KeyboardLayoutMap {
         self.transform_with_physical(text, &physical_keys)
     }
 
+    pub fn transform_text(&self, text: &str) -> Option<String> {
+        let mut transformed = String::with_capacity(text.len());
+        let mut changed = false;
+        for character in text.chars() {
+            if let Some(mapped) = self.map.get(&character).copied() {
+                changed |= mapped != character;
+                transformed.push(mapped);
+            } else if character.is_alphabetic() {
+                return None;
+            } else {
+                transformed.push(character);
+            }
+        }
+        changed.then_some(transformed)
+    }
+
     pub fn transform_with_physical(
         &self,
         text: &str,
@@ -253,6 +269,30 @@ impl LanguagePack {
         self.max_frequency
     }
 
+    pub fn prefix_matches(&self, prefix: &str, limit: usize) -> Vec<&DictionaryEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let normalized_prefix = normalize_word(prefix);
+        if normalized_prefix.is_empty() {
+            return Vec::new();
+        }
+
+        let mut entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.word().starts_with(&normalized_prefix))
+            .collect();
+        entries.sort_by(|left, right| {
+            right
+                .frequency()
+                .cmp(&left.frequency())
+                .then_with(|| left.word().cmp(right.word()))
+        });
+        entries.truncate(limit);
+        entries
+    }
+
     pub fn candidate_entries(&self, observed: &str, max_deletions: usize) -> Vec<&DictionaryEntry> {
         self.delete_index
             .candidate_indices(observed, max_deletions)
@@ -294,6 +334,16 @@ mod tests {
         assert_eq!(map.transform("lkz").as_deref(), Some("для"));
         assert_eq!(map.transform("Lkz").as_deref(), Some("Для"));
         assert_eq!(map.transform("lkx"), None);
+    }
+
+    #[test]
+    fn layout_text_transform_preserves_non_letters_between_mapped_words() {
+        let map = KeyboardLayoutMap::from_aligned("ghbdtn", "привет", 0.15).unwrap();
+        assert_eq!(
+            map.transform_text("ghbdtn 123! ghbdtn").as_deref(),
+            Some("привет 123! привет")
+        );
+        assert_eq!(map.transform_text("ghbdtn x"), None);
     }
 
     #[test]

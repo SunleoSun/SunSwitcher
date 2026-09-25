@@ -1,4 +1,5 @@
 pub mod adaptive;
+pub mod completion;
 pub mod correction;
 pub mod input;
 pub mod language;

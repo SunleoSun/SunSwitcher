@@ -1,6 +1,7 @@
 use super::ReplacementEngine;
-use crate::correction::{CorrectionDecision, ReplacementText};
+use crate::correction::{CorrectionDecision, CorrectionReplacement, ReplacementText};
 use crate::input::{Boundary, CompletedToken};
+use crate::language::LanguageId;
 
 #[test]
 fn certification_delete_count_uses_unicode_characters_not_utf8_bytes() {
@@ -16,7 +17,7 @@ fn certification_delete_count_uses_unicode_characters_not_utf8_bytes() {
         let action = engine
             .plan(
                 &token,
-                CorrectionDecision::Replace(ReplacementText::try_new(replacement).unwrap()),
+                CorrectionDecision::Replace(ReplacementText::try_new(replacement).unwrap().into()),
             )
             .expect("replacement action");
         assert_eq!(action.delete_previous_chars(), expected_delete_count);
@@ -32,7 +33,11 @@ fn certification_immediate_undo_preserves_original_text_and_boundary() {
     let applied = engine
         .plan(
             &token,
-            CorrectionDecision::Replace(ReplacementText::try_new("QuantileEntryStrategy").unwrap()),
+            CorrectionDecision::Replace(
+                ReplacementText::try_new("QuantileEntryStrategy")
+                    .unwrap()
+                    .into(),
+            ),
         )
         .unwrap();
     let undo = engine
@@ -48,6 +53,20 @@ fn certification_immediate_undo_preserves_original_text_and_boundary() {
 }
 
 #[test]
+fn certification_wrong_layout_target_language_survives_replacement_planning() {
+    let engine = ReplacementEngine::new();
+    let token = CompletedToken::new("lkz", Boundary::Character(' '));
+    let decision = CorrectionDecision::Replace(CorrectionReplacement::for_language(
+        ReplacementText::try_new("для").unwrap(),
+        LanguageId::try_new("ru").unwrap(),
+    ));
+    let action = engine.plan(&token, decision).unwrap();
+
+    assert_eq!(action.replacement().as_str(), "для");
+    assert_eq!(action.target_language().map(|id| id.as_str()), Some("ru"));
+}
+
+#[test]
 fn certification_boundary_semantics_are_preserved_for_execution() {
     let engine = ReplacementEngine::new();
     for boundary in [Boundary::Character('!'), Boundary::Enter, Boundary::Tab] {
@@ -55,7 +74,7 @@ fn certification_boundary_semantics_are_preserved_for_execution() {
         let action = engine
             .plan(
                 &token,
-                CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap()),
+                CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap().into()),
             )
             .expect("replacement action");
         assert_eq!(action.boundary(), boundary);

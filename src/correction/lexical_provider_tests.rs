@@ -97,3 +97,36 @@ fn provider_preserves_simple_case_pattern() {
             .any(|candidate| candidate.replacement().as_str() == "HELLO")
     );
 }
+
+#[test]
+fn kept_learning_term_strips_deferred_grave_edge_instead_of_polluting_user_words() {
+    let provider = provider();
+    let token = completed_physical_token("`него");
+    assert_eq!(provider.canonical_learning_term(&token), "него");
+}
+
+#[test]
+fn punctuation_only_physical_token_has_no_canonical_learning_word() {
+    let provider = provider();
+    let token = completed_physical_token(",");
+    assert_eq!(provider.canonical_learning_term(&token), "");
+}
+
+#[test]
+fn learned_user_word_replacement_uses_observed_case_not_first_stored_case() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("CustomToken", 100).unwrap();
+    let provider = LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap();
+    let lower = CompletedToken::new("customtoke", Boundary::Character(' '));
+
+    assert!(
+        provider
+            .candidates(&lower)
+            .iter()
+            .any(|candidate| candidate.replacement().as_str() == "customtoken")
+    );
+}

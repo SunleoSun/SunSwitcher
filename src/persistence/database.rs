@@ -4,13 +4,14 @@ use std::path::Path;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
+use crate::completion::sequence::{SequenceCandidate, SequenceHistory, SequenceHistoryError};
 use crate::language::{
     DictionaryEntry, LanguageId, LanguagePack, LanguagePackError, language_pack_from_entries,
     normalize_word,
 };
 use crate::lexicon::{UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 const SCHEMA_V1: &str = r#"
 CREATE TABLE app_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -241,6 +242,20 @@ CREATE TABLE clipboard_files (
 ) STRICT;
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE TABLE completion_hidden_words (
+    normalized_term TEXT PRIMARY KEY CHECK (length(normalized_term) > 0)
+) STRICT;
+"#;
+
+// Grave/backtick is a layout-ambiguous physical key (` in EN, ё in RU), not part of the
+// canonical lexical token grammar. Earlier typed learning could persist an edge grave as if it
+// were part of a word after the lexical provider had already validated the punctuation-free core.
+const SCHEMA_V3: &str = r#"
+DELETE FROM user_words WHERE instr(term, char(96)) > 0;
+DELETE FROM text_history WHERE instr(text, char(96)) > 0;
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipboardHistoryLimit(u32);
 
@@ -372,6 +387,7 @@ pub enum DatabaseError {
     Sqlite(rusqlite::Error),
     LanguagePack(LanguagePackError),
     UserLexicon(UserLexiconError),
+    SequenceHistory(SequenceHistoryError),
     SchemaTooNew {
         found: i64,
         supported: i64,
@@ -396,6 +412,9 @@ impl Display for DatabaseError {
             Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
             Self::LanguagePack(error) => write!(formatter, "invalid language data: {error:?}"),
             Self::UserLexicon(error) => write!(formatter, "invalid user lexicon data: {error}"),
+            Self::SequenceHistory(error) => {
+                write!(formatter, "invalid sequence history data: {error:?}")
+            }
             Self::SchemaTooNew { found, supported } => write!(
                 formatter,
                 "database schema version {found} is newer than supported version {supported}"
@@ -456,6 +475,12 @@ impl From<LanguagePackError> for DatabaseError {
 impl From<UserLexiconError> for DatabaseError {
     fn from(error: UserLexiconError) -> Self {
         Self::UserLexicon(error)
+    }
+}
+
+impl From<SequenceHistoryError> for DatabaseError {
+    fn from(error: SequenceHistoryError) -> Self {
+        Self::SequenceHistory(error)
     }
 }
 
@@ -564,6 +589,17 @@ impl Database {
         upsert_user_word(&self.connection, &input)
     }
 
+    pub fn delete_user_word(&self, term: &str) -> Result<bool, DatabaseError> {
+        let normalized_term = normalize_word(term.trim());
+        if normalized_term.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.connection.execute(
+            "DELETE FROM user_words WHERE normalized_term = ?1",
+            [normalized_term],
+        )? != 0)
+    }
+
     pub fn record_correction_event(
         &self,
         observed_text: &str,
@@ -648,6 +684,70 @@ impl Database {
         Ok(stored)
     }
 
+    pub fn record_text_history(
+        &self,
+        text: &str,
+        used_at_ms: i64,
+    ) -> Result<SequenceCandidate, DatabaseError> {
+        let input = SequenceCandidate::try_new(text, 1, used_at_ms)?;
+        upsert_text_history(&self.connection, &input)
+    }
+
+    pub fn delete_text_history(&self, text: &str) -> Result<bool, DatabaseError> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM text_history WHERE text = ?1", [text])?
+            != 0)
+    }
+
+    pub fn hide_completion_word(&self, normalized_term: &str) -> Result<(), DatabaseError> {
+        let normalized_term = normalize_word(normalized_term);
+        if normalized_term.is_empty() {
+            return Ok(());
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO completion_hidden_words (normalized_term) VALUES (?1)",
+            [normalized_term],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_hidden_completion_words(
+        &self,
+    ) -> Result<crate::completion::CompletionWordSuppressions, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT normalized_term FROM completion_hidden_words ORDER BY normalized_term",
+        )?;
+        let stored = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for normalized_term in &stored {
+            if normalize_word(normalized_term) != *normalized_term {
+                return Err(DatabaseError::InvalidStoredNormalizedTerm {
+                    term: normalized_term.clone(),
+                    normalized_term: normalized_term.clone(),
+                });
+            }
+        }
+        Ok(crate::completion::CompletionWordSuppressions::from_normalized_words(stored))
+    }
+
+    pub fn load_text_history(&self) -> Result<SequenceHistory, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT text, use_count, last_used_at_ms FROM text_history ORDER BY text")?;
+        let stored: Vec<(String, i64, i64)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut entries = Vec::with_capacity(stored.len());
+        for row in stored {
+            entries.push(sequence_candidate_from_stored(row)?);
+        }
+        Ok(SequenceHistory::new(entries))
+    }
+
+    // Correction history owns Undo state only; user vocabulary changes through user-word APIs.
+
     pub fn load_user_lexicon(&self) -> Result<UserLexicon, DatabaseError> {
         let mut statement = self.connection.prepare(
             "SELECT term, normalized_term, use_count, last_used_at_ms FROM user_words ORDER BY normalized_term",
@@ -699,6 +799,44 @@ RETURNING term, normalized_term, use_count, last_used_at_ms
     user_word_from_stored(stored)
 }
 
+fn upsert_text_history(
+    connection: &Connection,
+    input: &SequenceCandidate,
+) -> Result<SequenceCandidate, DatabaseError> {
+    let stored = connection.query_row(
+        r#"
+INSERT INTO text_history (text, last_used_at_ms, use_count)
+VALUES (?1, ?2, 1)
+ON CONFLICT(text) DO UPDATE SET
+    use_count = text_history.use_count + 1,
+    last_used_at_ms = MAX(text_history.last_used_at_ms, excluded.last_used_at_ms)
+RETURNING text, use_count, last_used_at_ms
+"#,
+        params![input.text(), input.last_used_at_ms()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    sequence_candidate_from_stored(stored)
+}
+
+fn sequence_candidate_from_stored(
+    stored: (String, i64, i64),
+) -> Result<SequenceCandidate, DatabaseError> {
+    let (text, stored_use_count, last_used_at_ms) = stored;
+    let use_count =
+        u32::try_from(stored_use_count).map_err(|_| SequenceHistoryError::InvalidUseCount)?;
+    Ok(SequenceCandidate::try_new(
+        text,
+        use_count,
+        last_used_at_ms,
+    )?)
+}
+
 fn user_word_from_stored(stored: (String, String, i64, i64)) -> Result<UserWord, DatabaseError> {
     let (term, normalized_term, stored_use_count, last_used_at_ms) = stored;
     if normalize_word(&term) != normalized_term {
@@ -717,7 +855,7 @@ fn schema_version(connection: &Connection) -> Result<i64, DatabaseError> {
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
-    let version = schema_version(connection)?;
+    let mut version = schema_version(connection)?;
     if version > CURRENT_SCHEMA_VERSION {
         return Err(DatabaseError::SchemaTooNew {
             found: version,
@@ -725,10 +863,26 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         });
     }
 
-    if version < CURRENT_SCHEMA_VERSION {
+    if version < 1 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V1)?;
-        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        transaction.pragma_update(None, "user_version", 1)?;
+        transaction.commit()?;
+        version = 1;
+    }
+
+    if version < 2 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V2)?;
+        transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
+        version = 2;
+    }
+
+    if version < 3 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V3)?;
+        transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
     }
 

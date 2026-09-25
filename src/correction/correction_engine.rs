@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 
 use crate::input::CompletedToken;
+use crate::language::LanguageId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplacementText(String);
@@ -43,22 +44,77 @@ impl Confidence {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionReplacement {
+    text: ReplacementText,
+    target_language: Option<LanguageId>,
+}
+
+impl CorrectionReplacement {
+    pub fn new(text: ReplacementText) -> Self {
+        Self {
+            text,
+            target_language: None,
+        }
+    }
+
+    pub fn for_language(text: ReplacementText, target_language: LanguageId) -> Self {
+        Self {
+            text,
+            target_language: Some(target_language),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.text.as_str()
+    }
+
+    pub fn target_language(&self) -> Option<&LanguageId> {
+        self.target_language.as_ref()
+    }
+
+    pub fn into_parts(self) -> (ReplacementText, Option<LanguageId>) {
+        (self.text, self.target_language)
+    }
+}
+
+impl From<ReplacementText> for CorrectionReplacement {
+    fn from(text: ReplacementText) -> Self {
+        Self::new(text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorrectionCandidate {
-    replacement: ReplacementText,
+    replacement: CorrectionReplacement,
     confidence: Confidence,
 }
 
 impl CorrectionCandidate {
     pub fn new(replacement: ReplacementText, confidence: Confidence) -> Self {
         Self {
-            replacement,
+            replacement: replacement.into(),
+            confidence,
+        }
+    }
+
+    pub fn for_language(
+        replacement: ReplacementText,
+        confidence: Confidence,
+        target_language: LanguageId,
+    ) -> Self {
+        Self {
+            replacement: CorrectionReplacement::for_language(replacement, target_language),
             confidence,
         }
     }
 
     pub fn replacement(&self) -> &ReplacementText {
-        &self.replacement
+        &self.replacement.text
+    }
+
+    pub fn target_language(&self) -> Option<&LanguageId> {
+        self.replacement.target_language()
     }
 
     pub fn confidence(&self) -> Confidence {
@@ -73,7 +129,7 @@ pub trait CorrectionCandidateProvider {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CorrectionDecision {
     Keep,
-    Replace(ReplacementText),
+    Replace(CorrectionReplacement),
 }
 
 pub struct CorrectionEngine<P> {

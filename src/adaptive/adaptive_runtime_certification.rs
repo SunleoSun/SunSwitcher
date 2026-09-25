@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
 use crate::correction::Confidence;
-use crate::input::InputEvent;
+use crate::input::{InputEvent, PhysicalKey};
 use crate::persistence::Database;
 use crate::replacement::{ReplacementOutcome, UndoOutcome};
 
@@ -73,6 +74,102 @@ fn certification_first_word_after_invalidation_is_corrected_without_leading_boun
         panic!("first fresh token after invalidation must still reach lexical correction");
     };
     assert_eq!(action.replacement().as_str(), "для");
+}
+
+#[test]
+fn certification_first_wrong_layout_word_after_invalidation_is_corrected() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        session.process(InputEvent::Invalidate, 50).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    let correction = type_token(&mut session, "lkz", 100);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!("first fresh wrong-layout token after invalidation must be corrected");
+    };
+    assert_eq!(action.replacement().as_str(), "для");
+    assert_eq!(action.target_language().unwrap().as_str(), "ru");
+}
+
+#[test]
+fn certification_explicit_user_word_deletion_refreshes_live_snapshot() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("руддщ", 20).unwrap();
+    database.record_text_history("hello руддщ", 21).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+
+    assert!(
+        runtime
+            .snapshots()
+            .load()
+            .unwrap()
+            .user_lexicon()
+            .contains_normalized("руддщ")
+    );
+    assert!(
+        runtime
+            .completion_provider()
+            .unwrap()
+            .complete_sequence(&["hello"], 25, 10)
+            .iter()
+            .any(|candidate| candidate.text() == "руддщ")
+    );
+
+    runtime.learning().delete_user_word("РУДДЩ").unwrap();
+    runtime.flush().unwrap();
+    assert!(
+        !runtime
+            .snapshots()
+            .load()
+            .unwrap()
+            .user_lexicon()
+            .contains_normalized("руддщ")
+    );
+
+    let mut session = runtime.session();
+    let correction = type_token(&mut session, "руддщ", 30);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!(
+            "deleting the learned wrong-layout spelling must expose the system correction again"
+        );
+    };
+    assert_eq!(action.replacement().as_str(), "hello");
+    assert_eq!(action.target_language().unwrap().as_str(), "en");
+    assert!(
+        runtime
+            .completion_provider()
+            .unwrap()
+            .complete_sequence(&["hello"], 40, 10)
+            .iter()
+            .all(|candidate| candidate.text() != "руддщ")
+    );
+}
+
+#[test]
+fn certification_startup_does_not_reinterpret_user_words_from_correction_history() {
+    let database = Database::open_in_memory().unwrap();
+    database
+        .record_correction_event("CustomToken", "OtherToken", 10)
+        .unwrap();
+    database.record_user_word("CustomToken", 20).unwrap();
+
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    assert!(
+        runtime
+            .snapshots()
+            .load()
+            .unwrap()
+            .user_lexicon()
+            .contains_normalized("customtoken")
+    );
 }
 
 #[test]
@@ -146,6 +243,25 @@ fn certification_copied_plain_word_becomes_a_typo_target_after_text_observation(
 }
 
 #[test]
+fn certification_copied_text_uses_words_learned_earlier_in_the_same_payload() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+
+    runtime
+        .learning()
+        .observe_text("мурзаплекс мурзапелкс", 100)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert!(snapshot.user_lexicon().contains_normalized("мурзаплекс"));
+    assert!(!snapshot.user_lexicon().contains_normalized("мурзапелкс"));
+}
+
+#[test]
 fn certification_copied_text_does_not_learn_tokens_the_same_corrector_would_replace() {
     let database = Database::open_in_memory().unwrap();
     database
@@ -172,6 +288,464 @@ fn certification_copied_text_does_not_learn_tokens_the_same_corrector_would_repl
         snapshot
             .user_lexicon()
             .contains_normalized("quantileentrystrategy")
+    );
+}
+
+#[test]
+fn certification_copied_sequence_is_canonicalized_and_repetition_beats_correction() {
+    let database = Database::open_in_memory().unwrap();
+    database
+        .record_user_word("QuantileEntryStrategy", 10)
+        .unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+
+    runtime
+        .learning()
+        .observe_text("hello QuanntileEntrySrtategy", 100)
+        .unwrap();
+    runtime.learning().observe_text("hello world", 200).unwrap();
+    runtime.learning().observe_text("hello world", 300).unwrap();
+    runtime.flush().unwrap();
+
+    let provider = runtime.completion_provider().unwrap();
+    let completions = provider.complete_sequence(&["hello"], 300, 10);
+    assert_eq!(completions[0].text(), "world");
+    assert!(
+        completions
+            .iter()
+            .any(|candidate| candidate.text() == "QuantileEntryStrategy")
+    );
+    assert!(
+        !completions
+            .iter()
+            .any(|candidate| candidate.text() == "QuanntileEntrySrtategy")
+    );
+}
+
+#[test]
+fn certification_word_completion_combines_user_and_system_prefixes_case_insensitively() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("PrototypeThing", 100).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+
+    let completions = runtime.completion_provider().unwrap().complete("Pro", 10);
+    assert_eq!(completions[0].text(), "PrototypeThing");
+    assert!(
+        completions
+            .iter()
+            .any(|candidate| candidate.text() == "program")
+    );
+}
+
+#[test]
+fn certification_live_completion_activates_at_three_characters_and_uses_sequence_context() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("PrototypeThing", 100).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    runtime
+        .learning()
+        .observe_text("мне нужно сделать проект", 200)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let mut completion = runtime.completion_session();
+    completion
+        .process_event(InputEvent::character('P'), 300)
+        .unwrap();
+    completion
+        .process_event(InputEvent::character('r'), 301)
+        .unwrap();
+    assert!(!completion.is_active());
+    completion
+        .process_event(InputEvent::character('o'), 302)
+        .unwrap();
+    assert!(completion.is_active());
+    assert!(
+        completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "PrototypeThing")
+    );
+
+    completion
+        .process_event(InputEvent::Invalidate, 303)
+        .unwrap();
+    for character in "мне ".chars() {
+        completion
+            .process_event(InputEvent::character(character), 310)
+            .unwrap();
+    }
+    for character in "нужно ".chars() {
+        completion
+            .process_event(InputEvent::character(character), 320)
+            .unwrap();
+    }
+    for character in "сде".chars() {
+        completion
+            .process_event(InputEvent::character(character), 330)
+            .unwrap();
+    }
+
+    assert!(completion.is_active());
+    assert!(
+        completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "сделать проект")
+    );
+}
+
+#[test]
+fn certification_sequence_prefix_and_word_acceptance_keep_selected_continuation() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    runtime
+        .learning()
+        .observe_text("project alpha beta", 100)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let mut completion = runtime.completion_session();
+    for (index, character) in "pro".chars().enumerate() {
+        completion
+            .process_event(InputEvent::character(character), 200 + index as i64)
+            .unwrap();
+    }
+    let target_index = completion
+        .suggestions()
+        .iter()
+        .position(|candidate| candidate.text() == "project alpha beta")
+        .expect("stored phrase should be suggested directly from its first-word prefix");
+    for _ in 0..target_index {
+        assert_eq!(
+            completion.command(CompletionCommand::Next).unwrap(),
+            CompletionCommandResult::Consumed
+        );
+    }
+
+    assert_eq!(
+        completion
+            .command(CompletionCommand::AcceptNextWord)
+            .unwrap(),
+        CompletionCommandResult::AcceptWord("ject ".to_owned())
+    );
+
+    runtime
+        .learning()
+        .observe_text("project alpha beta gamma", 250)
+        .unwrap();
+    for used_at_ms in 251..255 {
+        runtime
+            .learning()
+            .observe_text("project alpha theta", used_at_ms)
+            .unwrap();
+    }
+    runtime.flush().unwrap();
+
+    completion
+        .word_acceptance_outcome(CompletionApplyOutcome::Applied, 300)
+        .unwrap();
+    assert_eq!(completion.selected_index(), 0);
+    assert_eq!(completion.suggestions()[0].text(), "alpha beta gamma");
+
+    assert_eq!(
+        completion
+            .command(CompletionCommand::AcceptNextWord)
+            .unwrap(),
+        CompletionCommandResult::AcceptWord("alpha ".to_owned())
+    );
+    runtime
+        .learning()
+        .observe_text("project alpha beta gamma delta", 301)
+        .unwrap();
+    for used_at_ms in 302..306 {
+        runtime
+            .learning()
+            .observe_text("project alpha beta omega", used_at_ms)
+            .unwrap();
+    }
+    runtime.flush().unwrap();
+
+    completion
+        .word_acceptance_outcome(CompletionApplyOutcome::Applied, 310)
+        .unwrap();
+    assert_eq!(completion.selected_index(), 0);
+    assert_eq!(completion.suggestions()[0].text(), "beta gamma delta");
+}
+
+#[test]
+fn certification_delete_removes_selected_sequence_from_database_and_live_completion() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    runtime
+        .learning()
+        .observe_text("project alpha beta", 100)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let mut completion = runtime.completion_session();
+    for character in "pro".chars() {
+        completion
+            .process_event(InputEvent::character(character), 200)
+            .unwrap();
+    }
+    let target_index = completion
+        .suggestions()
+        .iter()
+        .position(|candidate| candidate.text() == "project alpha beta")
+        .expect("learned sequence must be visible before deletion");
+    for _ in 0..target_index {
+        completion.command(CompletionCommand::Next).unwrap();
+    }
+    assert_eq!(
+        completion
+            .command(CompletionCommand::DeleteSelected)
+            .unwrap(),
+        CompletionCommandResult::Consumed
+    );
+    assert!(
+        !completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "project alpha beta")
+    );
+    runtime.flush().unwrap();
+
+    let completions = runtime
+        .completion_provider()
+        .unwrap()
+        .complete_sequence_for_prefix(&[], "pro", 300, 10);
+    assert!(
+        !completions
+            .iter()
+            .any(|candidate| candidate.text() == "project alpha beta")
+    );
+}
+
+#[test]
+fn certification_delete_hides_system_word_completion_without_removing_lexical_authority() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut completion = runtime.completion_session();
+    for character in "hel".chars() {
+        completion
+            .process_event(InputEvent::character(character), 100)
+            .unwrap();
+    }
+    let target_index = completion
+        .suggestions()
+        .iter()
+        .position(|candidate| candidate.text() == "hello")
+        .expect("system word must be available before suppression");
+    for _ in 0..target_index {
+        completion.command(CompletionCommand::Next).unwrap();
+    }
+    assert_eq!(
+        completion
+            .command(CompletionCommand::DeleteSelected)
+            .unwrap(),
+        CompletionCommandResult::Consumed
+    );
+    runtime.flush().unwrap();
+
+    assert!(
+        !runtime
+            .completion_provider()
+            .unwrap()
+            .complete("hel", 10)
+            .iter()
+            .any(|candidate| candidate.text() == "hello")
+    );
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert!(
+        snapshot
+            .languages()
+            .iter()
+            .any(|pack| pack.id().as_str() == "en" && pack.contains_normalized("hello"))
+    );
+}
+
+#[test]
+fn certification_typed_words_feed_rolling_sequence_history() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        type_token(&mut session, "hello", 100),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        type_token(&mut session, "world", 200),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        type_token(&mut session, "again", 300),
+        AdaptiveCorrectionDirective::Pass
+    );
+    runtime.flush().unwrap();
+
+    let completions = runtime
+        .completion_provider()
+        .unwrap()
+        .complete_sequence(&["hello"], 400, 10);
+    assert!(
+        completions
+            .iter()
+            .any(|candidate| candidate.text() == "world again")
+    );
+}
+
+#[test]
+fn certification_undo_replaces_corrected_word_in_typed_sequence_history() {
+    let database = Database::open_in_memory().unwrap();
+    database
+        .record_user_word("QuantileEntryStrategy", 10)
+        .unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        type_token(&mut session, "hello", 50),
+        AdaptiveCorrectionDirective::Pass
+    );
+    let correction = type_token(&mut session, "QuanntileEntrySrtategy", 100);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!("technical typo must be corrected before rolling Undo is tested");
+    };
+    assert_eq!(action.replacement().as_str(), "QuantileEntryStrategy");
+    session
+        .replacement_outcome(ReplacementOutcome::Applied)
+        .unwrap();
+
+    let undo = session
+        .request_undo(110)
+        .unwrap()
+        .expect("applied correction must remain immediately undoable");
+    assert_eq!(undo.replacement().as_str(), "QuanntileEntrySrtategy");
+    session.undo_outcome(UndoOutcome::Applied).unwrap();
+    runtime.flush().unwrap();
+
+    let completions = runtime
+        .completion_provider()
+        .unwrap()
+        .complete_sequence(&["hello"], 200, 10);
+    assert!(
+        completions
+            .iter()
+            .any(|candidate| candidate.text() == "QuanntileEntrySrtategy")
+    );
+    assert!(
+        !completions
+            .iter()
+            .any(|candidate| candidate.text() == "QuantileEntryStrategy")
+    );
+}
+
+#[test]
+fn certification_aborted_correction_does_not_create_sequence_evidence() {
+    let path = TempDatabasePath::new("aborted-sequence");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut session = runtime.session();
+        assert_eq!(
+            type_token(&mut session, "world", 50),
+            AdaptiveCorrectionDirective::Pass
+        );
+        let correction = type_token(&mut session, "hlelo", 100);
+        assert!(matches!(
+            correction,
+            AdaptiveCorrectionDirective::Replace(_)
+        ));
+        session
+            .replacement_outcome(ReplacementOutcome::Aborted)
+            .unwrap();
+        session.process(InputEvent::Invalidate, 110).unwrap();
+        runtime.flush().unwrap();
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    let stale_sequence_count: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM text_history WHERE text = 'world hlelo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_sequence_count, 0);
+}
+
+#[test]
+fn certification_corrected_deferred_punctuation_uses_canonical_sequence_word() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+    assert_eq!(
+        type_token(&mut session, "world", 50),
+        AdaptiveCorrectionDirective::Pass
+    );
+    for character in "hlelo".chars() {
+        assert_eq!(
+            session
+                .process(InputEvent::character(character), 100)
+                .unwrap(),
+            AdaptiveCorrectionDirective::Pass
+        );
+    }
+    assert_eq!(
+        session
+            .process(InputEvent::typed_character(',', PhysicalKey::Comma), 100,)
+            .unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    let directive = session.process(InputEvent::character(' '), 100).unwrap();
+    let AdaptiveCorrectionDirective::Replace(action) = directive else {
+        panic!("punctuated typo must still correct");
+    };
+    assert_eq!(action.replacement().as_str(), "hello,");
+    session
+        .replacement_outcome(ReplacementOutcome::Applied)
+        .unwrap();
+    assert_eq!(
+        session.process(InputEvent::character('x'), 110).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    runtime.flush().unwrap();
+
+    let completions = runtime
+        .completion_provider()
+        .unwrap()
+        .complete_sequence(&["world"], 200, 10);
+    assert!(
+        completions
+            .iter()
+            .any(|candidate| candidate.text() == "hello")
+    );
+    assert!(
+        !completions
+            .iter()
+            .any(|candidate| candidate.text() == "hello,")
     );
 }
 
@@ -424,6 +998,16 @@ fn certification_undo_commit_learns_original_and_refreshes_live_snapshot() {
         .exact("quantileentrystrategy1")
         .unwrap();
     assert_eq!(learned.term(), "QuantileEntryStrategy1");
+
+    let completions = runtime
+        .completion_provider()
+        .unwrap()
+        .complete("QuantileEntryStrategy", 10);
+    assert!(
+        completions
+            .iter()
+            .any(|candidate| candidate.text() == "QuantileEntryStrategy1")
+    );
 }
 
 #[test]

@@ -6,7 +6,7 @@ use super::{
 fn default_settings_use_the_explicit_clipboard_history_limit() {
     let database = Database::open_in_memory().expect("fresh in-memory database should open");
 
-    assert_eq!(database.schema_version().unwrap(), 1);
+    assert_eq!(database.schema_version().unwrap(), 3);
     assert_eq!(
         database.settings().unwrap().clipboard_history_limit(),
         ClipboardHistoryLimit::DEFAULT
@@ -81,4 +81,20 @@ fn correction_undo_requires_valid_text_is_single_use_and_adds_a_user_word() {
         database.prepare_correction_undo(event),
         Err(DatabaseError::CorrectionEventAlreadyUndone(_))
     ));
+}
+
+#[test]
+fn user_word_delete_is_normalized_and_idempotent() {
+    let database = Database::open_in_memory().unwrap();
+    database
+        .record_user_word("QuantileEntryStrategy1", 1)
+        .unwrap();
+    database.record_user_word("OtherToken", 2).unwrap();
+
+    assert!(database.delete_user_word("QUANTILEENTRYSTRATEGY1").unwrap());
+    assert!(!database.delete_user_word("quantileentrystrategy1").unwrap());
+
+    let lexicon = database.load_user_lexicon().unwrap();
+    assert!(!lexicon.contains_normalized("quantileentrystrategy1"));
+    assert!(lexicon.contains_normalized("othertoken"));
 }

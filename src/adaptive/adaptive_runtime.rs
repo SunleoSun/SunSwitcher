@@ -3,6 +3,12 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 
+use crate::completion::sequence::{MAX_SEQUENCE_WORDS, SequenceHistory};
+use crate::completion::{
+    CompletionApplyOutcome, CompletionCommand, CompletionCommandResult, CompletionDeletionTarget,
+    CompletionProvider, CompletionSession, CompletionSuggestion,
+    CompletionSuppressionSnapshotStore, SequenceSnapshotStore,
+};
 use crate::correction::{
     Confidence, CorrectionDecision, CorrectionEngine, LexicalCorrectionProvider, LexicalSnapshot,
 };
@@ -101,6 +107,16 @@ enum LearningCommand {
         text: String,
         used_at_ms: i64,
     },
+    ObserveTypedSequence {
+        canonical_tokens: Vec<String>,
+        used_at_ms: i64,
+    },
+    DeleteCompletion {
+        target: CompletionDeletionTarget,
+    },
+    DeleteUserWord {
+        term: String,
+    },
     RecordCorrection {
         observed_text: String,
         replacement_text: String,
@@ -156,6 +172,28 @@ impl LearningClient {
             text: text.into(),
             used_at_ms,
         })
+    }
+
+    fn observe_typed_sequence(
+        &self,
+        canonical_tokens: Vec<String>,
+        used_at_ms: i64,
+    ) -> Result<(), AdaptiveRuntimeError> {
+        self.send(LearningCommand::ObserveTypedSequence {
+            canonical_tokens,
+            used_at_ms,
+        })
+    }
+
+    fn delete_completion(
+        &self,
+        target: CompletionDeletionTarget,
+    ) -> Result<(), AdaptiveRuntimeError> {
+        self.send(LearningCommand::DeleteCompletion { target })
+    }
+
+    pub fn delete_user_word(&self, term: impl Into<String>) -> Result<(), AdaptiveRuntimeError> {
+        self.send(LearningCommand::DeleteUserWord { term: term.into() })
     }
 
     fn record_correction(
@@ -239,6 +277,8 @@ impl LearningClient {
 
 pub struct AdaptiveLexicalRuntime {
     snapshots: LexicalSnapshotStore,
+    sequences: SequenceSnapshotStore,
+    completion_suppressions: CompletionSuppressionSnapshotStore,
     learning: LearningClient,
     minimum_confidence: Confidence,
     worker: Option<JoinHandle<()>>,
@@ -251,9 +291,14 @@ impl AdaptiveLexicalRuntime {
     ) -> Result<Self, AdaptiveRuntimeError> {
         let languages = database.load_enabled_language_packs()?;
         let user_lexicon = database.load_user_lexicon()?;
+        let sequence_history = database.load_text_history()?;
+        let completion_suppressions = database.load_hidden_completion_words()?;
         let snapshot = LexicalSnapshot::try_new(languages, user_lexicon)
             .map_err(|_| AdaptiveRuntimeError::NoLanguages)?;
         let snapshots = LexicalSnapshotStore::new(snapshot);
+        let sequences = SequenceSnapshotStore::new(sequence_history);
+        let completion_suppressions =
+            CompletionSuppressionSnapshotStore::new(completion_suppressions);
         let (sender, receiver) = mpsc::channel();
         let last_error = Arc::new(Mutex::new(None));
         let learning = LearningClient {
@@ -261,10 +306,14 @@ impl AdaptiveLexicalRuntime {
             last_error: Arc::clone(&last_error),
         };
         let worker_snapshots = snapshots.clone();
+        let worker_sequences = sequences.clone();
+        let worker_completion_suppressions = completion_suppressions.clone();
         let worker = thread::spawn(move || {
             learning_worker(
                 database,
                 worker_snapshots,
+                worker_sequences,
+                worker_completion_suppressions,
                 receiver,
                 last_error,
                 minimum_confidence,
@@ -272,6 +321,8 @@ impl AdaptiveLexicalRuntime {
         });
         Ok(Self {
             snapshots,
+            sequences,
+            completion_suppressions,
             learning,
             minimum_confidence,
             worker: Some(worker),
@@ -286,8 +337,34 @@ impl AdaptiveLexicalRuntime {
         self.learning.clone()
     }
 
+    pub fn completion_provider(&self) -> Result<CompletionProvider, AdaptiveRuntimeError> {
+        let lexical = self.snapshots.load()?;
+        let sequences = self
+            .sequences
+            .load()
+            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
+        let completion_suppressions = self
+            .completion_suppressions
+            .load()
+            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
+        Ok(CompletionProvider::with_word_suppressions(
+            lexical,
+            sequences,
+            completion_suppressions,
+        ))
+    }
+
     pub fn session(&self) -> AdaptiveCorrectionSession {
         AdaptiveCorrectionSession::new(self.snapshots(), self.learning(), self.minimum_confidence)
+    }
+
+    pub fn completion_session(&self) -> AdaptiveCompletionSession {
+        AdaptiveCompletionSession::new(
+            self.snapshots.clone(),
+            self.sequences.clone(),
+            self.completion_suppressions.clone(),
+            self.learning(),
+        )
     }
 
     pub fn flush(&self) -> Result<(), AdaptiveRuntimeError> {
@@ -301,6 +378,101 @@ impl Drop for AdaptiveLexicalRuntime {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+pub struct AdaptiveCompletionSession {
+    lexical: LexicalSnapshotStore,
+    sequences: SequenceSnapshotStore,
+    completion_suppressions: CompletionSuppressionSnapshotStore,
+    learning: LearningClient,
+    session: CompletionSession,
+}
+
+impl AdaptiveCompletionSession {
+    fn new(
+        lexical: LexicalSnapshotStore,
+        sequences: SequenceSnapshotStore,
+        completion_suppressions: CompletionSuppressionSnapshotStore,
+        learning: LearningClient,
+    ) -> Self {
+        Self {
+            lexical,
+            sequences,
+            completion_suppressions,
+            learning,
+            session: CompletionSession::default(),
+        }
+    }
+
+    pub fn process_event(
+        &mut self,
+        event: InputEvent,
+        observed_at_ms: i64,
+    ) -> Result<(), AdaptiveRuntimeError> {
+        self.session.process_event(event);
+        let provider = CompletionProvider::with_word_suppressions(
+            self.lexical.load()?,
+            self.sequences
+                .load()
+                .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?,
+            self.completion_suppressions
+                .load()
+                .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?,
+        );
+        self.session.refresh(&provider, observed_at_ms);
+        Ok(())
+    }
+
+    pub fn canonicalize_last_context_word(&mut self, canonical: &str) {
+        self.session.canonicalize_last_context_word(canonical);
+    }
+
+    pub fn command(
+        &mut self,
+        command: CompletionCommand,
+    ) -> Result<CompletionCommandResult, AdaptiveRuntimeError> {
+        let result = self.session.command(command);
+        if let CompletionCommandResult::DeletePrediction(target) = &result {
+            self.learning.delete_completion(target.clone())?;
+            return Ok(CompletionCommandResult::Consumed);
+        }
+        Ok(result)
+    }
+
+    pub fn word_acceptance_outcome(
+        &mut self,
+        outcome: CompletionApplyOutcome,
+        observed_at_ms: i64,
+    ) -> Result<(), AdaptiveRuntimeError> {
+        self.session.word_acceptance_outcome(outcome);
+        if outcome != CompletionApplyOutcome::Applied {
+            return Ok(());
+        }
+
+        let provider = CompletionProvider::with_word_suppressions(
+            self.lexical.load()?,
+            self.sequences
+                .load()
+                .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?,
+            self.completion_suppressions
+                .load()
+                .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?,
+        );
+        self.session.refresh(&provider, observed_at_ms);
+        Ok(())
+    }
+
+    pub fn suggestions(&self) -> &[CompletionSuggestion] {
+        self.session.suggestions()
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.session.selected_index()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.session.is_active()
     }
 }
 
@@ -325,6 +497,13 @@ struct PendingUndo {
     undone_at_ms: i64,
 }
 
+#[derive(Debug)]
+struct PendingTypedSequence {
+    canonical_tokens: Vec<String>,
+    boundary: Boundary,
+    observed_at_ms: i64,
+}
+
 pub struct AdaptiveCorrectionSession {
     input: InputBuffer,
     snapshots: LexicalSnapshotStore,
@@ -334,6 +513,9 @@ pub struct AdaptiveCorrectionSession {
     pending_correction: Option<PendingCorrection>,
     undo_candidate: Option<UndoCandidate>,
     pending_undo: Option<PendingUndo>,
+    typed_sequence_context: Vec<String>,
+    pending_typed_sequence: Option<PendingTypedSequence>,
+    resolved_completion_word: Option<String>,
 }
 
 impl AdaptiveCorrectionSession {
@@ -351,6 +533,9 @@ impl AdaptiveCorrectionSession {
             pending_correction: None,
             undo_candidate: None,
             pending_undo: None,
+            typed_sequence_context: Vec::new(),
+            pending_typed_sequence: None,
+            resolved_completion_word: None,
         }
     }
 
@@ -359,24 +544,44 @@ impl AdaptiveCorrectionSession {
         event: InputEvent,
         observed_at_ms: i64,
     ) -> Result<AdaptiveCorrectionDirective, AdaptiveRuntimeError> {
-        // A side-effect result is valid only for the directive that was returned immediately
-        // before it. Any intervening observed input makes a previously planned correction or Undo
-        // stale, including an Undo whose external text restoration is still in flight.
+        self.resolved_completion_word = None;
+        // A side-effect result is valid only for the directive returned immediately before it.
+        // If a correction/Undo side effect is still in flight when new input arrives, visible text
+        // is no longer provable, so the typed sequence context is discarded instead of guessed.
+        if self.pending_correction.is_some() || self.pending_undo.is_some() {
+            self.pending_typed_sequence = None;
+            self.typed_sequence_context.clear();
+        } else {
+            self.finalize_pending_typed_sequence()?;
+        }
         self.pending_correction = None;
         self.undo_candidate = None;
         self.pending_undo = None;
-        let InputOutcome::Completed(token) = self.input.process(event) else {
-            return Ok(AdaptiveCorrectionDirective::Pass);
+
+        let outcome = self.input.process(event);
+        let token = match outcome {
+            InputOutcome::Continue => return Ok(AdaptiveCorrectionDirective::Pass),
+            InputOutcome::Invalidated => {
+                self.typed_sequence_context.clear();
+                return Ok(AdaptiveCorrectionDirective::Pass);
+            }
+            InputOutcome::Completed(token) => token,
         };
 
         let snapshot = self.snapshots.load()?;
         let provider = LexicalCorrectionProvider::from_snapshot(snapshot);
+        let canonical_kept_term = provider.canonical_learning_term(&token);
         let decision = CorrectionEngine::new(provider, self.minimum_confidence).decide(&token);
         let action = self.replacements.plan(&token, decision.clone());
         match &decision {
             CorrectionDecision::Keep => {
+                self.resolved_completion_word = Some(canonical_kept_term.clone());
                 self.learning
-                    .observe_typed_token(token.text(), observed_at_ms)?;
+                    .observe_typed_token(&canonical_kept_term, observed_at_ms)?;
+                let canonical_tokens =
+                    self.push_typed_sequence_word(&canonical_kept_term, token.boundary());
+                self.learning
+                    .observe_typed_sequence(canonical_tokens, observed_at_ms)?;
             }
             CorrectionDecision::Replace(replacement) => {
                 if let Some(action) = action.as_ref() {
@@ -403,17 +608,46 @@ impl AdaptiveCorrectionSession {
         let Some(pending) = self.pending_correction.take() else {
             return Ok(());
         };
-        if outcome == ReplacementOutcome::Applied {
-            let receipt = self.learning.record_correction(
-                pending.observed_text.clone(),
-                pending.replacement_text,
-                pending.observed_at_ms,
-            )?;
-            if let Some(action) = self
-                .replacements
-                .plan_immediate_undo(&pending.observed_text, &pending.action)
-            {
-                self.undo_candidate = Some(UndoCandidate { receipt, action });
+
+        match outcome {
+            ReplacementOutcome::Applied => {
+                let receipt = self.learning.record_correction(
+                    pending.observed_text.clone(),
+                    pending.replacement_text.clone(),
+                    pending.observed_at_ms,
+                )?;
+                let canonical_tokens = if let Some(canonical_replacement) =
+                    canonical_sequence_word(&pending.replacement_text)
+                {
+                    self.resolved_completion_word = Some(canonical_replacement.clone());
+                    self.push_typed_sequence_word(&canonical_replacement, pending.action.boundary())
+                } else {
+                    self.resolved_completion_word = Some(String::new());
+                    self.pending_typed_sequence = None;
+                    self.typed_sequence_context.clear();
+                    Vec::new()
+                };
+                if let Some(action) = self
+                    .replacements
+                    .plan_immediate_undo(&pending.observed_text, &pending.action)
+                {
+                    self.undo_candidate = Some(UndoCandidate { receipt, action });
+                    if !canonical_tokens.is_empty() {
+                        self.pending_typed_sequence = Some(PendingTypedSequence {
+                            canonical_tokens,
+                            boundary: pending.action.boundary(),
+                            observed_at_ms: pending.observed_at_ms,
+                        });
+                    }
+                } else if !canonical_tokens.is_empty() {
+                    self.learning
+                        .observe_typed_sequence(canonical_tokens, pending.observed_at_ms)?;
+                }
+            }
+            ReplacementOutcome::Aborted => {
+                self.resolved_completion_word = None;
+                self.pending_typed_sequence = None;
+                self.typed_sequence_context.clear();
             }
         }
         Ok(())
@@ -443,9 +677,30 @@ impl AdaptiveCorrectionSession {
             return Ok(());
         };
         match outcome {
-            UndoOutcome::Applied => self
-                .learning
-                .queue_commit_recorded_undo(pending.receipt, pending.undone_at_ms),
+            UndoOutcome::Applied => {
+                let original_text = pending.action.replacement().as_str();
+                self.learning
+                    .queue_commit_recorded_undo(pending.receipt, pending.undone_at_ms)?;
+
+                if let Some(mut typed) = self.pending_typed_sequence.take() {
+                    let Some(canonical_original) = canonical_sequence_word(original_text) else {
+                        self.typed_sequence_context.clear();
+                        return Ok(());
+                    };
+                    self.resolved_completion_word = Some(canonical_original.clone());
+                    if let Some(last) = typed.canonical_tokens.last_mut() {
+                        *last = canonical_original.clone();
+                    }
+                    if matches!(typed.boundary, Boundary::Character(' '))
+                        && let Some(last) = self.typed_sequence_context.last_mut()
+                    {
+                        *last = canonical_original;
+                    }
+                    self.learning
+                        .observe_typed_sequence(typed.canonical_tokens, pending.undone_at_ms)?;
+                }
+                Ok(())
+            }
             UndoOutcome::NotExecuted => {
                 self.undo_candidate = Some(UndoCandidate {
                     receipt: pending.receipt,
@@ -453,14 +708,51 @@ impl AdaptiveCorrectionSession {
                 });
                 Ok(())
             }
-            UndoOutcome::Uncertain => Ok(()),
+            UndoOutcome::Uncertain => {
+                self.pending_typed_sequence = None;
+                self.typed_sequence_context.clear();
+                Ok(())
+            }
         }
+    }
+
+    pub fn take_resolved_completion_word(&mut self) -> Option<String> {
+        self.resolved_completion_word.take()
+    }
+
+    fn finalize_pending_typed_sequence(&mut self) -> Result<(), AdaptiveRuntimeError> {
+        let Some(pending) = self.pending_typed_sequence.as_ref() else {
+            return Ok(());
+        };
+        self.learning
+            .observe_typed_sequence(pending.canonical_tokens.clone(), pending.observed_at_ms)?;
+        self.pending_typed_sequence = None;
+        Ok(())
+    }
+
+    fn push_typed_sequence_word(&mut self, token: &str, boundary: Boundary) -> Vec<String> {
+        if token.is_empty() {
+            self.typed_sequence_context.clear();
+            return Vec::new();
+        }
+        self.typed_sequence_context.push(token.to_owned());
+        if self.typed_sequence_context.len() > MAX_SEQUENCE_WORDS {
+            let excess = self.typed_sequence_context.len() - MAX_SEQUENCE_WORDS;
+            self.typed_sequence_context.drain(..excess);
+        }
+        let canonical_tokens = self.typed_sequence_context.clone();
+        if !matches!(boundary, Boundary::Character(' ')) {
+            self.typed_sequence_context.clear();
+        }
+        canonical_tokens
     }
 }
 
 fn learning_worker(
     mut database: Database,
     snapshots: LexicalSnapshotStore,
+    sequences: SequenceSnapshotStore,
+    completion_suppressions: CompletionSuppressionSnapshotStore,
     receiver: mpsc::Receiver<LearningCommand>,
     last_error: Arc<Mutex<Option<String>>>,
     minimum_confidence: Confidence,
@@ -470,9 +762,46 @@ fn learning_worker(
             LearningCommand::ObserveToken { token, used_at_ms } => {
                 observe_user_word(&database, &snapshots, &token, used_at_ms)
             }
-            LearningCommand::ObserveText { text, used_at_ms } => {
-                observe_user_text(&database, &snapshots, &text, used_at_ms, minimum_confidence)
-            }
+            LearningCommand::ObserveText { text, used_at_ms } => observe_user_text(
+                &database,
+                &snapshots,
+                &sequences,
+                &text,
+                used_at_ms,
+                minimum_confidence,
+            ),
+            LearningCommand::ObserveTypedSequence {
+                canonical_tokens,
+                used_at_ms,
+            } => observe_typed_sequence(&database, &sequences, &canonical_tokens, used_at_ms),
+            LearningCommand::DeleteUserWord { term } => database
+                .delete_user_word(&term)
+                .map_err(AdaptiveRuntimeError::from)
+                .and_then(|deleted| {
+                    if deleted {
+                        snapshots.replace_user_lexicon(database.load_user_lexicon()?)
+                    } else {
+                        Ok(())
+                    }
+                }),
+            LearningCommand::DeleteCompletion { target } => match target {
+                CompletionDeletionTarget::TextHistory(text) => database
+                    .delete_text_history(&text)
+                    .map_err(AdaptiveRuntimeError::from)
+                    .and_then(|_| {
+                        sequences
+                            .replace(database.load_text_history()?)
+                            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)
+                    }),
+                CompletionDeletionTarget::Word(normalized_term) => database
+                    .hide_completion_word(&normalized_term)
+                    .map_err(AdaptiveRuntimeError::from)
+                    .and_then(|_| {
+                        completion_suppressions
+                            .replace(database.load_hidden_completion_words()?)
+                            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)
+                    }),
+            },
             LearningCommand::RecordCorrection {
                 observed_text,
                 replacement_text,
@@ -537,31 +866,80 @@ fn learning_worker(
 fn observe_user_text(
     database: &Database,
     snapshots: &LexicalSnapshotStore,
+    sequences: &SequenceSnapshotStore,
     text: &str,
     used_at_ms: i64,
     minimum_confidence: Confidence,
 ) -> Result<(), AdaptiveRuntimeError> {
-    let snapshot = snapshots.load()?;
-    let provider = LexicalCorrectionProvider::from_snapshot(Arc::clone(&snapshot));
-    let correction = CorrectionEngine::new(provider, minimum_confidence);
+    let mut snapshot = snapshots.load()?;
+    let mut canonical_tokens = Vec::new();
+
+    for token in extract_tokens(text) {
+        let provider = LexicalCorrectionProvider::from_snapshot(Arc::clone(&snapshot));
+        let correction = CorrectionEngine::new(provider, minimum_confidence);
+        let completed = CompletedToken::new(token, Boundary::Character(' '));
+        let decision = correction.decide(&completed);
+        let canonical = match &decision {
+            CorrectionDecision::Keep => token.to_owned(),
+            CorrectionDecision::Replace(replacement) => replacement.as_str().to_owned(),
+        };
+        canonical_tokens.push(canonical);
+
+        if decision != CorrectionDecision::Keep || !should_record_user_word(token, &snapshot) {
+            continue;
+        }
+
+        database.record_user_word(token, used_at_ms)?;
+        let user_lexicon = database.load_user_lexicon()?;
+        snapshots.replace_user_lexicon(user_lexicon)?;
+        snapshot = snapshots.load()?;
+    }
+
+    persist_sequence_observations(
+        database,
+        sequences,
+        SequenceHistory::ngrams_from_canonical_tokens(&canonical_tokens),
+        used_at_ms,
+    )
+}
+
+fn observe_typed_sequence(
+    database: &Database,
+    sequences: &SequenceSnapshotStore,
+    canonical_tokens: &[String],
+    used_at_ms: i64,
+) -> Result<(), AdaptiveRuntimeError> {
+    persist_sequence_observations(
+        database,
+        sequences,
+        SequenceHistory::suffix_ngrams_from_canonical_tokens(canonical_tokens),
+        used_at_ms,
+    )
+}
+
+fn persist_sequence_observations(
+    database: &Database,
+    sequences: &SequenceSnapshotStore,
+    observed_sequences: Vec<String>,
+    used_at_ms: i64,
+) -> Result<(), AdaptiveRuntimeError> {
+    if observed_sequences.is_empty() {
+        return Ok(());
+    }
+
     let mut changed = false;
     let persist_result = (|| {
-        for token in extract_tokens(text) {
-            let completed = CompletedToken::new(token, Boundary::Character(' '));
-            if correction.decide(&completed) == CorrectionDecision::Keep
-                && should_record_user_word(token, &snapshot)
-            {
-                database.record_user_word(token, used_at_ms)?;
-                changed = true;
-            }
+        for sequence in observed_sequences {
+            database.record_text_history(&sequence, used_at_ms)?;
+            changed = true;
         }
         Ok(())
     })();
 
-    // record_user_word writes canonical state before returning. If a later token fails, refresh
-    // from the rows that did commit so the live snapshot never silently lags canonical SQLite.
     if changed {
-        snapshots.replace_user_lexicon(database.load_user_lexicon()?)?;
+        sequences
+            .replace(database.load_text_history()?)
+            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
     }
     persist_result
 }
@@ -596,6 +974,12 @@ fn should_record_user_word(token: &str, snapshot: &LexicalSnapshot) -> bool {
         return false;
     }
     token.chars().any(char::is_alphabetic)
+}
+
+fn canonical_sequence_word(text: &str) -> Option<String> {
+    let mut tokens = extract_tokens(text);
+    let token = tokens.next()?.to_owned();
+    tokens.next().is_none().then_some(token)
 }
 
 fn extract_tokens(text: &str) -> impl Iterator<Item = &str> {

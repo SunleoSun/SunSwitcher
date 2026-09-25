@@ -1,18 +1,23 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_BACK, VK_CONTROL, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
-    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_SHIFT, VK_TAB,
+    INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_ESCAPE, VK_LEFT, VK_MENU, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
+    VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 
 use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
 
 use super::keyboard_runtime::{
-    InputOwnershipStamp, KeyDownDisposition, RuntimeError, build_ctrl_chord_inputs,
-    build_replacement_inputs, foreground_change_requires_invalidation, injected_marker,
-    input_ownership_matches, is_foreign_injected_keyboard_event, is_shift_modifier_key,
-    is_toggle_key, keyup_suppression_after_injection, mouse_message_invalidates_tracking,
+    DoubleShiftEvent, DoubleShiftTracker, InputOwnershipStamp, KeyDownDisposition,
+    PauseHotkeyAction, RuntimeError, build_completion_suffix_inputs, build_completion_word_inputs,
+    build_ctrl_chord_inputs, build_ctrl_shift_chord_inputs, build_previous_word_selection_inputs,
+    build_replacement_inputs, completion_hotkey_command, foreground_change_requires_invalidation,
+    injected_marker, input_ownership_matches, is_foreign_injected_keyboard_event,
+    is_physical_keyboard_event, is_shift_modifier_key, is_toggle_key,
+    keyup_suppression_after_injection, mouse_message_invalidates_tracking, pause_hotkey_action,
     physical_key_from_vk, preclassify_key_down, undo_hotkey_matches, undo_outcome_after_injection,
     update_keyboard_state,
 };
+use crate::completion::CompletionCommand;
 use crate::correction::{CorrectionDecision, ReplacementText};
 use crate::input::{Boundary, CompletedToken, InputEvent, PhysicalKey};
 use crate::persistence::UndoHotkey;
@@ -26,7 +31,7 @@ fn action(
     ReplacementEngine::new()
         .plan(
             &CompletedToken::new(source, boundary),
-            CorrectionDecision::Replace(ReplacementText::try_new(replacement).unwrap()),
+            CorrectionDecision::Replace(ReplacementText::try_new(replacement).unwrap().into()),
         )
         .unwrap()
 }
@@ -84,6 +89,201 @@ fn pause_undo_hotkey_requires_an_unmodified_keypress() {
         VK_PAUSE as u32,
         &state
     ));
+}
+
+#[test]
+fn grave_oem_key_is_service_input_instead_of_token_text() {
+    assert_eq!(
+        preclassify_key_down(VK_OEM_3 as u32, false),
+        KeyDownDisposition::Ignore
+    );
+}
+
+#[test]
+fn pause_with_selection_deletes_that_user_word_instead_of_undoing() {
+    assert_eq!(
+        pause_hotkey_action(Some("CustomToken")),
+        PauseHotkeyAction::DeleteSelectedUserWord("CustomToken".to_owned())
+    );
+    assert_eq!(
+        pause_hotkey_action(None),
+        PauseHotkeyAction::UndoPreviousCorrection
+    );
+}
+
+#[test]
+fn completion_hotkeys_require_exact_default_modifier_contract() {
+    let mut state = [0u8; 256];
+    assert_eq!(
+        completion_hotkey_command(VK_ESCAPE as u32, &state),
+        Some(CompletionCommand::Dismiss)
+    );
+    assert_eq!(
+        completion_hotkey_command(VK_UP as u32, &state),
+        Some(CompletionCommand::Previous)
+    );
+    assert_eq!(
+        completion_hotkey_command(VK_DOWN as u32, &state),
+        Some(CompletionCommand::Next)
+    );
+    assert_eq!(
+        completion_hotkey_command(VK_RETURN as u32, &state),
+        Some(CompletionCommand::Accept)
+    );
+    assert_eq!(
+        completion_hotkey_command(VK_TAB as u32, &state),
+        Some(CompletionCommand::Accept)
+    );
+    assert_eq!(
+        completion_hotkey_command(VK_DELETE as u32, &state),
+        Some(CompletionCommand::DeleteSelected)
+    );
+
+    update_keyboard_state(&mut state, VK_MENU as u32, true);
+    assert_eq!(
+        completion_hotkey_command(VK_RIGHT as u32, &state),
+        Some(CompletionCommand::AcceptNextWord)
+    );
+    assert_eq!(completion_hotkey_command(VK_UP as u32, &state), None);
+    update_keyboard_state(&mut state, VK_MENU as u32, false);
+    update_keyboard_state(&mut state, VK_CONTROL as u32, true);
+    assert_eq!(completion_hotkey_command(VK_RETURN as u32, &state), None);
+}
+
+#[test]
+fn double_shift_ignores_injected_keyboard_transitions() {
+    assert!(is_physical_keyboard_event(0));
+    assert!(!is_physical_keyboard_event(LLKHF_INJECTED));
+}
+
+#[test]
+fn double_shift_triggers_only_after_two_plain_taps_and_on_second_release() {
+    use std::time::{Duration, Instant};
+
+    let mut tracker = DoubleShiftTracker::default();
+    let start = Instant::now();
+    assert_eq!(
+        tracker.observe(VK_SHIFT as u32, true, false, start),
+        DoubleShiftEvent::None
+    );
+    assert_eq!(
+        tracker.observe(
+            VK_SHIFT as u32,
+            false,
+            true,
+            start + Duration::from_millis(40)
+        ),
+        DoubleShiftEvent::None
+    );
+    assert_eq!(
+        tracker.observe(
+            VK_SHIFT as u32,
+            true,
+            false,
+            start + Duration::from_millis(100)
+        ),
+        DoubleShiftEvent::Consume
+    );
+    assert_eq!(
+        tracker.observe(
+            VK_SHIFT as u32,
+            false,
+            true,
+            start + Duration::from_millis(130)
+        ),
+        DoubleShiftEvent::Trigger
+    );
+
+    assert_eq!(
+        tracker.observe(
+            VK_SHIFT as u32,
+            true,
+            false,
+            start + Duration::from_millis(500)
+        ),
+        DoubleShiftEvent::None
+    );
+    assert_eq!(
+        tracker.observe(
+            VK_SHIFT as u32,
+            false,
+            true,
+            start + Duration::from_millis(520)
+        ),
+        DoubleShiftEvent::None
+    );
+    assert_eq!(
+        tracker.observe(b'A' as u32, true, false, start + Duration::from_millis(530)),
+        DoubleShiftEvent::None
+    );
+    assert_eq!(
+        tracker.observe(
+            VK_SHIFT as u32,
+            true,
+            false,
+            start + Duration::from_millis(550)
+        ),
+        DoubleShiftEvent::None
+    );
+}
+
+#[test]
+fn ctrl_shift_selection_chord_has_balanced_modifier_order() {
+    let inputs = build_ctrl_shift_chord_inputs(VK_RIGHT);
+    assert_eq!(inputs.len(), 6);
+    let keys = inputs
+        .iter()
+        .map(|input| unsafe { input.Anonymous.ki })
+        .collect::<Vec<_>>();
+    assert_eq!(keys[0].wVk, VK_CONTROL);
+    assert_eq!(keys[1].wVk, VK_SHIFT);
+    assert_eq!(keys[2].wVk, VK_RIGHT);
+    assert_eq!(keys[3].wVk, VK_RIGHT);
+    assert_eq!(keys[4].wVk, VK_SHIFT);
+    assert_eq!(keys[5].wVk, VK_CONTROL);
+    assert_eq!(keys[0].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_eq!(keys[1].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_ne!(keys[3].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_ne!(keys[4].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_ne!(keys[5].dwFlags & KEYEVENTF_KEYUP, 0);
+}
+
+#[test]
+fn previous_word_reselection_normalizes_to_the_captured_word_before_delete() {
+    let inputs = build_previous_word_selection_inputs();
+    let keys = inputs
+        .iter()
+        .map(|input| unsafe { input.Anonymous.ki })
+        .collect::<Vec<_>>();
+
+    assert_eq!(keys.len(), 12);
+    assert_eq!(keys[0].wVk, VK_LEFT);
+    assert_eq!(keys[1].wVk, VK_LEFT);
+    assert_eq!(keys[2].wVk, VK_CONTROL);
+    assert_eq!(keys[3].wVk, VK_RIGHT);
+    assert_eq!(keys[6].wVk, VK_CONTROL);
+    assert_eq!(keys[7].wVk, VK_SHIFT);
+    assert_eq!(keys[8].wVk, VK_LEFT);
+}
+
+#[test]
+fn completion_suffix_uses_only_unicode_inputs() {
+    let inputs = build_completion_suffix_inputs("лать");
+    assert_eq!(inputs.len(), "лать".encode_utf16().count() * 2);
+    assert!(inputs.iter().all(|input| {
+        let key = unsafe { input.Anonymous.ki };
+        key.wVk == 0 && key.dwFlags & KEYEVENTF_UNICODE != 0
+    }));
+}
+
+#[test]
+fn completion_word_uses_only_unicode_while_physical_alt_is_owned_by_sunswitcher() {
+    let inputs = build_completion_word_inputs("лать ");
+    assert_eq!(inputs.len(), "лать ".encode_utf16().count() * 2);
+    assert!(inputs.iter().all(|input| {
+        let key = unsafe { input.Anonymous.ki };
+        key.wVk == 0 && key.dwFlags & KEYEVENTF_UNICODE != 0
+    }));
 }
 
 #[test]

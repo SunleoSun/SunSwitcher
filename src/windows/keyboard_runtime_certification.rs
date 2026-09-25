@@ -1,17 +1,19 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7,
-    VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_TAB,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_MENU, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
+    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_TAB,
 };
 
 use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
 
 use super::keyboard_runtime::{
-    InputOwnershipStamp, KeyDownDisposition, RuntimeError, build_replacement_inputs,
-    foreground_change_requires_invalidation, injected_marker, input_ownership_matches,
-    is_foreign_injected_keyboard_event, keyup_suppression_after_injection, physical_key_from_vk,
-    preclassify_key_down, replacement_outcome_after_injection, undo_hotkey_matches,
-    undo_outcome_after_injection,
+    InputOwnershipStamp, KeyDownDisposition, RuntimeError, SuppressedKeyUpRoute,
+    build_replacement_inputs, completion_modifier_is_sunswitcher_only,
+    completion_result_passes_through, foreground_change_requires_invalidation, injected_marker,
+    input_ownership_matches, is_foreign_injected_keyboard_event, keyup_suppression_after_injection,
+    physical_key_from_vk, preclassify_key_down, replacement_outcome_after_injection,
+    suppressed_keyup_calls_downstream, undo_hotkey_matches, undo_outcome_after_injection,
 };
+use crate::completion::CompletionCommandResult;
 use crate::correction::{CorrectionDecision, ReplacementText};
 use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome, PhysicalKey};
 use crate::persistence::UndoHotkey;
@@ -25,7 +27,7 @@ fn action(
     ReplacementEngine::new()
         .plan(
             &CompletedToken::new(source, boundary),
-            CorrectionDecision::Replace(ReplacementText::try_new(replacement).unwrap()),
+            CorrectionDecision::Replace(ReplacementText::try_new(replacement).unwrap().into()),
         )
         .unwrap()
 }
@@ -121,6 +123,40 @@ fn certification_foreign_injected_input_cannot_become_owned_text_state() {
         LLKHF_INJECTED,
         injected_marker()
     ));
+}
+
+#[test]
+fn certification_only_unhandled_completion_hotkeys_reach_the_foreground_application() {
+    assert!(completion_modifier_is_sunswitcher_only(
+        true,
+        VK_MENU as u32
+    ));
+    assert!(!completion_modifier_is_sunswitcher_only(
+        false,
+        VK_MENU as u32
+    ));
+    assert!(!completion_modifier_is_sunswitcher_only(true, b'A' as u32));
+
+    assert!(completion_result_passes_through(
+        &CompletionCommandResult::Pass
+    ));
+    assert!(!completion_result_passes_through(
+        &CompletionCommandResult::Consumed
+    ));
+    assert!(!completion_result_passes_through(
+        &CompletionCommandResult::AcceptSuffix("suffix".to_owned())
+    ));
+    assert!(!completion_result_passes_through(
+        &CompletionCommandResult::AcceptWord("word ".to_owned())
+    ));
+
+    assert!(!suppressed_keyup_calls_downstream(Some(
+        SuppressedKeyUpRoute::SunSwitcherOnly
+    )));
+    assert!(suppressed_keyup_calls_downstream(Some(
+        SuppressedKeyUpRoute::DownstreamThenSuppress
+    )));
+    assert!(suppressed_keyup_calls_downstream(None));
 }
 
 #[test]

@@ -6,7 +6,7 @@ use crate::input::{Boundary, CompletedToken};
 fn plans_delete_insert_and_boundary_from_typed_decision() {
     let engine = ReplacementEngine::new();
     let token = CompletedToken::new("дял", Boundary::Character(' '));
-    let decision = CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap());
+    let decision = CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap().into());
 
     let action = engine.plan(&token, decision).expect("replacement action");
     assert_eq!(action.delete_previous_chars(), 3);
@@ -21,7 +21,7 @@ fn immediate_undo_reverses_only_character_boundary_replacements() {
     let applied = engine
         .plan(
             &token,
-            CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap()),
+            CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap().into()),
         )
         .unwrap();
 
@@ -37,7 +37,7 @@ fn immediate_undo_reverses_only_character_boundary_replacements() {
         let applied = engine
             .plan(
                 &token,
-                CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap()),
+                CorrectionDecision::Replace(ReplacementText::try_new("для").unwrap().into()),
             )
             .unwrap();
         assert_eq!(engine.plan_immediate_undo("дял", &applied), None);
