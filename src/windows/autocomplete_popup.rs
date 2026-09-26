@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
@@ -6,6 +7,10 @@ use std::time::Duration;
 use eframe::egui::{self, ViewportBuilder, ViewportCommand, pos2, vec2};
 
 use super::caret_locator::{CaretAnchor, CaretLocator, popup_placement};
+use super::clipboard_manager::{
+    ClipboardManagerApp, ClipboardManagerHandle, ClipboardManagerState, ClipboardManagerTab,
+};
+use super::tray_icon::TrayIcon;
 
 const POPUP_WIDTH: f32 = 360.0;
 const ROW_HEIGHT: f32 = 24.0;
@@ -50,18 +55,48 @@ struct PopupState {
     selected: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PopupLayout {
+    position: egui::Pos2,
+    size: egui::Vec2,
+}
+
+impl PopupLayout {
+    fn approximately_matches(self, other: Self) -> bool {
+        (self.position.x - other.position.x).abs() < 0.5
+            && (self.position.y - other.position.y).abs() < 0.5
+            && (self.size.x - other.size.x).abs() < 0.5
+            && (self.size.y - other.size.y).abs() < 0.5
+    }
+}
+
 pub struct AutocompletePopupHandle {
     state: Arc<RwLock<PopupState>>,
+    clipboard: ClipboardManagerHandle,
     repaint_ctx: egui::Context,
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    _tray: TrayIcon,
+}
+
+fn replace_popup_state(state: &RwLock<PopupState>, next: PopupState) -> bool {
+    state.write().is_ok_and(|mut state| {
+        if *state == next {
+            false
+        } else {
+            *state = next;
+            true
+        }
+    })
 }
 
 impl AutocompletePopupHandle {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(database_path: PathBuf) -> Result<Self, String> {
         let state = Arc::new(RwLock::new(PopupState::default()));
+        let clipboard_state = Arc::new(RwLock::new(ClipboardManagerState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
+        let worker_clipboard_state = Arc::clone(&clipboard_state);
         let worker_shutdown = Arc::clone(&shutdown);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
@@ -71,14 +106,14 @@ impl AutocompletePopupHandle {
                     builder.with_any_thread(true);
                 })),
                 viewport: ViewportBuilder::default()
-                    .with_title("SunSwitcher suggestions")
+                    .with_title("SunSwitcher UI")
                     .with_inner_size(vec2(1.0, 1.0))
                     .with_position(pos2(PARKED_POSITION, PARKED_POSITION))
                     .with_resizable(false)
                     .with_decorations(false)
                     .with_taskbar(false)
                     .with_active(false)
-                    .with_visible(true)
+                    .with_visible(false)
                     .with_always_on_top()
                     .with_mouse_passthrough(false)
                     .with_transparent(false),
@@ -87,7 +122,7 @@ impl AutocompletePopupHandle {
 
             let startup_sender = ready_sender.clone();
             let result = eframe::run_native(
-                "SunSwitcher suggestions",
+                "SunSwitcher UI",
                 options,
                 Box::new(move |creation_context| {
                     install_system_font(&creation_context.egui_ctx)?;
@@ -95,9 +130,12 @@ impl AutocompletePopupHandle {
                     let _ = startup_sender.send(Ok(repaint_ctx));
                     Ok(Box::new(AutocompletePopupApp {
                         state: worker_state,
+                        clipboard: ClipboardManagerApp::new(database_path, worker_clipboard_state),
                         shutdown: worker_shutdown,
                         locator: CaretLocator::new(),
                         fallback_anchor: None,
+                        shown: false,
+                        last_layout: None,
                     }))
                 }),
             );
@@ -107,19 +145,25 @@ impl AutocompletePopupHandle {
         });
 
         match ready_receiver.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(repaint_ctx)) => Ok(Self {
-                state,
-                repaint_ctx,
-                shutdown,
-                worker: Some(worker),
-            }),
+            Ok(Ok(repaint_ctx)) => {
+                let clipboard = ClipboardManagerHandle::new(clipboard_state, repaint_ctx.clone());
+                let tray = TrayIcon::start(clipboard.clone());
+                Ok(Self {
+                    state,
+                    clipboard,
+                    repaint_ctx,
+                    shutdown,
+                    worker: Some(worker),
+                    _tray: tray,
+                })
+            }
             Ok(Err(error)) => {
                 let _ = worker.join();
                 Err(error)
             }
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
-                Err(format!("autocomplete popup did not initialize: {error}"))
+                Err(format!("SunSwitcher UI did not initialize: {error}"))
             }
         }
     }
@@ -129,19 +173,25 @@ impl AutocompletePopupHandle {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        if let Ok(mut state) = self.state.write() {
-            state.selected = selected.min(suggestions.len().saturating_sub(1));
-            state.suggestions = suggestions;
+        let next = PopupState {
+            selected: selected.min(suggestions.len().saturating_sub(1)),
+            suggestions,
+        };
+        let changed = replace_popup_state(&self.state, next);
+        if changed {
+            self.repaint_ctx.request_repaint();
         }
-        self.repaint_ctx.request_repaint();
     }
 
     pub fn hide(&self) {
-        if let Ok(mut state) = self.state.write() {
-            state.suggestions.clear();
-            state.selected = 0;
+        let changed = replace_popup_state(&self.state, PopupState::default());
+        if changed {
+            self.repaint_ctx.request_repaint();
         }
-        self.repaint_ctx.request_repaint();
+    }
+
+    pub fn show_clipboard(&self, active_tab: ClipboardManagerTab, target_window_id: usize) {
+        self.clipboard.show(active_tab, target_window_id);
     }
 }
 
@@ -157,9 +207,45 @@ impl Drop for AutocompletePopupHandle {
 
 struct AutocompletePopupApp {
     state: Arc<RwLock<PopupState>>,
+    clipboard: ClipboardManagerApp,
     shutdown: Arc<AtomicBool>,
     locator: CaretLocator,
     fallback_anchor: Option<CaretAnchor>,
+    shown: bool,
+    last_layout: Option<PopupLayout>,
+}
+
+impl AutocompletePopupApp {
+    fn hide_popup(&mut self, ctx: &egui::Context) {
+        self.fallback_anchor = None;
+        self.last_layout = None;
+        if self.shown {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.shown = false;
+        }
+    }
+
+    fn prepare_popup_viewport(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Title("SunSwitcher suggestions".to_owned()));
+        ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
+    }
+
+    fn apply_layout(&mut self, ctx: &egui::Context, layout: PopupLayout) {
+        let layout_changed = self
+            .last_layout
+            .is_none_or(|previous| !previous.approximately_matches(layout));
+        if !self.shown || layout_changed {
+            self.prepare_popup_viewport(ctx);
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(layout.size));
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(layout.position));
+            self.last_layout = Some(layout);
+        }
+        if !self.shown {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            self.shown = true;
+        }
+    }
 }
 
 impl eframe::App for AutocompletePopupApp {
@@ -169,18 +255,20 @@ impl eframe::App for AutocompletePopupApp {
             return;
         }
 
+        if self.clipboard.logic(ctx) {
+            self.fallback_anchor = None;
+            self.last_layout = None;
+            self.shown = false;
+            return;
+        }
+
         let state = self
             .state
             .read()
             .map(|state| state.clone())
             .unwrap_or_default();
         if state.suggestions.is_empty() {
-            self.fallback_anchor = None;
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(1.0, 1.0)));
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(
-                PARKED_POSITION,
-                PARKED_POSITION,
-            )));
+            self.hide_popup(ctx);
             return;
         }
 
@@ -192,11 +280,7 @@ impl eframe::App for AutocompletePopupApp {
                 self.fallback_anchor = self.locator.fallback_anchor();
             }
             let Some(anchor) = self.fallback_anchor else {
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(1.0, 1.0)));
-                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(
-                    PARKED_POSITION,
-                    PARKED_POSITION,
-                )));
+                self.hide_popup(ctx);
                 return;
             };
             anchor
@@ -204,15 +288,20 @@ impl eframe::App for AutocompletePopupApp {
 
         let popup_height = POPUP_PADDING * 2.0 + ROW_HEIGHT * state.suggestions.len() as f32;
         let placement = popup_placement(anchor, POPUP_WIDTH, popup_height, CARET_GAP);
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(POPUP_WIDTH, popup_height)));
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(
-            placement.x,
-            placement.y,
-        )));
+        self.apply_layout(
+            ctx,
+            PopupLayout {
+                position: pos2(placement.x, placement.y),
+                size: vec2(POPUP_WIDTH, popup_height),
+            },
+        );
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        if self.clipboard.ui(ui) {
             return;
         }
 
@@ -248,8 +337,6 @@ impl eframe::App for AutocompletePopupApp {
                 egui::Color32::WHITE,
             );
         }
-
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -260,40 +347,25 @@ impl eframe::App for AutocompletePopupApp {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
-
     use super::*;
 
     #[test]
-    fn popup_update_wakes_the_eframe_context() {
-        let repaint_count = Arc::new(AtomicUsize::new(0));
-        let observed_repaints = Arc::clone(&repaint_count);
-        let repaint_ctx = egui::Context::default();
-        repaint_ctx.set_request_repaint_callback(move |info| {
-            if info.delay.is_zero() {
-                observed_repaints.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-        let handle = AutocompletePopupHandle {
-            state: Arc::new(RwLock::new(PopupState::default())),
-            repaint_ctx,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            worker: None,
+    fn popup_state_change_detection_ignores_identical_updates() {
+        let state = RwLock::new(PopupState::default());
+        let project = PopupState {
+            suggestions: vec!["project".to_owned()],
+            selected: 0,
         };
+        assert!(replace_popup_state(&state, project.clone()));
+        assert!(!replace_popup_state(&state, project));
 
-        let before_update = repaint_count.load(Ordering::SeqCst);
-        handle.update(["project"], 0);
-        let after_update = repaint_count.load(Ordering::SeqCst);
-        assert!(after_update > before_update);
-
-        handle.hide();
-        assert!(
-            handle
-                .state
-                .read()
-                .expect("popup state lock")
-                .suggestions
-                .is_empty()
-        );
+        let expanded = PopupState {
+            suggestions: vec!["project".to_owned(), "probe".to_owned()],
+            selected: 1,
+        };
+        assert!(replace_popup_state(&state, expanded.clone()));
+        assert_eq!(*state.read().expect("popup state lock"), expanded);
+        assert!(replace_popup_state(&state, PopupState::default()));
+        assert!(!replace_popup_state(&state, PopupState::default()));
     }
 }

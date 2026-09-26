@@ -163,9 +163,25 @@ impl CompletionSession {
         } else {
             self.limit
         };
-        for candidate in
-            provider.complete_sequence_for_prefix(&context_refs, prefix, now_ms, sequence_limit)
-        {
+        // Alt+Right keeps the already-visible next word as the logical lookup prefix while the
+        // physical input prefix is empty. The provider therefore executes exactly the same
+        // prefix-driven lookup/ranking path as it does for manual typing; only session lifecycle
+        // decides where that prefix comes from.
+        let lookup_prefix = if prefix.is_empty() {
+            self.protected_continuation
+                .as_deref()
+                .and_then(|continuation| continuation.split_whitespace().next())
+                .unwrap_or(prefix)
+        } else {
+            prefix
+        };
+        let sequence_candidates = provider.complete_sequence_for_prefix(
+            &context_refs,
+            lookup_prefix,
+            now_ms,
+            sequence_limit,
+        );
+        for candidate in sequence_candidates {
             let target = CompletionDeletionTarget::TextHistory(candidate.source_text().to_owned());
             if self.deleted_predictions.contains(&target) {
                 continue;

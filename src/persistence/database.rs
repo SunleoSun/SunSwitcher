@@ -6,12 +6,11 @@ use rusqlite::{Connection, TransactionBehavior, params};
 
 use crate::completion::sequence::{SequenceCandidate, SequenceHistory, SequenceHistoryError};
 use crate::language::{
-    DictionaryEntry, LanguageId, LanguagePack, LanguagePackError, builtin_language_pack,
-    language_pack_from_entries, normalize_word,
+    LanguageId, LanguagePack, LanguagePackError, builtin_language_pack, normalize_word,
 };
 use crate::lexicon::{UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 const SCHEMA_V1: &str = r#"
 CREATE TABLE app_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -256,11 +255,12 @@ DELETE FROM user_words WHERE instr(term, char(96)) > 0;
 DELETE FROM text_history WHERE instr(text, char(96)) > 0;
 "#;
 
-// Built-in RU/EN vocabulary moved to compact immutable FST assets. Keeping the old seed rows would
-// create a second system-dictionary authority with different frequency semantics.
-const SCHEMA_V4: &str = r#"
-DELETE FROM dictionary_words
-WHERE language_id IN (SELECT id FROM languages WHERE code IN ('ru', 'en'));
+// Built-in RU/EN vocabulary moved to compact immutable FST assets. Version 5 owns the
+// final cleanup by dropping the obsolete mutable dictionary table entirely.
+const SCHEMA_V4: &str = r#""#;
+
+const SCHEMA_V5: &str = r#"
+DROP TABLE IF EXISTS dictionary_words;
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +375,82 @@ pub struct CorrectionUndoPlan {
     replacement_text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardEntryId(i64);
+
+impl ClipboardEntryId {
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardEntryKind {
+    Text,
+    Image,
+    Files,
+}
+
+impl ClipboardEntryKind {
+    pub const fn as_stored(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Files => "files",
+        }
+    }
+
+    fn try_from_stored(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "text" => Ok(Self::Text),
+            "image" => Ok(Self::Image),
+            "files" => Ok(Self::Files),
+            _ => Err(DatabaseError::InvalidStoredClipboardKind(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardEntryContent {
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardEntryView {
+    id: ClipboardEntryId,
+    kind: ClipboardEntryKind,
+    last_seen_at_ms: i64,
+    copy_count: u32,
+    pinned_at_ms: Option<i64>,
+    content: ClipboardEntryContent,
+}
+
+impl ClipboardEntryView {
+    pub const fn id(&self) -> ClipboardEntryId {
+        self.id
+    }
+
+    pub const fn kind(&self) -> ClipboardEntryKind {
+        self.kind
+    }
+
+    pub const fn last_seen_at_ms(&self) -> i64 {
+        self.last_seen_at_ms
+    }
+
+    pub const fn copy_count(&self) -> u32 {
+        self.copy_count
+    }
+
+    pub const fn pinned_at_ms(&self) -> Option<i64> {
+        self.pinned_at_ms
+    }
+
+    pub const fn content(&self) -> &ClipboardEntryContent {
+        &self.content
+    }
+}
+
 impl CorrectionUndoPlan {
     pub const fn event_id(&self) -> CorrectionEventId {
         self.event_id
@@ -403,6 +479,10 @@ pub enum DatabaseError {
     InvalidStoredUndoHotkey(String),
     InvalidStoredDictionaryFrequency(i64),
     InvalidStoredUserWordUseCount(i64),
+    InvalidStoredClipboardKind(String),
+    InvalidStoredClipboardCopyCount(i64),
+    InvalidStoredLanguageCode(String),
+    ClipboardEntryNotFound(i64),
     InvalidCorrectionText,
     CorrectionEventNotFound(i64),
     CorrectionEventAlreadyUndone(i64),
@@ -437,6 +517,18 @@ impl Display for DatabaseError {
             }
             Self::InvalidStoredUserWordUseCount(value) => {
                 write!(formatter, "invalid stored user word use count: {value}")
+            }
+            Self::InvalidStoredClipboardKind(value) => {
+                write!(formatter, "invalid stored clipboard kind: {value:?}")
+            }
+            Self::InvalidStoredClipboardCopyCount(value) => {
+                write!(formatter, "invalid stored clipboard copy count: {value}")
+            }
+            Self::InvalidStoredLanguageCode(value) => {
+                write!(formatter, "invalid stored language code: {value:?}")
+            }
+            Self::ClipboardEntryNotFound(id) => {
+                write!(formatter, "clipboard entry {id} was not found")
             }
             Self::InvalidCorrectionText => formatter.write_str("invalid correction event text"),
             Self::CorrectionEventNotFound(id) => {
@@ -553,45 +645,19 @@ impl Database {
     pub fn load_enabled_language_packs(&self) -> Result<Vec<LanguagePack>, DatabaseError> {
         let mut language_statement = self
             .connection
-            .prepare("SELECT id, code FROM languages WHERE enabled = 1 ORDER BY id")?;
-        let languages: Vec<(i64, String)> = language_statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .prepare("SELECT code FROM languages WHERE enabled = 1 ORDER BY id")?;
+        let language_codes: Vec<String> = language_statement
+            .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         drop(language_statement);
 
-        let mut packs = Vec::with_capacity(languages.len());
-        for (database_id, code) in languages {
-            let id = LanguageId::try_new(code)?;
-            if let Some(pack) = builtin_language_pack(&id)? {
-                packs.push(pack);
-                continue;
-            }
-
-            let mut word_statement = self.connection.prepare(
-                "SELECT term, normalized_term, frequency FROM dictionary_words WHERE language_id = ?1 ORDER BY id",
-            )?;
-            let stored_entries: Vec<(String, String, i64)> = word_statement
-                .query_map([database_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?
-                .collect::<Result<_, _>>()?;
-
-            let mut entries = Vec::with_capacity(stored_entries.len());
-            for (term, normalized_term, stored_frequency) in stored_entries {
-                let expected_normalized = normalize_word(&term);
-                if normalized_term != expected_normalized {
-                    return Err(DatabaseError::InvalidStoredNormalizedTerm {
-                        term,
-                        normalized_term,
-                    });
-                }
-                let frequency = u32::try_from(stored_frequency).map_err(|_| {
-                    DatabaseError::InvalidStoredDictionaryFrequency(stored_frequency)
-                })?;
-                entries.push(DictionaryEntry::try_new(term, frequency)?);
-            }
-
-            packs.push(language_pack_from_entries(id, entries)?);
+        let mut packs = Vec::with_capacity(language_codes.len());
+        for code in language_codes {
+            let id = LanguageId::try_new(code.clone())?;
+            let Some(pack) = builtin_language_pack(&id)? else {
+                return Err(DatabaseError::InvalidStoredLanguageCode(code));
+            };
+            packs.push(pack);
         }
         Ok(packs)
     }
@@ -710,6 +776,203 @@ impl Database {
             .connection
             .execute("DELETE FROM text_history WHERE text = ?1", [text])?
             != 0)
+    }
+
+    pub fn record_clipboard_text(
+        &self,
+        text: &str,
+        observed_at_ms: i64,
+    ) -> Result<ClipboardEntryView, DatabaseError> {
+        validate_clipboard_text(text)?;
+        let content_hash = clipboard_content_hash(ClipboardEntryKind::Text, text.as_bytes());
+        let entry_id = self.connection.query_row(
+            r#"
+            INSERT INTO clipboard_entries (kind, last_seen_at_ms, content_hash, copy_count)
+            VALUES (?1, ?2, ?3, 1)
+            ON CONFLICT(kind, content_hash) DO UPDATE SET
+                last_seen_at_ms = excluded.last_seen_at_ms,
+                copy_count = clipboard_entries.copy_count + 1
+            RETURNING id
+            "#,
+            params![
+                ClipboardEntryKind::Text.as_stored(),
+                observed_at_ms,
+                &content_hash
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.connection.execute(
+            r#"
+            INSERT INTO clipboard_text (entry_id, text)
+            VALUES (?1, ?2)
+            ON CONFLICT(entry_id) DO UPDATE SET text = excluded.text
+            "#,
+            params![entry_id, text],
+        )?;
+        self.load_clipboard_entry(ClipboardEntryId(entry_id))
+    }
+
+    pub fn mark_clipboard_entry_used(
+        &self,
+        entry_id: ClipboardEntryId,
+        used_at_ms: i64,
+    ) -> Result<ClipboardEntryView, DatabaseError> {
+        self.connection.execute(
+            r#"
+            UPDATE clipboard_entries
+            SET last_seen_at_ms = ?1,
+                copy_count = copy_count + 1
+            WHERE id = ?2
+            "#,
+            params![used_at_ms, entry_id.get()],
+        )?;
+        self.load_clipboard_entry(entry_id)
+    }
+
+    pub fn pin_clipboard_entry(
+        &self,
+        entry_id: ClipboardEntryId,
+        pinned_at_ms: i64,
+    ) -> Result<ClipboardEntryView, DatabaseError> {
+        self.connection.execute(
+            "UPDATE clipboard_entries SET pinned_at_ms = ?1 WHERE id = ?2",
+            params![pinned_at_ms, entry_id.get()],
+        )?;
+        self.load_clipboard_entry(entry_id)
+    }
+
+    pub fn unpin_clipboard_entry(
+        &self,
+        entry_id: ClipboardEntryId,
+    ) -> Result<ClipboardEntryView, DatabaseError> {
+        self.connection.execute(
+            "UPDATE clipboard_entries SET pinned_at_ms = NULL WHERE id = ?1",
+            [entry_id.get()],
+        )?;
+        self.load_clipboard_entry(entry_id)
+    }
+
+    pub fn delete_clipboard_entry(
+        &self,
+        entry_id: ClipboardEntryId,
+    ) -> Result<bool, DatabaseError> {
+        Ok(self.connection.execute(
+            "DELETE FROM clipboard_entries WHERE id = ?1",
+            [entry_id.get()],
+        )? != 0)
+    }
+
+    pub fn prune_clipboard_history(
+        &self,
+        limit: ClipboardHistoryLimit,
+    ) -> Result<usize, DatabaseError> {
+        Ok(self.connection.execute(
+            r#"
+            DELETE FROM clipboard_entries
+            WHERE pinned_at_ms IS NULL
+              AND id NOT IN (
+                  SELECT id
+                  FROM clipboard_entries
+                  WHERE pinned_at_ms IS NULL
+                  ORDER BY last_seen_at_ms DESC, id DESC
+                  LIMIT ?1
+              )
+            "#,
+            [i64::from(limit.get())],
+        )?)
+    }
+
+    pub fn load_clipboard_current(
+        &self,
+        filter: &str,
+        limit: usize,
+    ) -> Result<Vec<ClipboardEntryView>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms, clipboard_text.text
+            FROM clipboard_entries
+            JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.kind = 'text'
+            ORDER BY clipboard_entries.last_seen_at_ms DESC, clipboard_entries.id DESC
+            "#,
+        )?;
+        let stored = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        clipboard_entries_from_stored(stored, filter, limit)
+    }
+
+    pub fn load_clipboard_pinned(
+        &self,
+        filter: &str,
+        limit: usize,
+    ) -> Result<Vec<ClipboardEntryView>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms, clipboard_text.text
+            FROM clipboard_entries
+            JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.kind = 'text' AND clipboard_entries.pinned_at_ms IS NOT NULL
+            ORDER BY clipboard_entries.pinned_at_ms DESC, clipboard_entries.id DESC
+            "#,
+        )?;
+        let stored = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        clipboard_entries_from_stored(stored, filter, limit)
+    }
+
+    fn load_clipboard_entry(
+        &self,
+        entry_id: ClipboardEntryId,
+    ) -> Result<ClipboardEntryView, DatabaseError> {
+        let result = self.connection.query_row(
+            r#"
+            SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms, clipboard_text.text
+            FROM clipboard_entries
+            JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.id = ?1 AND clipboard_entries.kind = 'text'
+            "#,
+            [entry_id.get()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        );
+        match result {
+            Ok(stored) => clipboard_entry_from_stored(stored),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(DatabaseError::ClipboardEntryNotFound(entry_id.get()))
+            }
+            Err(error) => Err(DatabaseError::Sqlite(error)),
+        }
     }
 
     pub fn hide_completion_word(&self, normalized_term: &str) -> Result<(), DatabaseError> {
@@ -836,6 +1099,71 @@ RETURNING text, use_count, last_used_at_ms
     sequence_candidate_from_stored(stored)
 }
 
+fn validate_clipboard_text(text: &str) -> Result<(), DatabaseError> {
+    if text.is_empty() || text.contains('\0') {
+        return Err(DatabaseError::InvalidCorrectionText);
+    }
+    Ok(())
+}
+
+fn clipboard_content_hash(kind: ClipboardEntryKind, bytes: &[u8]) -> Vec<u8> {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in kind
+        .as_stored()
+        .bytes()
+        .chain([0])
+        .chain(bytes.iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.to_be_bytes().to_vec()
+}
+
+fn clipboard_entry_from_stored(
+    stored: (i64, String, i64, i64, Option<i64>, String),
+) -> Result<ClipboardEntryView, DatabaseError> {
+    let (id, stored_kind, last_seen_at_ms, stored_copy_count, pinned_at_ms, text) = stored;
+    let copy_count = u32::try_from(stored_copy_count)
+        .map_err(|_| DatabaseError::InvalidStoredClipboardCopyCount(stored_copy_count))?;
+    Ok(ClipboardEntryView {
+        id: ClipboardEntryId(id),
+        kind: ClipboardEntryKind::try_from_stored(&stored_kind)?,
+        last_seen_at_ms,
+        copy_count,
+        pinned_at_ms,
+        content: ClipboardEntryContent::Text(text),
+    })
+}
+
+fn clipboard_entries_from_stored(
+    stored: Vec<(i64, String, i64, i64, Option<i64>, String)>,
+    filter: &str,
+    limit: usize,
+) -> Result<Vec<ClipboardEntryView>, DatabaseError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let normalized_filter = filter.trim().to_lowercase();
+    let mut entries = Vec::new();
+    for row in stored {
+        let entry = clipboard_entry_from_stored(row)?;
+        let matches_filter = normalized_filter.is_empty()
+            || match entry.content() {
+                ClipboardEntryContent::Text(text) => {
+                    text.to_lowercase().contains(&normalized_filter)
+                }
+            };
+        if matches_filter {
+            entries.push(entry);
+            if entries.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(entries)
+}
+
 fn sequence_candidate_from_stored(
     stored: (String, i64, i64),
 ) -> Result<SequenceCandidate, DatabaseError> {
@@ -903,6 +1231,14 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V4)?;
         transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+        version = 4;
+    }
+
+    if version < 5 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V5)?;
+        transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit()?;
     }
 

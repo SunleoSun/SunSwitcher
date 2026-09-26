@@ -1,12 +1,13 @@
 use super::{
-    AppSettings, ClipboardHistoryLimit, Database, DatabaseError, SettingsError, UndoHotkey,
+    AppSettings, ClipboardEntryContent, ClipboardEntryKind, ClipboardHistoryLimit, Database,
+    DatabaseError, SettingsError, UndoHotkey,
 };
 
 #[test]
 fn default_settings_use_the_explicit_clipboard_history_limit() {
     let database = Database::open_in_memory().expect("fresh in-memory database should open");
 
-    assert_eq!(database.schema_version().unwrap(), 4);
+    assert_eq!(database.schema_version().unwrap(), 5);
     assert_eq!(
         database.settings().unwrap().clipboard_history_limit(),
         ClipboardHistoryLimit::DEFAULT
@@ -35,6 +36,77 @@ fn clipboard_history_limit_is_typed_and_round_trips_through_sqlite() {
     assert_eq!(
         database.settings().unwrap().clipboard_history_limit(),
         limit
+    );
+}
+
+#[test]
+fn clipboard_text_history_deduplicates_orders_filters_and_pins() {
+    let database = Database::open_in_memory().unwrap();
+
+    let hello = database.record_clipboard_text("Hello", 10).unwrap();
+    let world = database.record_clipboard_text("world", 20).unwrap();
+    let hello_again = database.record_clipboard_text("Hello", 30).unwrap();
+
+    assert_eq!(hello_again.id(), hello.id());
+    assert_eq!(hello_again.kind(), ClipboardEntryKind::Text);
+    assert_eq!(hello_again.copy_count(), 2);
+    assert_eq!(hello_again.last_seen_at_ms(), 30);
+    assert_eq!(
+        hello_again.content(),
+        &ClipboardEntryContent::Text("Hello".to_owned())
+    );
+
+    let current = database.load_clipboard_current("", 9).unwrap();
+    assert_eq!(
+        current.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
+        [hello.id(), world.id()]
+    );
+    assert_eq!(database.load_clipboard_current("HEL", 9).unwrap().len(), 1);
+
+    let pinned = database.pin_clipboard_entry(world.id(), 40).unwrap();
+    assert_eq!(pinned.pinned_at_ms(), Some(40));
+    assert_eq!(
+        database.load_clipboard_pinned("wor", 9).unwrap()[0].id(),
+        world.id()
+    );
+
+    database.mark_clipboard_entry_used(world.id(), 50).unwrap();
+    assert_eq!(
+        database.load_clipboard_current("", 9).unwrap()[0].id(),
+        world.id()
+    );
+    assert_eq!(
+        database.load_clipboard_pinned("", 9).unwrap()[0].pinned_at_ms(),
+        Some(40)
+    );
+}
+
+#[test]
+fn clipboard_prune_keeps_pinned_entries_and_recent_current_entries() {
+    let database = Database::open_in_memory().unwrap();
+    let old = database.record_clipboard_text("old", 10).unwrap();
+    let pinned = database.record_clipboard_text("pinned", 20).unwrap();
+    let recent = database.record_clipboard_text("recent", 30).unwrap();
+    database.pin_clipboard_entry(pinned.id(), 40).unwrap();
+
+    assert_eq!(
+        database
+            .prune_clipboard_history(ClipboardHistoryLimit::try_new(1).unwrap())
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        database.mark_clipboard_entry_used(old.id(), 50),
+        Err(DatabaseError::ClipboardEntryNotFound(_))
+    ));
+    assert_eq!(
+        database
+            .load_clipboard_current("", 10)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id())
+            .collect::<Vec<_>>(),
+        [recent.id(), pinned.id()]
     );
 }
 

@@ -109,3 +109,20 @@ fn certification_invalidation_discards_stale_text_and_tracks_the_first_fresh_tok
     };
     assert_eq!(token.text(), "привте");
 }
+
+#[test]
+fn certification_navigation_invalidation_drops_post_switch_layout_span() {
+    let mut buffer = InputBuffer::new();
+    buffer.replace_layout_switch_span("как");
+    assert_eq!(buffer.current_layout_span(), "как");
+
+    assert_eq!(
+        buffer.process(InputEvent::Invalidate),
+        InputOutcome::Invalidated
+    );
+    assert!(buffer.current_layout_span().is_empty());
+
+    buffer.process(InputEvent::character('п'));
+    assert_eq!(buffer.current_layout_span(), "п");
+    assert_eq!(buffer.current_token(), "п");
+}

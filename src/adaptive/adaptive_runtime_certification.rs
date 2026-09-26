@@ -77,6 +77,99 @@ fn certification_first_word_after_invalidation_is_corrected_without_leading_boun
 }
 
 #[test]
+fn certification_layout_switch_span_keeps_punctuation_until_whitespace() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+
+    for character in "ndj".chars() {
+        assert_eq!(
+            session
+                .process(InputEvent::character(character), 100)
+                .unwrap(),
+            AdaptiveCorrectionDirective::Pass
+        );
+    }
+    assert_eq!(
+        session
+            .process(InputEvent::typed_character('.', PhysicalKey::Period), 100,)
+            .unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(session.current_layout_switch_span(), "ndj.");
+
+    session.tracked_layout_switch_applied("твою");
+    assert_eq!(session.current_layout_switch_span(), "твою");
+    assert_eq!(
+        session.process(InputEvent::character(' '), 101).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(session.current_layout_switch_span(), "твою ");
+
+    session.tracked_layout_switch_applied("ndj. ");
+    assert_eq!(session.current_layout_switch_span(), "ndj. ");
+}
+
+#[test]
+fn certification_one_letter_wrong_layout_words_are_replaced() {
+    for (observed, expected) in [("z", "я"), ("b", "и")] {
+        let runtime = AdaptiveLexicalRuntime::start(
+            Database::open_in_memory().unwrap(),
+            Confidence::try_new(0.80).unwrap(),
+        )
+        .unwrap();
+        let mut session = runtime.session();
+
+        let correction = type_token(&mut session, observed, 100);
+        let AdaptiveCorrectionDirective::Replace(action) = correction else {
+            panic!("{observed:?} must resolve to exact cross-layout word {expected:?}");
+        };
+        assert_eq!(action.replacement().as_str(), expected);
+        assert_eq!(action.target_language().unwrap().as_str(), "ru");
+    }
+}
+
+#[test]
+fn certification_learned_single_letter_alias_yields_stronger_short_function_word() {
+    let database = Database::open_in_memory().unwrap();
+    for used_at_ms in 0..20 {
+        database.record_user_word("b", used_at_ms).unwrap();
+    }
+    for used_at_ms in 100..284 {
+        database.record_user_word("и", used_at_ms).unwrap();
+    }
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
+
+    let correction = type_token(&mut session, "b", 100);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!("learned b must still resolve to stronger short function word и");
+    };
+    assert_eq!(action.replacement().as_str(), "и");
+    assert_eq!(action.target_language().unwrap().as_str(), "ru");
+}
+
+#[test]
+fn certification_cross_layout_learned_identifier_preserves_digits() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("AA33", 10).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
+
+    let correction = type_token(&mut session, "ФФ33", 100);
+    let AdaptiveCorrectionDirective::Replace(action) = correction else {
+        panic!("exact cross-layout learned identifier must be corrected");
+    };
+    assert_eq!(action.replacement().as_str(), "AA33");
+    assert_eq!(action.target_language().unwrap().as_str(), "en");
+}
+
+#[test]
 fn certification_first_wrong_layout_word_after_invalidation_is_corrected() {
     let runtime = AdaptiveLexicalRuntime::start(
         Database::open_in_memory().unwrap(),
@@ -340,6 +433,109 @@ fn certification_word_completion_combines_user_and_system_prefixes_case_insensit
 }
 
 #[test]
+fn certification_applied_completion_acceptance_increments_user_word_usage() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("PrototypeThing", 100).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut completion = runtime.completion_session();
+
+    for (index, character) in "Pro".chars().enumerate() {
+        completion
+            .process_event(InputEvent::character(character), 110 + index as i64)
+            .unwrap();
+    }
+    assert_eq!(completion.suggestions()[0].text(), "PrototypeThing");
+    assert_eq!(
+        completion.command(CompletionCommand::Accept).unwrap(),
+        CompletionCommandResult::AcceptSuffix("totypeThing".to_owned())
+    );
+    completion
+        .suffix_acceptance_outcome(CompletionApplyOutcome::Applied, 200)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert_eq!(
+        snapshot
+            .user_lexicon()
+            .exact("prototypething")
+            .unwrap()
+            .use_count(),
+        2
+    );
+}
+
+#[test]
+fn certification_applied_next_word_completion_increments_user_word_usage() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("PrototypeThing", 100).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut completion = runtime.completion_session();
+
+    for (index, character) in "Pro".chars().enumerate() {
+        completion
+            .process_event(InputEvent::character(character), 110 + index as i64)
+            .unwrap();
+    }
+    assert_eq!(completion.suggestions()[0].text(), "PrototypeThing");
+    assert_eq!(
+        completion
+            .command(CompletionCommand::AcceptNextWord)
+            .unwrap(),
+        CompletionCommandResult::AcceptWord("totypeThing ".to_owned())
+    );
+    completion
+        .word_acceptance_outcome(CompletionApplyOutcome::Applied, 200)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert_eq!(
+        snapshot
+            .user_lexicon()
+            .exact("prototypething")
+            .unwrap()
+            .use_count(),
+        2
+    );
+}
+
+#[test]
+fn certification_uncertain_completion_acceptance_does_not_increment_usage() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("PrototypeThing", 100).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut completion = runtime.completion_session();
+
+    for (index, character) in "Pro".chars().enumerate() {
+        completion
+            .process_event(InputEvent::character(character), 110 + index as i64)
+            .unwrap();
+    }
+    assert!(matches!(
+        completion.command(CompletionCommand::Accept).unwrap(),
+        CompletionCommandResult::AcceptSuffix(_)
+    ));
+    completion
+        .suffix_acceptance_outcome(CompletionApplyOutcome::Uncertain, 200)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert_eq!(
+        snapshot
+            .user_lexicon()
+            .exact("prototypething")
+            .unwrap()
+            .use_count(),
+        1
+    );
+}
+
+#[test]
 fn certification_live_completion_activates_at_three_characters_and_uses_sequence_context() {
     let database = Database::open_in_memory().unwrap();
     database.record_user_word("PrototypeThing", 100).unwrap();
@@ -574,6 +770,80 @@ fn certification_delete_hides_system_word_completion_without_removing_lexical_au
             .languages()
             .iter()
             .any(|pack| pack.id().as_str() == "en" && pack.contains_normalized("hello"))
+    );
+}
+
+#[test]
+fn certification_repeated_typed_sequence_surfaces_multi_word_repetition() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+
+    for (index, token) in [
+        "AA11", "AA22", "AA33", "AA11", "AA33", "AA11", "AA33", "AA33", "AA33", "AA33",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            type_token(&mut session, token, 100 + index as i64),
+            AdaptiveCorrectionDirective::Pass
+        );
+    }
+    runtime.flush().unwrap();
+
+    let completions = runtime
+        .completion_provider()
+        .unwrap()
+        .complete_sequence_for_prefix(&["AA33", "AA33"], "AA3", 200, 10);
+    assert_eq!(completions[0].text(), "AA33 AA33");
+
+    let mut completion = runtime.completion_session();
+    for character in "AA3".chars() {
+        completion
+            .process_event(InputEvent::character(character), 201)
+            .unwrap();
+    }
+    assert_eq!(completion.suggestions()[0].text(), "AA33 AA33");
+    assert_eq!(
+        completion
+            .command(CompletionCommand::AcceptNextWord)
+            .unwrap(),
+        CompletionCommandResult::AcceptWord("3 ".to_owned())
+    );
+    completion
+        .word_acceptance_outcome(CompletionApplyOutcome::Applied, 202)
+        .unwrap();
+    assert!(
+        completion.suggestions()[0]
+            .text()
+            .split_whitespace()
+            .count()
+            >= 2,
+        "continuation collapsed too early: {:?}",
+        completion.suggestions()[0].text()
+    );
+
+    assert_eq!(
+        completion
+            .command(CompletionCommand::AcceptNextWord)
+            .unwrap(),
+        CompletionCommandResult::AcceptWord("AA33 ".to_owned())
+    );
+    completion
+        .word_acceptance_outcome(CompletionApplyOutcome::Applied, 203)
+        .unwrap();
+    assert!(
+        completion.suggestions()[0]
+            .text()
+            .split_whitespace()
+            .count()
+            >= 2,
+        "second Alt+Right collapsed to one word: {:?}",
+        completion.suggestions()[0].text()
     );
 }
 

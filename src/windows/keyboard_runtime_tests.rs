@@ -1,27 +1,51 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
-    VK_ESCAPE, VK_LEFT, VK_MENU, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
-    VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    INPUT_KEYBOARD, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_ADD, VK_BACK,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LSHIFT, VK_MENU,
+    VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 
-use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    LLKHF_INJECTED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN,
+    WM_XBUTTONDOWN,
+};
 
 use super::keyboard_runtime::{
-    DoubleShiftEvent, DoubleShiftTracker, InputOwnershipStamp, KeyDownDisposition,
-    PauseHotkeyAction, RuntimeError, build_completion_suffix_inputs, build_completion_word_inputs,
-    build_ctrl_chord_inputs, build_ctrl_shift_chord_inputs, build_previous_word_selection_inputs,
-    build_replacement_inputs, completion_hotkey_command, foreground_change_requires_invalidation,
-    injected_marker, input_ownership_matches, is_foreign_injected_keyboard_event,
-    is_physical_keyboard_event, is_shift_modifier_key, is_toggle_key,
-    keyup_suppression_after_injection, mouse_message_invalidates_tracking, pause_hotkey_action,
-    physical_key_from_vk, preclassify_key_down, undo_hotkey_matches, undo_outcome_after_injection,
+    ClipboardCommand, DoubleShiftEvent, DoubleShiftTracker, InputOwnershipStamp,
+    KeyDownDisposition, MouseSelectionEffect, MouseSelectionTracker, PauseHotkeyAction,
+    RuntimeError, build_backward_selection_inputs, build_completion_suffix_inputs,
+    build_completion_word_inputs, build_ctrl_chord_inputs, build_ctrl_shift_chord_inputs,
+    build_previous_caret_range_replacement_inputs, build_replacement_inputs,
+    build_tracked_text_replacement_inputs, clipboard_hotkey_command, completion_hotkey_command,
+    foreground_change_requires_invalidation, injected_marker, input_ownership_matches,
+    is_foreign_injected_keyboard_event, is_physical_keyboard_event, is_shift_modifier_key,
+    is_toggle_key, keyup_suppression_after_injection, mouse_message_invalidates_tracking,
+    pause_hotkey_action, physical_key_from_vk, preclassify_key_down,
+    selection_capture_intent_for_navigation, undo_hotkey_matches, undo_outcome_after_injection,
     update_keyboard_state,
 };
+use super::selected_text_runtime::SelectionCaptureIntent;
 use crate::completion::CompletionCommand;
 use crate::correction::{CorrectionDecision, ReplacementText};
 use crate::input::{Boundary, CompletedToken, InputEvent, PhysicalKey};
 use crate::persistence::UndoHotkey;
 use crate::replacement::{ReplacementEngine, UndoOutcome};
+
+#[test]
+fn shift_navigation_is_explicit_selection_intent_but_plain_navigation_is_not() {
+    assert_eq!(
+        selection_capture_intent_for_navigation(VK_LEFT as u32, true),
+        Some(SelectionCaptureIntent::UserSelection)
+    );
+    assert_eq!(
+        selection_capture_intent_for_navigation(VK_RIGHT as u32, false),
+        Some(SelectionCaptureIntent::Unknown)
+    );
+    assert_eq!(
+        selection_capture_intent_for_navigation(b'A' as u32, true),
+        None
+    );
+}
 
 fn action(
     source: &str,
@@ -38,15 +62,188 @@ fn action(
 
 #[test]
 fn mouse_clicks_invalidate_tracked_text_state() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
-    };
-
     assert!(mouse_message_invalidates_tracking(WM_LBUTTONDOWN));
     assert!(mouse_message_invalidates_tracking(WM_RBUTTONDOWN));
     assert!(mouse_message_invalidates_tracking(WM_MBUTTONDOWN));
     assert!(mouse_message_invalidates_tracking(WM_XBUTTONDOWN));
     assert!(!mouse_message_invalidates_tracking(WM_MOUSEMOVE));
+    assert!(!mouse_message_invalidates_tracking(WM_LBUTTONUP));
+}
+
+#[test]
+fn mouse_drag_records_selection_intent_after_release() {
+    let mut tracker = MouseSelectionTracker::default();
+    assert_eq!(
+        tracker.observe(WM_LBUTTONDOWN, 10, 10),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe(WM_MOUSEMOVE, 12, 12),
+        MouseSelectionEffect::None
+    );
+    assert_eq!(
+        tracker.observe(WM_MOUSEMOVE, 16, 10),
+        MouseSelectionEffect::None
+    );
+    assert_eq!(
+        tracker.observe(WM_LBUTTONUP, 16, 10),
+        MouseSelectionEffect::UserSelectionIntent
+    );
+}
+
+#[test]
+fn mouse_click_without_drag_does_not_create_selection_intent() {
+    let mut tracker = MouseSelectionTracker::default();
+    assert_eq!(
+        tracker.observe(WM_LBUTTONDOWN, 10, 10),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe(WM_LBUTTONUP, 10, 10),
+        MouseSelectionEffect::None
+    );
+}
+
+#[test]
+fn mouse_double_click_records_selection_intent_after_second_release() {
+    let mut tracker = MouseSelectionTracker::default();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        tracker.observe_at(WM_LBUTTONDOWN, 10, 10, start),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONUP,
+            10,
+            10,
+            start + std::time::Duration::from_millis(20)
+        ),
+        MouseSelectionEffect::None
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONDOWN,
+            11,
+            10,
+            start + std::time::Duration::from_millis(120)
+        ),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONUP,
+            11,
+            10,
+            start + std::time::Duration::from_millis(150)
+        ),
+        MouseSelectionEffect::UserSelectionIntent
+    );
+}
+
+#[test]
+fn spaced_mouse_clicks_do_not_create_selection_intent() {
+    let mut tracker = MouseSelectionTracker::default();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        tracker.observe_at(WM_LBUTTONDOWN, 10, 10, start),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONUP,
+            10,
+            10,
+            start + std::time::Duration::from_millis(20)
+        ),
+        MouseSelectionEffect::None
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONDOWN,
+            30,
+            30,
+            start + std::time::Duration::from_millis(120)
+        ),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONUP,
+            30,
+            30,
+            start + std::time::Duration::from_millis(150)
+        ),
+        MouseSelectionEffect::None
+    );
+}
+
+#[test]
+fn mouse_drag_release_does_not_seed_a_later_double_click() {
+    let mut tracker = MouseSelectionTracker::default();
+    let start = std::time::Instant::now();
+    assert_eq!(
+        tracker.observe_at(WM_LBUTTONDOWN, 10, 10, start),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_MOUSEMOVE,
+            18,
+            10,
+            start + std::time::Duration::from_millis(20)
+        ),
+        MouseSelectionEffect::None
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONUP,
+            18,
+            10,
+            start + std::time::Duration::from_millis(40)
+        ),
+        MouseSelectionEffect::UserSelectionIntent
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONDOWN,
+            18,
+            10,
+            start + std::time::Duration::from_millis(120)
+        ),
+        MouseSelectionEffect::InvalidateOnly
+    );
+    assert_eq!(
+        tracker.observe_at(
+            WM_LBUTTONUP,
+            18,
+            10,
+            start + std::time::Duration::from_millis(150)
+        ),
+        MouseSelectionEffect::None
+    );
+}
+
+#[test]
+fn ctrl_shift_copy_chord_keeps_modifier_order_balanced() {
+    let inputs = build_ctrl_shift_chord_inputs(b'C' as u16);
+    let keys = inputs
+        .iter()
+        .map(|input| unsafe { input.Anonymous.ki })
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 6);
+    assert_eq!(keys[0].wVk, VK_LCONTROL);
+    assert_eq!(keys[1].wVk, VK_LSHIFT);
+    assert_eq!(keys[2].wVk, b'C' as u16);
+    assert_eq!(keys[3].wVk, b'C' as u16);
+    assert_eq!(keys[4].wVk, VK_LSHIFT);
+    assert_eq!(keys[5].wVk, VK_LCONTROL);
+    assert_eq!(keys[0].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_eq!(keys[1].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_eq!(keys[2].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_ne!(keys[3].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_ne!(keys[4].dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_ne!(keys[5].dwFlags & KEYEVENTF_KEYUP, 0);
 }
 
 #[test]
@@ -112,6 +309,23 @@ fn pause_with_selection_deletes_that_user_word_instead_of_undoing() {
 }
 
 #[test]
+fn clipboard_manager_hotkey_mapping_uses_ctrl_shift_numpad_plus_minus() {
+    let mut state = [0u8; 256];
+    state[VK_CONTROL as usize] = 0x80;
+    state[VK_SHIFT as usize] = 0x80;
+    assert_eq!(
+        clipboard_hotkey_command(VK_SUBTRACT as u32, &state),
+        Some(ClipboardCommand::OpenCurrent)
+    );
+    assert_eq!(
+        clipboard_hotkey_command(VK_ADD as u32, &state),
+        Some(ClipboardCommand::OpenPinned)
+    );
+    assert_eq!(clipboard_hotkey_command(VK_RIGHT as u32, &state), None);
+    state[VK_MENU as usize] = 0x80;
+    assert_eq!(clipboard_hotkey_command(VK_ADD as u32, &state), None);
+}
+#[test]
 fn completion_hotkeys_require_exact_default_modifier_contract() {
     let mut state = [0u8; 256];
     assert_eq!(
@@ -126,10 +340,7 @@ fn completion_hotkeys_require_exact_default_modifier_contract() {
         completion_hotkey_command(VK_DOWN as u32, &state),
         Some(CompletionCommand::Next)
     );
-    assert_eq!(
-        completion_hotkey_command(VK_RETURN as u32, &state),
-        Some(CompletionCommand::Accept)
-    );
+    assert_eq!(completion_hotkey_command(VK_RETURN as u32, &state), None);
     assert_eq!(
         completion_hotkey_command(VK_TAB as u32, &state),
         Some(CompletionCommand::Accept)
@@ -228,42 +439,60 @@ fn double_shift_triggers_only_after_two_plain_taps_and_on_second_release() {
 }
 
 #[test]
-fn ctrl_shift_selection_chord_has_balanced_modifier_order() {
-    let inputs = build_ctrl_shift_chord_inputs(VK_RIGHT);
-    assert_eq!(inputs.len(), 6);
+fn backward_chunk_selection_has_balanced_modifier_order() {
+    let inputs = build_backward_selection_inputs(4);
     let keys = inputs
         .iter()
         .map(|input| unsafe { input.Anonymous.ki })
         .collect::<Vec<_>>();
-    assert_eq!(keys[0].wVk, VK_CONTROL);
-    assert_eq!(keys[1].wVk, VK_SHIFT);
-    assert_eq!(keys[2].wVk, VK_RIGHT);
-    assert_eq!(keys[3].wVk, VK_RIGHT);
-    assert_eq!(keys[4].wVk, VK_SHIFT);
-    assert_eq!(keys[5].wVk, VK_CONTROL);
+    assert_eq!(keys.len(), 10);
+    assert_eq!(keys[0].wVk, VK_LSHIFT);
     assert_eq!(keys[0].dwFlags & KEYEVENTF_KEYUP, 0);
-    assert_eq!(keys[1].dwFlags & KEYEVENTF_KEYUP, 0);
-    assert_ne!(keys[3].dwFlags & KEYEVENTF_KEYUP, 0);
-    assert_ne!(keys[4].dwFlags & KEYEVENTF_KEYUP, 0);
-    assert_ne!(keys[5].dwFlags & KEYEVENTF_KEYUP, 0);
+    for pair in keys[1..9].chunks_exact(2) {
+        assert_eq!(pair[0].wVk, VK_LEFT);
+        assert_eq!(pair[1].wVk, VK_LEFT);
+        assert_ne!(pair[0].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+        assert_ne!(pair[1].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+        assert_eq!(pair[0].dwFlags & KEYEVENTF_KEYUP, 0);
+        assert_ne!(pair[1].dwFlags & KEYEVENTF_KEYUP, 0);
+    }
+    assert_eq!(keys[9].wVk, VK_LSHIFT);
+    assert_ne!(keys[9].dwFlags & KEYEVENTF_KEYUP, 0);
 }
 
 #[test]
-fn previous_word_reselection_normalizes_to_the_captured_word_before_delete() {
-    let inputs = build_previous_word_selection_inputs();
+fn previous_caret_range_replacement_moves_left_selects_and_restores_trailing_space() {
+    let inputs = build_previous_caret_range_replacement_inputs(4, 1, "для.");
     let keys = inputs
         .iter()
         .map(|input| unsafe { input.Anonymous.ki })
         .collect::<Vec<_>>();
 
-    assert_eq!(keys.len(), 12);
     assert_eq!(keys[0].wVk, VK_LEFT);
     assert_eq!(keys[1].wVk, VK_LEFT);
-    assert_eq!(keys[2].wVk, VK_CONTROL);
-    assert_eq!(keys[3].wVk, VK_RIGHT);
-    assert_eq!(keys[6].wVk, VK_CONTROL);
-    assert_eq!(keys[7].wVk, VK_SHIFT);
-    assert_eq!(keys[8].wVk, VK_LEFT);
+    assert_ne!(keys[0].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    assert_ne!(keys[1].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    assert_eq!(keys[2].wVk, VK_LSHIFT);
+    for pair in keys[3..11].chunks_exact(2) {
+        assert_eq!(pair[0].wVk, VK_LEFT);
+        assert_eq!(pair[1].wVk, VK_LEFT);
+        assert_ne!(pair[0].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+        assert_ne!(pair[1].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    }
+    assert_eq!(keys[11].wVk, VK_LSHIFT);
+    assert_eq!(keys[12].wVk, VK_DELETE);
+    assert_eq!(keys[13].wVk, VK_DELETE);
+    assert_ne!(keys[12].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    assert_ne!(keys[13].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    assert!(
+        keys[14..22]
+            .iter()
+            .all(|key| key.wVk == 0 && key.dwFlags & KEYEVENTF_UNICODE != 0)
+    );
+    assert_eq!(keys[22].wVk, VK_RIGHT);
+    assert_eq!(keys[23].wVk, VK_RIGHT);
+    assert_ne!(keys[22].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    assert_ne!(keys[23].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
 }
 
 #[test]
@@ -271,6 +500,25 @@ fn completion_suffix_uses_only_unicode_inputs() {
     let inputs = build_completion_suffix_inputs("лать");
     assert_eq!(inputs.len(), "лать".encode_utf16().count() * 2);
     assert!(inputs.iter().all(|input| {
+        let key = unsafe { input.Anonymous.ki };
+        key.wVk == 0 && key.dwFlags & KEYEVENTF_UNICODE != 0
+    }));
+}
+
+#[test]
+fn tracked_layout_replacement_reuses_backspace_then_unicode_effect_path() {
+    let inputs = build_tracked_text_replacement_inputs(4, "твою");
+    assert_eq!(inputs.len(), 8 + "твою".encode_utf16().count() * 2);
+
+    for pair in inputs[..8].chunks_exact(2) {
+        let down = unsafe { pair[0].Anonymous.ki };
+        let up = unsafe { pair[1].Anonymous.ki };
+        assert_eq!(down.wVk, VK_BACK);
+        assert_eq!(down.dwFlags & KEYEVENTF_KEYUP, 0);
+        assert_eq!(up.wVk, VK_BACK);
+        assert_ne!(up.dwFlags & KEYEVENTF_KEYUP, 0);
+    }
+    assert!(inputs[8..].iter().all(|input| {
         let key = unsafe { input.Anonymous.ki };
         key.wVk == 0 && key.dwFlags & KEYEVENTF_UNICODE != 0
     }));
@@ -417,17 +665,19 @@ fn builds_backspace_text_and_boundary_input_sequence() {
 }
 
 #[test]
-fn ctrl_chord_has_explicit_press_and_release_order() {
-    let inputs = build_ctrl_chord_inputs(b'C' as u16);
+fn ctrl_insert_copy_chord_has_physical_modifier_and_extended_key_identity() {
+    let inputs = build_ctrl_chord_inputs(VK_INSERT);
     assert_eq!(inputs.len(), 4);
     let keys: Vec<_> = inputs
         .iter()
         .map(|input| unsafe { input.Anonymous.ki })
         .collect();
-    assert_eq!(keys[0].wVk, VK_CONTROL);
-    assert_eq!(keys[1].wVk, b'C' as u16);
-    assert_eq!(keys[2].wVk, b'C' as u16);
-    assert_eq!(keys[3].wVk, VK_CONTROL);
+    assert_eq!(keys[0].wVk, VK_LCONTROL);
+    assert_eq!(keys[1].wVk, VK_INSERT);
+    assert_ne!(keys[1].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    assert_eq!(keys[2].wVk, VK_INSERT);
+    assert_ne!(keys[2].dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    assert_eq!(keys[3].wVk, VK_LCONTROL);
     assert_eq!(keys[0].dwFlags & KEYEVENTF_KEYUP, 0);
     assert_eq!(keys[1].dwFlags & KEYEVENTF_KEYUP, 0);
     assert_ne!(keys[2].dwFlags & KEYEVENTF_KEYUP, 0);

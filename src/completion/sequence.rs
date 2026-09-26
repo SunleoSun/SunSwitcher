@@ -90,14 +90,39 @@ impl SequenceCompletion {
     }
 }
 
+#[derive(Debug, Clone)]
+struct IndexedSequence {
+    tokens: Vec<String>,
+    normalized_tokens: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SequenceHistory {
     entries: Vec<SequenceCandidate>,
+    indexed: Vec<IndexedSequence>,
 }
 
 impl SequenceHistory {
     pub fn new(entries: Vec<SequenceCandidate>) -> Self {
-        Self { entries }
+        let indexed = entries
+            .iter()
+            .map(|entry| {
+                let tokens = entry
+                    .text
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let normalized_tokens = tokens
+                    .iter()
+                    .map(|token| normalize_word(token))
+                    .collect::<Vec<_>>();
+                IndexedSequence {
+                    tokens,
+                    normalized_tokens,
+                }
+            })
+            .collect();
+        Self { entries, indexed }
     }
 
     pub fn entries(&self) -> &[SequenceCandidate] {
@@ -135,12 +160,9 @@ impl SequenceHistory {
         }
 
         let mut completions = Vec::new();
-        for entry in &self.entries {
-            let sequence_tokens: Vec<_> = entry.text.split_whitespace().collect();
-            let normalized_sequence: Vec<_> = sequence_tokens
-                .iter()
-                .map(|token| normalize_word(token))
-                .collect();
+        for (entry, indexed) in self.entries.iter().zip(&self.indexed) {
+            let sequence_tokens = &indexed.tokens;
+            let normalized_sequence = &indexed.normalized_tokens;
             if normalized_sequence.is_empty() {
                 continue;
             }
@@ -149,28 +171,41 @@ impl SequenceHistory {
                 .len()
                 .min(MAX_CONTEXT_WORDS)
                 .min(normalized_sequence.len().saturating_sub(1));
-            let matched_context_words = if max_specificity == 0 {
-                0
-            } else {
-                (1..=max_specificity)
-                    .rev()
-                    .find(|specificity| {
-                        let context_start = normalized_context.len() - specificity;
-                        normalized_context[context_start..] == normalized_sequence[..*specificity]
-                    })
-                    .unwrap_or(0)
-            };
+            let valid_specificities = (0..=max_specificity)
+                .rev()
+                .filter(|specificity| {
+                    if *specificity == 0 {
+                        return true;
+                    }
+                    let context_start = normalized_context.len() - specificity;
+                    normalized_context[context_start..] == normalized_sequence[..*specificity]
+                })
+                .filter(|specificity| {
+                    normalized_sequence
+                        .get(*specificity)
+                        .is_some_and(|next_word| next_word.starts_with(&normalized_prefix))
+                })
+                .collect::<Vec<_>>();
 
+            // Prefix-driven ranking is the single canonical rule. A visible partial word may
+            // use a less-specific repeated context to keep a multi-word continuation visible;
+            // without a prefix, ordinary context specificity wins.
+            let matched_context_words = if normalized_prefix.is_empty() {
+                valid_specificities.first().copied()
+            } else {
+                valid_specificities
+                    .iter()
+                    .copied()
+                    .find(|specificity| sequence_tokens.len().saturating_sub(*specificity) >= 2)
+                    .or_else(|| valid_specificities.first().copied())
+            };
+            let Some(matched_context_words) = matched_context_words else {
+                continue;
+            };
             if normalized_prefix.is_empty()
                 && !normalized_context.is_empty()
                 && matched_context_words == 0
             {
-                continue;
-            }
-            let Some(next_word) = normalized_sequence.get(matched_context_words) else {
-                continue;
-            };
-            if !next_word.starts_with(&normalized_prefix) {
                 continue;
             }
 
@@ -282,6 +317,33 @@ mod tests {
         let completions = history.complete(&["hello"], DAY_MS, 10);
         assert_eq!(completions[0].text(), "world again");
         assert_eq!(completions[1].text(), "world");
+    }
+
+    #[test]
+    fn repeated_prefix_keeps_a_multi_word_continuation_when_context_also_matches() {
+        let history = SequenceHistory::new(vec![
+            SequenceCandidate::try_new("AA11 AA33", 1, DAY_MS).unwrap(),
+            SequenceCandidate::try_new("AA33 AA33", 3, DAY_MS).unwrap(),
+            SequenceCandidate::try_new("AA33 AA33 AA33", 2, DAY_MS).unwrap(),
+        ]);
+
+        let completions = history.complete_for_prefix(&["AA33", "AA33"], "AA3", DAY_MS, 10);
+        assert_eq!(completions[0].text(), "AA33 AA33");
+    }
+
+    #[test]
+    fn one_lookup_rule_uses_the_visible_prefix_to_preserve_repeated_continuations() {
+        let history = SequenceHistory::new(vec![
+            SequenceCandidate::try_new("AA33 AA33 AA33", 3, DAY_MS).unwrap(),
+        ]);
+
+        let typed = history.complete_for_prefix(&["AA33", "AA33"], "AA3", DAY_MS, 10);
+        assert_eq!(typed[0].text(), "AA33 AA33");
+        assert_eq!(typed[0].matched_context_words(), 1);
+
+        let no_prefix = history.complete_for_prefix(&["AA33", "AA33"], "", DAY_MS, 10);
+        assert_eq!(no_prefix[0].text(), "AA33");
+        assert_eq!(no_prefix[0].matched_context_words(), 2);
     }
 
     #[test]

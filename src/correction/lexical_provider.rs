@@ -6,7 +6,7 @@ use crate::input::CompletedToken;
 use crate::language::{
     KeyboardLayoutMap, LanguageId, LanguagePack, TextCasePattern, normalize_word,
 };
-use crate::lexicon::{MAX_INDEX_DELETIONS, UserLexicon};
+use crate::lexicon::{MAX_INDEX_DELETIONS, UserLexicon, UserWord};
 
 use super::{Confidence, CorrectionCandidate, CorrectionCandidateProvider, ReplacementText};
 const REPEATED_DELETE_COST: f32 = 0.45;
@@ -82,24 +82,30 @@ impl LexicalCorrectionProvider {
 
     fn contains_normalized(&self, normalized: &str) -> bool {
         self.user_lexicon().contains_normalized(normalized)
-            || self
-                .languages()
-                .iter()
-                .any(|language| language.contains_normalized(normalized))
+            || self.contains_system_normalized(normalized)
     }
 
-    fn has_exact_cross_layout_interpretation(&self, token: &CompletedToken) -> bool {
-        self.languages().iter().any(|language| {
-            language.transforms().iter().any(|transform| {
-                let Some(transformed) =
-                    transform.transform_with_physical(token.text(), token.physical_keys())
-                else {
-                    return false;
-                };
-                let Some(view) = LiteralWordView::from_transformed(&transformed) else {
-                    return false;
-                };
-                language.contains_normalized(&normalize_word(&view.core))
+    fn contains_system_normalized(&self, normalized: &str) -> bool {
+        self.languages()
+            .iter()
+            .any(|language| language.contains_normalized(normalized))
+    }
+
+    fn exact_cross_layout_interpretation(
+        &self,
+        token: &CompletedToken,
+    ) -> Option<CrossLayoutInterpretation> {
+        self.languages().iter().find_map(|language| {
+            language.transforms().iter().find_map(|transform| {
+                let transformed =
+                    transform.transform_with_physical(token.text(), token.physical_keys())?;
+                let view = LiteralWordView::from_transformed(&transformed)?;
+                let normalized_core = normalize_word(&view.core);
+                language.exact_entry(&normalized_core)?;
+                Some(CrossLayoutInterpretation {
+                    normalized_core,
+                    target_language: language.id().clone(),
+                })
             })
         })
     }
@@ -124,17 +130,40 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
             return Vec::new();
         }
 
+        let exact_user_entry = self.user_lexicon().exact(&normalized);
+        let exact_user_word = exact_user_entry.is_some();
+        let exact_system_word = self.contains_system_normalized(&normalized);
+        let exact_cross_layout = self.exact_cross_layout_interpretation(token);
+        let has_exact_cross_layout = exact_cross_layout.is_some();
+        let learned_function_word_alias = exact_user_entry.is_some_and(|entry| {
+            learned_one_character_alias_can_yield_function_word(
+                &normalized,
+                exact_cross_layout.as_ref(),
+                entry,
+                self.user_lexicon(),
+            )
+        });
+        let single_character_layout_ambiguity = normalized.chars().count() == 1
+            && has_exact_cross_layout
+            && ((!exact_user_word && exact_system_word) || learned_function_word_alias);
+
         let literal_view = LiteralWordView::from_token(token);
         let literal_core_is_valid = literal_view
             .as_ref()
             .is_some_and(|view| self.contains_normalized(&normalize_word(&view.core)));
-        if self.contains_normalized(&normalized)
-            || (literal_core_is_valid && !self.has_exact_cross_layout_interpretation(token))
+        if (exact_user_word && !learned_function_word_alias)
+            || (exact_system_word && !single_character_layout_ambiguity)
+            || (literal_core_is_valid && !has_exact_cross_layout)
         {
-            // A literal word that is already valid in any configured language wins over
-            // speculative cross-layout interpretation. Deferred punctuation such as "hello,"
-            // is therefore preserved unless the complete physical token has an exact
-            // cross-layout dictionary interpretation of its own.
+            // Exact learned words remain authoritative, except for a one-character learned
+            // alias whose opposite-layout interpretation is a short Russian function word
+            // the user actually uses more often (for example learned `b` should still yield
+            // `и` when `и` is the stronger user word). A one-character system spelling may
+            // also be the physical spelling of an exact word in another enabled layout
+            // (for example `z` -> `я`); unlike longer bilingual words there is not enough
+            // lexical context to treat that system alias as decisive. Literal punctuation on
+            // an otherwise valid word remains protected unless the complete physical token
+            // has an exact cross-layout interpretation.
             return Vec::new();
         }
 
@@ -241,6 +270,12 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
 }
 
 #[derive(Debug, Clone)]
+struct CrossLayoutInterpretation {
+    normalized_core: String,
+    target_language: LanguageId,
+}
+
+#[derive(Debug, Clone)]
 struct LiteralWordView {
     prefix: String,
     core: String,
@@ -294,6 +329,38 @@ fn is_deferred_literal_punctuation(
     physical_key: crate::input::PhysicalKey,
 ) -> bool {
     physical_key.is_layout_ambiguous() && !character.is_alphanumeric()
+}
+
+fn learned_one_character_alias_can_yield_function_word(
+    normalized_observed: &str,
+    interpretation: Option<&CrossLayoutInterpretation>,
+    learned: &UserWord,
+    user_lexicon: &UserLexicon,
+) -> bool {
+    if normalized_observed.chars().count() != 1 {
+        return false;
+    }
+    let Some(interpretation) = interpretation else {
+        return false;
+    };
+    if !is_short_function_word(
+        &interpretation.target_language,
+        &interpretation.normalized_core,
+    ) {
+        return false;
+    }
+    let target_use_count = user_lexicon
+        .exact(&interpretation.normalized_core)
+        .map(UserWord::use_count)
+        .unwrap_or(0);
+    target_use_count > learned.use_count()
+}
+
+fn is_short_function_word(language: &LanguageId, normalized_word: &str) -> bool {
+    matches!(
+        (language.as_str(), normalized_word),
+        ("ru", "а" | "в" | "и" | "к" | "о" | "с" | "у")
+    )
 }
 
 #[derive(Debug, Clone)]

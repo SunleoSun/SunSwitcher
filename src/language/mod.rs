@@ -77,50 +77,49 @@ pub fn switch_keyboard_layout_text(
     languages: &[LanguagePack],
     text: &str,
 ) -> Option<KeyboardLayoutSwitch> {
-    let mut transformed_text = String::with_capacity(text.len());
+    struct CharacterTransform {
+        original: char,
+        candidates: Vec<(String, LanguageId)>,
+    }
+
+    let mut character_transforms = Vec::with_capacity(text.chars().count());
     let mut target_votes: Vec<(LanguageId, usize)> = Vec::new();
-    let mut changed = false;
 
     for character in text.chars() {
         let source = character.to_string();
-        let mut mapped: Option<(String, LanguageId)> = None;
+        let mut candidates = Vec::new();
         for language in languages {
             for transform in language.transforms() {
                 let Some(transformed) = transform.transform_text(&source) else {
                     continue;
                 };
                 let candidate = (transformed, language.id().clone());
-                match mapped.as_ref() {
-                    None => mapped = Some(candidate),
-                    Some(existing) if existing == &candidate => {}
-                    Some(_) => return None,
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
                 }
             }
         }
 
-        let Some((transformed, target_language)) = mapped else {
-            if character.is_alphabetic() {
-                return None;
-            }
-            transformed_text.push(character);
-            continue;
-        };
-
-        changed = true;
-        transformed_text.push_str(&transformed);
-        if let Some((_, votes)) = target_votes
-            .iter_mut()
-            .find(|(language, _)| language == &target_language)
-        {
-            *votes += 1;
-        } else {
-            target_votes.push((target_language, 1));
+        if candidates.is_empty() && character.is_alphabetic() {
+            return None;
         }
+        if candidates.len() == 1 {
+            let target_language = &candidates[0].1;
+            if let Some((_, votes)) = target_votes
+                .iter_mut()
+                .find(|(language, _)| language == target_language)
+            {
+                *votes += 1;
+            } else {
+                target_votes.push((target_language.clone(), 1));
+            }
+        }
+        character_transforms.push(CharacterTransform {
+            original: character,
+            candidates,
+        });
     }
 
-    if !changed {
-        return None;
-    }
     let best_votes = target_votes.iter().map(|(_, votes)| *votes).max()?;
     let mut winners = target_votes
         .into_iter()
@@ -129,7 +128,29 @@ pub fn switch_keyboard_layout_text(
     if winners.next().is_some() {
         return None;
     }
-    Some(KeyboardLayoutSwitch {
+
+    let mut transformed_text = String::with_capacity(text.len());
+    let mut changed = false;
+    for character in character_transforms {
+        let transformed = match character.candidates.as_slice() {
+            [] => character.original.to_string(),
+            [(transformed, _)] => transformed.clone(),
+            candidates => {
+                let mut matching = candidates
+                    .iter()
+                    .filter(|(_, language)| language == &target_language);
+                let (transformed, _) = matching.next()?;
+                if matching.next().is_some() {
+                    return None;
+                }
+                transformed.clone()
+            }
+        };
+        changed |= transformed != character.original.to_string();
+        transformed_text.push_str(&transformed);
+    }
+
+    changed.then_some(KeyboardLayoutSwitch {
         text: transformed_text,
         target_language,
     })
@@ -184,6 +205,30 @@ mod tests {
             .expect("latin physical spelling should map to Russian");
         assert_eq!(to_russian.text(), "привет");
         assert_eq!(to_russian.target_language().as_str(), "ru");
+
+        let punctuation_to_russian =
+            switch_keyboard_layout_text(&[english.clone(), russian.clone()], "ndj.")
+                .expect("layout punctuation before whitespace belongs to the switched span");
+        assert_eq!(punctuation_to_russian.text(), "твою");
+        assert_eq!(punctuation_to_russian.target_language().as_str(), "ru");
+        assert_eq!(
+            switch_keyboard_layout_text(&[english.clone(), russian.clone()], "lkz/")
+                .unwrap()
+                .text(),
+            "для."
+        );
+        assert_eq!(
+            switch_keyboard_layout_text(&[english.clone(), russian.clone()], "ndj/")
+                .unwrap()
+                .text(),
+            "тво."
+        );
+        assert_eq!(
+            switch_keyboard_layout_text(&[english.clone(), russian.clone()], "ndj?")
+                .unwrap()
+                .text(),
+            "тво,"
+        );
 
         let to_english = switch_keyboard_layout_text(&[english, russian], "руддщ")
             .expect("Russian physical spelling should map to English");

@@ -1,5 +1,5 @@
 ---
-description: Maps canonical built-in RU/EN FST dictionary ownership, full-vocabulary exact/completion lookup, bounded correction subsets, custom-language fallback, source regeneration, and validation; read before changing system dictionaries, grammatical-form handling, or lexical candidate generation.
+description: Maps canonical built-in RU/EN FST dictionary ownership, full-vocabulary exact/completion lookup, bounded correction subsets, source regeneration, and validation; read before changing system dictionaries, grammatical-form handling, or lexical candidate generation.
 ---
 
 # Language Dictionaries
@@ -37,13 +37,13 @@ The producer lowercases, keeps alphabetic forms, deduplicates, sorts, and writes
 
 ## Persistence and layout ownership
 
-SQLite `languages` remains the enablement/configuration authority. Built-in `ru`/`en` vocabulary content does not live in SQLite after schema v4; `Database::load_enabled_language_packs` resolves enabled RU/EN IDs to the built-in assets. `dictionary_words` remains the fallback vocabulary store for enabled custom/non-built-in language IDs, preserving the existing extensibility contract without creating two RU/EN authorities.
+SQLite `languages` remains the enablement/configuration authority for built-in language IDs. Built-in `ru`/`en` vocabulary content lives only in immutable FST assets; schema v5 drops the obsolete `dictionary_words` table and `Database::load_enabled_language_packs` fails closed on enabled non-built-in language IDs instead of rebuilding mutable custom dictionaries.
 
 Keyboard-layout maps remain in `src/language/russian.rs` and `src/language/english.rs`; they are not dictionary data. `KeyboardLayoutMap::transform_text`, mixed-layout Double Shift behavior, and `TextCasePattern` remain independent typed behavior owners.
 
 ## Validation
 
-High-value checks cover representative Russian inflections and `ё`, English inflections, separation of full exact vocabulary from the correction subset, correction-sidecar/full-asset consistency, schema-v4 removal of legacy RU/EN rows, custom-language SQLite fallback, lexical correction behavior, completion behavior, and the normal full Rust validation suite.
+High-value checks cover representative Russian inflections and `ё`, English inflections, separation of full exact vocabulary from the correction subset, correction-sidecar/full-asset consistency, schema-v5 removal of obsolete `dictionary_words`, unknown enabled-language fail-closed behavior, lexical correction behavior, completion behavior, and the normal full Rust validation suite.
 
 ## Related memory
 

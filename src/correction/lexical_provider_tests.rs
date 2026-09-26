@@ -106,6 +106,79 @@ fn exact_wrong_layout_candidate_uses_the_full_builtin_dictionary() {
 }
 
 #[test]
+fn one_letter_system_aliases_can_resolve_exact_cross_layout_words() {
+    let provider = provider();
+    for (observed, expected) in [("z", "я"), ("b", "и")] {
+        let token = completed_physical_token(observed);
+        let candidates = provider.candidates(&token);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.replacement().as_str() == expected),
+            "{observed:?} -> {expected:?}, candidates={candidates:?}"
+        );
+    }
+}
+
+#[test]
+fn learned_one_letter_user_word_wins_over_cross_layout_interpretation() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("z", 100).unwrap();
+    let provider = LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap();
+    let token = completed_physical_token("z");
+
+    assert!(provider.candidates(&token).is_empty());
+}
+
+#[test]
+fn stronger_learned_short_function_word_overrides_one_letter_alias() {
+    let database = Database::open_in_memory().unwrap();
+    for used_at_ms in 0..20 {
+        database.record_user_word("b", used_at_ms).unwrap();
+    }
+    for used_at_ms in 100..284 {
+        database.record_user_word("и", used_at_ms).unwrap();
+    }
+    let provider = LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap();
+    let token = completed_physical_token("b");
+    let candidates = provider.candidates(&token);
+
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.replacement().as_str() == "и"),
+        "learned b should still resolve to stronger short function word, candidates={candidates:?}"
+    );
+}
+
+#[test]
+fn stronger_learned_source_letter_still_blocks_function_word_alias() {
+    let database = Database::open_in_memory().unwrap();
+    for used_at_ms in 0..200 {
+        database.record_user_word("b", used_at_ms).unwrap();
+    }
+    for used_at_ms in 300..320 {
+        database.record_user_word("и", used_at_ms).unwrap();
+    }
+    let provider = LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap();
+    let token = completed_physical_token("b");
+
+    assert!(provider.candidates(&token).is_empty());
+}
+
+#[test]
 fn provider_preserves_simple_case_pattern() {
     let provider = provider();
     let title = CompletedToken::new("Lkz", Boundary::Character(' '));
@@ -137,6 +210,25 @@ fn punctuation_only_physical_token_has_no_canonical_learning_word() {
     let provider = provider();
     let token = completed_physical_token(",");
     assert_eq!(provider.canonical_learning_term(&token), "");
+}
+
+#[test]
+fn exact_cross_layout_user_word_preserves_unmapped_digits() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("AA33", 100).unwrap();
+    let provider = LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap();
+    let token = completed_physical_token("ФФ33");
+
+    assert!(
+        provider
+            .candidates(&token)
+            .iter()
+            .any(|candidate| candidate.replacement().as_str() == "AA33")
+    );
 }
 
 #[test]

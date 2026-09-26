@@ -16,17 +16,20 @@ use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT
 
 use super::caret_locator::CaretLocator;
 use super::keyboard_runtime::{
-    inject_ctrl_chord, inject_ctrl_shift_chord, inject_key_press, inject_previous_word_selection,
-    inject_selected_text,
+    inject_backward_selection, inject_ctrl_chord, inject_ctrl_shift_chord,
+    inject_current_caret_forward_replacement, inject_current_caret_forward_selection,
+    inject_key_press, inject_key_presses, inject_previous_caret_range_replacement,
+    inject_selected_replacement, inject_selected_text,
 };
 use crate::replacement::{SelectedReplacementAction, SelectedText};
 
 const COPY_TIMEOUT: Duration = Duration::from_millis(700);
 const CLIPBOARD_OPEN_TIMEOUT: Duration = Duration::from_millis(300);
 const RETRY_INTERVAL: Duration = Duration::from_millis(5);
-const VK_C: u16 = b'C' as u16;
-const VK_LEFT_KEY: u16 = 0x25;
+const VK_C_KEY: u16 = b'C' as u16;
+const VK_INSERT_KEY: u16 = 0x2D;
 const VK_RIGHT_KEY: u16 = 0x27;
+const PREVIOUS_TEXT_LOOKBACK: usize = 64;
 const PREFERRED_DROP_EFFECT_NAME: &str = "Preferred DropEffect";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,7 @@ pub enum SelectedTextRuntimeError {
     ClipboardTextDecodeFailed,
     KeyboardInjection(super::RuntimeError),
     ActionDoesNotMatchSelection,
+    SelectionChangedDuringCapture,
 }
 
 impl From<super::RuntimeError> for SelectedTextRuntimeError {
@@ -49,20 +53,114 @@ impl From<super::RuntimeError> for SelectedTextRuntimeError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TrailingNonWhitespaceRange {
+    pub(super) leading_chars: usize,
+    pub(super) selected_chars: usize,
+    pub(super) trailing_chars: usize,
+}
+
+pub(super) fn trailing_non_whitespace_range(text: &str) -> Option<TrailingNonWhitespaceRange> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let last_non_whitespace = chars
+        .iter()
+        .rposition(|character| !character.is_whitespace())?;
+    let end = last_non_whitespace + 1;
+    let start = chars[..end]
+        .iter()
+        .rposition(|character| character.is_whitespace())
+        .map_or(0, |index| index + 1);
+    Some(TrailingNonWhitespaceRange {
+        leading_chars: start,
+        selected_chars: end - start,
+        trailing_chars: chars.len() - end,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn is_single_line_capture(text: &str) -> bool {
+    !text.contains(['\r', '\n'])
+}
+
+pub(super) fn caret_navigation_steps(text: &str) -> usize {
+    let mut chars = text.chars().peekable();
+    let mut steps = 0usize;
+    while let Some(character) = chars.next() {
+        if character == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+        }
+        steps = steps.saturating_add(1);
+    }
+    steps
+}
+
+pub(super) fn replace_copied_chunk_range(
+    text: &str,
+    range: TrailingNonWhitespaceRange,
+    replacement: &str,
+) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let start = range.leading_chars;
+    let end = range.leading_chars + range.selected_chars;
+    let prefix = chars[..start].iter().collect::<String>();
+    let suffix = chars[end..].iter().collect::<String>();
+    format!("{prefix}{replacement}{suffix}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum SelectionCaptureIntent {
+    #[default]
+    Unknown,
+    UserSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyShortcut {
+    CtrlInsert,
+    CtrlShiftC,
+    CtrlC,
+}
+
+impl CopyShortcut {
+    fn copy_to_clipboard(self) -> Result<(), SelectedTextRuntimeError> {
+        match self {
+            Self::CtrlInsert => inject_ctrl_chord(VK_INSERT_KEY)?,
+            Self::CtrlShiftC => inject_ctrl_shift_chord(VK_C_KEY)?,
+            Self::CtrlC => inject_ctrl_chord(VK_C_KEY)?,
+        }
+        Ok(())
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CtrlInsert => "Ctrl+Insert",
+            Self::CtrlShiftC => "Ctrl+Shift+C",
+            Self::CtrlC => "Ctrl+C",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedTextOrigin {
-    ExistingSelection,
-    PreviousWordSelection,
-    PreviousWordClipboard,
+    ExistingSelection {
+        retained_after_copy: bool,
+    },
+    PreviousCaretChunk {
+        range: TrailingNonWhitespaceRange,
+        retained_after_copy: bool,
+    },
 }
 
 pub struct SelectedTextSession {
     selected: SelectedText,
     origin: SelectedTextOrigin,
+    previous_caret_chunk: Option<String>,
 }
 
 impl SelectedTextSession {
     pub fn capture() -> Result<Option<Self>, SelectedTextRuntimeError> {
-        Self::capture_current(SelectedTextOrigin::ExistingSelection)
+        Self::capture_current(SelectedTextOrigin::ExistingSelection {
+            retained_after_copy: true,
+        })
     }
 
     pub fn capture_existing_selection() -> Option<Self> {
@@ -70,38 +168,251 @@ impl SelectedTextSession {
         let selected = SelectedText::try_new(text).ok()?;
         Some(Self {
             selected,
-            origin: SelectedTextOrigin::ExistingSelection,
+            origin: SelectedTextOrigin::ExistingSelection {
+                retained_after_copy: true,
+            },
+            previous_caret_chunk: None,
         })
     }
 
-    pub fn capture_previous_word() -> Result<Option<Self>, SelectedTextRuntimeError> {
-        inject_ctrl_shift_chord(VK_LEFT_KEY)?;
-        if let Some(mut session) = Self::capture_existing_selection() {
-            session.origin = SelectedTextOrigin::PreviousWordSelection;
-            return Ok(Some(session));
+    pub(super) fn capture_existing_selection_for_replacement(
+        intent: SelectionCaptureIntent,
+    ) -> Result<Option<Self>, SelectedTextRuntimeError> {
+        let ui_selection = CaretLocator::new().selected_text();
+        eprintln!(
+            "[double-shift] explicit-selection UIA before copy={:?} intent={intent:?}",
+            ui_selection
+        );
+
+        let origin = SelectedTextOrigin::ExistingSelection {
+            retained_after_copy: true,
+        };
+        if ui_selection.is_none() && intent != SelectionCaptureIntent::UserSelection {
+            eprintln!(
+                "[double-shift] explicit-selection skipped clipboard probe without UIA selection or user selection intent"
+            );
+            return Ok(None);
         }
-        match Self::capture_current(SelectedTextOrigin::PreviousWordClipboard) {
-            Ok(Some(session)) => Ok(Some(session)),
-            Ok(None) => {
+
+        let (mut session, shortcut) = if let Some(session) =
+            Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlInsert)?
+        {
+            (session, CopyShortcut::CtrlInsert)
+        } else if let Some(session) =
+            Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlShiftC)?
+        {
+            (session, CopyShortcut::CtrlShiftC)
+        } else if ui_selection.is_some() {
+            let Some(session) = Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlC)?
+            else {
+                eprintln!(
+                    "[double-shift] explicit-selection proven by UIA but no copy shortcut produced text"
+                );
+                return Ok(None);
+            };
+            (session, CopyShortcut::CtrlC)
+        } else {
+            eprintln!(
+                "[double-shift] explicit-selection intended but safe copy shortcuts produced no text"
+            );
+            return Ok(None);
+        };
+
+        if let Some(ui_selection) = ui_selection.as_deref()
+            && session.selected.as_str() != ui_selection
+        {
+            eprintln!(
+                "[double-shift] explicit-selection mismatch UIA={:?} clipboard={:?}",
+                ui_selection,
+                session.selected.as_str()
+            );
+            return Err(SelectedTextRuntimeError::SelectionChangedDuringCapture);
+        }
+
+        let ui_after_copy = CaretLocator::new().selected_text();
+        let retained_after_copy = if ui_after_copy
+            .as_deref()
+            .is_some_and(|current| current == session.selected.as_str())
+        {
+            true
+        } else if shortcut == CopyShortcut::CtrlInsert {
+            Self::selection_retained_after_safe_copy(session.selected.as_str())?
+        } else {
+            false
+        };
+        eprintln!(
+            "[double-shift] explicit-selection clipboard={:?} shortcut={} UIA after copy={:?} retained_after_copy={retained_after_copy}",
+            session.selected.as_str(),
+            shortcut.label(),
+            ui_after_copy
+        );
+        session.origin = SelectedTextOrigin::ExistingSelection {
+            retained_after_copy,
+        };
+        Ok(Some(session))
+    }
+
+    pub fn capture_previous_word() -> Result<Option<Self>, SelectedTextRuntimeError> {
+        eprintln!("[double-shift] previous-text probe: Shift+Left({PREVIOUS_TEXT_LOOKBACK})");
+        inject_backward_selection(PREVIOUS_TEXT_LOOKBACK)?;
+        let ui_after_selection = CaretLocator::new().selected_text();
+        eprintln!(
+            "[double-shift] previous-text UIA after backward selection={:?}; diagnostic only",
+            ui_after_selection
+        );
+
+        let origin = SelectedTextOrigin::PreviousCaretChunk {
+            range: TrailingNonWhitespaceRange {
+                leading_chars: 0,
+                selected_chars: 0,
+                trailing_chars: 0,
+            },
+            retained_after_copy: false,
+        };
+        let (mut session, copied, copied_caret_steps, retained_after_copy, source_label) =
+            if let Some(session) =
+                Self::capture_previous_chunk_from_uia_selection(origin, ui_after_selection)
+            {
+                let copied = session.selected.as_str().to_owned();
+                let copied_caret_steps = caret_navigation_steps(&copied);
+                (session, copied, copied_caret_steps, true, "UIA")
+            } else if let Some(session) =
+                Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlInsert)?
+            {
+                let copied = session.selected.as_str().to_owned();
+                let copied_caret_steps = caret_navigation_steps(&copied);
+                let retained_after_copy =
+                    Self::previous_chunk_retained_after_copy(CopyShortcut::CtrlInsert, &copied)?;
+                (
+                    session,
+                    copied,
+                    copied_caret_steps,
+                    retained_after_copy,
+                    CopyShortcut::CtrlInsert.label(),
+                )
+            } else if let Some(session) =
+                Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlShiftC)?
+            {
+                let copied = session.selected.as_str().to_owned();
+                let copied_caret_steps = caret_navigation_steps(&copied);
+                let retained_after_copy =
+                    Self::previous_chunk_retained_after_copy(CopyShortcut::CtrlShiftC, &copied)?;
+                (
+                    session,
+                    copied,
+                    copied_caret_steps,
+                    retained_after_copy,
+                    CopyShortcut::CtrlShiftC.label(),
+                )
+            } else {
+                eprintln!(
+                    "[double-shift] previous-text backward selection produced no copyable text; collapsing any synthetic selection to its right edge"
+                );
                 inject_key_press(VK_RIGHT_KEY)?;
-                Ok(None)
+                return Ok(None);
+            };
+
+        if !retained_after_copy {
+            inject_key_presses(VK_RIGHT_KEY, copied_caret_steps)?;
+        }
+        eprintln!(
+            "[double-shift] previous-text copied chunk={:?} chars={} caret_steps={} source={} retained_after_copy={} caret_restored={} restore_path={}",
+            copied,
+            copied.chars().count(),
+            copied_caret_steps,
+            source_label,
+            retained_after_copy,
+            !retained_after_copy,
+            if retained_after_copy {
+                "selection-retained"
+            } else {
+                "Right"
             }
-            Err(error) => {
-                let _ = inject_key_press(VK_RIGHT_KEY);
-                Err(error)
-            }
+        );
+
+        let Some(range) = trailing_non_whitespace_range(&copied) else {
+            eprintln!("[double-shift] previous-text copied chunk contains only whitespace");
+            return Ok(None);
+        };
+        let chars = copied.chars().collect::<Vec<_>>();
+        let end = range.leading_chars + range.selected_chars;
+        let target = chars[range.leading_chars..end].iter().collect::<String>();
+        eprintln!(
+            "[double-shift] previous-text range leading={} selected={} trailing={} target={:?}",
+            range.leading_chars, range.selected_chars, range.trailing_chars, target
+        );
+        let selected = SelectedText::try_new(target)
+            .map_err(|_| SelectedTextRuntimeError::SelectionChangedDuringCapture)?;
+
+        session.selected = selected;
+        session.previous_caret_chunk = Some(copied);
+        session.origin = SelectedTextOrigin::PreviousCaretChunk {
+            range,
+            retained_after_copy,
+        };
+        Ok(Some(session))
+    }
+
+    fn capture_previous_chunk_from_uia_selection(
+        origin: SelectedTextOrigin,
+        ui_after_selection: Option<String>,
+    ) -> Option<Self> {
+        let text = ui_after_selection?;
+        let selected = SelectedText::try_new(text).ok()?;
+        eprintln!(
+            "[double-shift] previous-text using UIA selected chunk={:?} chars={}",
+            selected.as_str(),
+            selected.as_str().chars().count()
+        );
+        Some(Self {
+            selected,
+            origin,
+            previous_caret_chunk: None,
+        })
+    }
+
+    fn previous_chunk_retained_after_copy(
+        shortcut: CopyShortcut,
+        copied: &str,
+    ) -> Result<bool, SelectedTextRuntimeError> {
+        let ui_after_copy = CaretLocator::new().selected_text();
+        if ui_after_copy
+            .as_deref()
+            .is_some_and(|current| current == copied)
+        {
+            return Ok(true);
+        }
+        if shortcut == CopyShortcut::CtrlInsert {
+            Self::selection_retained_after_safe_copy(copied)
+        } else {
+            Ok(false)
         }
     }
 
     fn capture_current(
         origin: SelectedTextOrigin,
     ) -> Result<Option<Self>, SelectedTextRuntimeError> {
+        Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlInsert)
+    }
+
+    fn capture_current_with_shortcut(
+        origin: SelectedTextOrigin,
+        shortcut: CopyShortcut,
+    ) -> Result<Option<Self>, SelectedTextRuntimeError> {
         let mut snapshot = ClipboardSnapshot::capture()?;
         let _observation_guard = super::clipboard_listener::InternalClipboardMutationGuard::begin();
         let sequence_before_copy = unsafe { GetClipboardSequenceNumber() };
+        eprintln!(
+            "[double-shift] clipboard capture start origin={origin:?} sequence_before={sequence_before_copy} shortcut={}",
+            shortcut.label()
+        );
 
-        inject_ctrl_chord(VK_C)?;
+        shortcut.copy_to_clipboard()?;
         if !wait_for_clipboard_change(sequence_before_copy, COPY_TIMEOUT) {
+            eprintln!(
+                "[double-shift] clipboard capture timeout/no change origin={origin:?} shortcut={}",
+                shortcut.label()
+            );
             snapshot.restore()?;
             return Ok(None);
         }
@@ -110,22 +421,50 @@ impl SelectedTextSession {
         snapshot.restore()?;
 
         let Some(text) = copied_text? else {
+            eprintln!(
+                "[double-shift] clipboard changed but contained no Unicode text origin={origin:?} shortcut={}",
+                shortcut.label()
+            );
             return Ok(None);
         };
+        eprintln!(
+            "[double-shift] clipboard capture origin={origin:?} shortcut={} text={:?} chars={}",
+            shortcut.label(),
+            text,
+            text.chars().count()
+        );
         let Ok(selected) = SelectedText::try_new(text) else {
+            eprintln!("[double-shift] clipboard text rejected by SelectedText origin={origin:?}");
             return Ok(None);
-        };
-        let origin = if origin == SelectedTextOrigin::PreviousWordClipboard
-            && CaretLocator::new()
-                .selected_text()
-                .is_some_and(|current| current == selected.as_str())
-        {
-            SelectedTextOrigin::PreviousWordSelection
-        } else {
-            origin
         };
 
-        Ok(Some(Self { selected, origin }))
+        Ok(Some(Self {
+            selected,
+            origin,
+            previous_caret_chunk: None,
+        }))
+    }
+
+    fn selection_retained_after_safe_copy(
+        expected: &str,
+    ) -> Result<bool, SelectedTextRuntimeError> {
+        let probe = Self::capture_current_with_shortcut(
+            SelectedTextOrigin::ExistingSelection {
+                retained_after_copy: true,
+            },
+            CopyShortcut::CtrlInsert,
+        )?;
+        match probe {
+            Some(probe) if probe.selected.as_str() == expected => Ok(true),
+            Some(probe) => {
+                eprintln!(
+                    "[double-shift] retained-selection probe changed text expected={expected:?} actual={:?}",
+                    probe.selected.as_str()
+                );
+                Err(SelectedTextRuntimeError::SelectionChangedDuringCapture)
+            }
+            None => Ok(false),
+        }
     }
 
     pub fn selected_text(&self) -> &SelectedText {
@@ -149,29 +488,87 @@ impl SelectedTextSession {
             return Err(SelectedTextRuntimeError::ActionDoesNotMatchSelection);
         }
 
+        eprintln!(
+            "[double-shift] apply origin={:?} source={:?} replacement={:?}",
+            self.origin,
+            self.selected.as_str(),
+            action.replacement().as_str()
+        );
         match self.origin {
-            SelectedTextOrigin::ExistingSelection | SelectedTextOrigin::PreviousWordSelection => {
-                // The selected range is still active: delete it explicitly instead of depending on
-                // Unicode SendInput replacement semantics, which differ between controls.
-                inject_selected_text("")?;
+            SelectedTextOrigin::ExistingSelection {
+                retained_after_copy: true,
+            } => {
+                eprintln!("[double-shift] apply path=selection-still-active Delete+Unicode");
+                inject_selected_replacement(action.replacement().as_str())?;
             }
-            SelectedTextOrigin::PreviousWordClipboard => {
-                // Some terminal controls collapse the temporary Ctrl+Shift+Left selection while
-                // servicing Ctrl+C. Normalize from the original right-edge caret: step into the
-                // captured word, return to its right word-boundary, then select exactly that word.
-                // This avoids blind backspacing, which could consume the word before it if a
-                // selection happened to survive the copy.
-                inject_previous_word_selection()?;
-                inject_selected_text("")?;
+            SelectedTextOrigin::ExistingSelection {
+                retained_after_copy: false,
+            } => {
+                eprintln!(
+                    "[double-shift] apply path=selection-collapsed-at-start Shift+Right({})+Delete+Unicode",
+                    self.selected.as_str().chars().count()
+                );
+                inject_current_caret_forward_replacement(
+                    self.selected.as_str().chars().count(),
+                    action.replacement().as_str(),
+                )?;
+            }
+            SelectedTextOrigin::PreviousCaretChunk {
+                range,
+                retained_after_copy: true,
+            } => {
+                let copied = self
+                    .previous_caret_chunk
+                    .as_deref()
+                    .ok_or(SelectedTextRuntimeError::SelectionChangedDuringCapture)?;
+                let replacement =
+                    replace_copied_chunk_range(copied, range, action.replacement().as_str());
+                eprintln!(
+                    "[double-shift] apply path=retained-previous-caret-chunk ReplaceFullSelection chars={}",
+                    replacement.chars().count()
+                );
+                inject_selected_replacement(&replacement)?;
+            }
+            SelectedTextOrigin::PreviousCaretChunk {
+                range,
+                retained_after_copy: false,
+            } => {
+                eprintln!(
+                    "[double-shift] apply path=restored-caret Left({})+ShiftLeft({})+replace+Right({})",
+                    range.trailing_chars, range.selected_chars, range.trailing_chars
+                );
+                inject_previous_caret_range_replacement(
+                    range.selected_chars,
+                    range.trailing_chars,
+                    action.replacement().as_str(),
+                )?;
             }
         }
-        inject_selected_text(action.replacement().as_str())?;
         Ok(())
     }
 
     pub fn finish_without_replacement(self) -> Result<(), SelectedTextRuntimeError> {
-        if self.origin == SelectedTextOrigin::PreviousWordSelection {
-            inject_key_press(VK_RIGHT_KEY)?;
+        match self.origin {
+            SelectedTextOrigin::ExistingSelection {
+                retained_after_copy: true,
+            } => {}
+            SelectedTextOrigin::ExistingSelection {
+                retained_after_copy: false,
+            } => {
+                inject_current_caret_forward_selection(self.selected.as_str().chars().count())?;
+            }
+            SelectedTextOrigin::PreviousCaretChunk {
+                retained_after_copy: true,
+                ..
+            } => {
+                if let Some(copied) = self.previous_caret_chunk.as_deref() {
+                    inject_current_caret_forward_selection(caret_navigation_steps(copied))?;
+                }
+            }
+            SelectedTextOrigin::PreviousCaretChunk {
+                retained_after_copy: false,
+                ..
+            } => {}
         }
         Ok(())
     }

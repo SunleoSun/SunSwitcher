@@ -387,6 +387,7 @@ pub struct AdaptiveCompletionSession {
     completion_suppressions: CompletionSuppressionSnapshotStore,
     learning: LearningClient,
     session: CompletionSession,
+    pending_accepted_words: Vec<String>,
 }
 
 impl AdaptiveCompletionSession {
@@ -402,6 +403,7 @@ impl AdaptiveCompletionSession {
             completion_suppressions,
             learning,
             session: CompletionSession::default(),
+            pending_accepted_words: Vec::new(),
         }
     }
 
@@ -410,6 +412,7 @@ impl AdaptiveCompletionSession {
         event: InputEvent,
         observed_at_ms: i64,
     ) -> Result<(), AdaptiveRuntimeError> {
+        self.pending_accepted_words.clear();
         self.session.process_event(event);
         let provider = CompletionProvider::with_word_suppressions(
             self.lexical.load()?,
@@ -432,12 +435,29 @@ impl AdaptiveCompletionSession {
         &mut self,
         command: CompletionCommand,
     ) -> Result<CompletionCommandResult, AdaptiveRuntimeError> {
+        let accepted_words = self.selected_acceptance_words(command);
         let result = self.session.command(command);
+        if matches!(
+            result,
+            CompletionCommandResult::AcceptSuffix(_) | CompletionCommandResult::AcceptWord(_)
+        ) {
+            self.pending_accepted_words = accepted_words;
+        } else {
+            self.pending_accepted_words.clear();
+        }
         if let CompletionCommandResult::DeletePrediction(target) = &result {
             self.learning.delete_completion(target.clone())?;
             return Ok(CompletionCommandResult::Consumed);
         }
         Ok(result)
+    }
+
+    pub fn suffix_acceptance_outcome(
+        &mut self,
+        outcome: CompletionApplyOutcome,
+        observed_at_ms: i64,
+    ) -> Result<(), AdaptiveRuntimeError> {
+        self.learn_pending_acceptance(outcome, observed_at_ms)
     }
 
     pub fn word_acceptance_outcome(
@@ -446,6 +466,7 @@ impl AdaptiveCompletionSession {
         observed_at_ms: i64,
     ) -> Result<(), AdaptiveRuntimeError> {
         self.session.word_acceptance_outcome(outcome);
+        self.learn_pending_acceptance(outcome, observed_at_ms)?;
         if outcome != CompletionApplyOutcome::Applied {
             return Ok(());
         }
@@ -460,6 +481,46 @@ impl AdaptiveCompletionSession {
                 .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?,
         );
         self.session.refresh(&provider, observed_at_ms);
+        Ok(())
+    }
+
+    fn selected_acceptance_words(&self, command: CompletionCommand) -> Vec<String> {
+        let Some(suggestion) = self
+            .session
+            .suggestions()
+            .get(self.session.selected_index())
+        else {
+            return Vec::new();
+        };
+        match command {
+            CompletionCommand::Accept => suggestion
+                .text()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            CompletionCommand::AcceptNextWord => suggestion
+                .text()
+                .split_whitespace()
+                .next()
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn learn_pending_acceptance(
+        &mut self,
+        outcome: CompletionApplyOutcome,
+        observed_at_ms: i64,
+    ) -> Result<(), AdaptiveRuntimeError> {
+        let accepted_words = std::mem::take(&mut self.pending_accepted_words);
+        if outcome != CompletionApplyOutcome::Applied {
+            return Ok(());
+        }
+        for word in accepted_words {
+            self.learning.observe_typed_token(word, observed_at_ms)?;
+        }
         Ok(())
     }
 
@@ -714,6 +775,20 @@ impl AdaptiveCorrectionSession {
                 Ok(())
             }
         }
+    }
+
+    pub fn current_layout_switch_span(&self) -> &str {
+        self.input.current_layout_span()
+    }
+
+    pub fn tracked_layout_switch_applied(&mut self, replacement: &str) {
+        self.pending_correction = None;
+        self.undo_candidate = None;
+        self.pending_undo = None;
+        self.pending_typed_sequence = None;
+        self.typed_sequence_context.clear();
+        self.resolved_completion_word = None;
+        self.input.replace_layout_switch_span(replacement);
     }
 
     pub fn take_resolved_completion_word(&mut self) -> Option<String> {

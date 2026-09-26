@@ -98,13 +98,24 @@ impl CaretLocator {
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        let pattern = self.focused_text_pattern()?;
-        pattern
-            .get_selection()
-            .ok()?
-            .into_iter()
-            .filter_map(|range| range.get_text(-1).ok())
-            .find(|text| !text.is_empty())
+        fn non_empty_selection(pattern: &UITextPattern) -> Option<String> {
+            pattern
+                .get_selection()
+                .ok()?
+                .into_iter()
+                .filter_map(|range| range.get_text(-1).ok())
+                .find(|text| !text.is_empty())
+        }
+
+        if let Some(pattern) = self.focused_text_pattern()
+            && let Some(text) = non_empty_selection(&pattern)
+        {
+            return Some(text);
+        }
+
+        let edit_pattern = self.focused_text_edit_pattern()?;
+        let text_pattern: &UITextPattern = edit_pattern.as_ref();
+        non_empty_selection(text_pattern)
     }
 
     fn focused_text_pattern(&self) -> Option<UITextPattern> {

@@ -38,7 +38,7 @@ impl Drop for TempDatabasePath {
 fn certification_fresh_database_has_only_the_required_application_tables() {
     let path = TempDatabasePath::new("schema");
     let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 4);
+    assert_eq!(database.schema_version().unwrap(), 5);
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -63,7 +63,6 @@ fn certification_fresh_database_has_only_the_required_application_tables() {
             "clipboard_text",
             "completion_hidden_words",
             "correction_events",
-            "dictionary_words",
             "languages",
             "text_history",
             "user_words",
@@ -156,26 +155,26 @@ fn certification_builtin_vocabulary_is_not_duplicated_in_sqlite() {
     let path = TempDatabasePath::new("builtin-dictionary-authority");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 4);
+        assert_eq!(database.schema_version().unwrap(), 5);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
-    let count: i64 = raw
+    let exists: i64 = raw
         .query_row(
-            "SELECT count(*) FROM dictionary_words JOIN languages ON languages.id = dictionary_words.language_id WHERE languages.code IN ('ru', 'en')",
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'dictionary_words'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(exists, 0);
 }
 
 #[test]
-fn certification_custom_language_rows_still_build_a_runtime_pack() {
-    let path = TempDatabasePath::new("custom-language-dictionary");
+fn certification_unknown_enabled_language_fails_closed() {
+    let path = TempDatabasePath::new("unknown-language");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 4);
+        assert_eq!(database.schema_version().unwrap(), 5);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -184,21 +183,13 @@ fn certification_custom_language_rows_still_build_a_runtime_pack() {
         [],
     )
     .unwrap();
-    let language_id = raw.last_insert_rowid();
-    raw.execute(
-        "INSERT INTO dictionary_words (language_id, term, normalized_term, frequency) VALUES (?1, 'customword', 'customword', 10)",
-        [language_id],
-    )
-    .unwrap();
     drop(raw);
 
     let database = Database::open(path.as_path()).unwrap();
-    let packs = database.load_enabled_language_packs().unwrap();
-    let custom = packs
-        .iter()
-        .find(|pack| pack.id().as_str() == "xx")
-        .expect("custom language must still load from SQLite rows");
-    assert!(custom.contains_normalized("customword"));
+    assert!(matches!(
+        database.load_enabled_language_packs(),
+        Err(DatabaseError::InvalidStoredLanguageCode(code)) if code == "xx"
+    ));
 }
 
 #[test]
@@ -277,7 +268,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     let path = TempDatabasePath::new("schema-v1-to-v2");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 4);
+        assert_eq!(database.schema_version().unwrap(), 5);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -287,7 +278,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 4);
+    assert_eq!(migrated.schema_version().unwrap(), 5);
     migrated.hide_completion_word("hello").unwrap();
     assert!(
         migrated
@@ -302,7 +293,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     let path = TempDatabasePath::new("schema-v2-grave-cleanup");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 4);
+        assert_eq!(database.schema_version().unwrap(), 5);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -320,7 +311,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 4);
+    assert_eq!(migrated.schema_version().unwrap(), 5);
     assert!(
         migrated
             .load_user_lexicon()
@@ -339,58 +330,39 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
 }
 
 #[test]
-fn certification_schema_v3_removes_only_builtin_dictionary_rows() {
-    let path = TempDatabasePath::new("schema-v3-builtins-to-assets");
+fn certification_schema_v4_drops_obsolete_dictionary_table() {
+    let path = TempDatabasePath::new("schema-v4-dictionary-drop");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 4);
+        assert_eq!(database.schema_version().unwrap(), 5);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
-    let ru_id: i64 = raw
-        .query_row("SELECT id FROM languages WHERE code = 'ru'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
     raw.execute(
-        "INSERT INTO dictionary_words (language_id, term, normalized_term, frequency) VALUES (?1, 'legacyru', 'legacyru', 10)",
-        [ru_id],
-    )
-    .unwrap();
-    raw.execute(
-        "INSERT INTO languages (code, display_name, enabled) VALUES ('xx', 'Custom', 1)",
+        "CREATE TABLE dictionary_words (id INTEGER PRIMARY KEY, language_id INTEGER NOT NULL, term TEXT NOT NULL, normalized_term TEXT NOT NULL, frequency INTEGER NOT NULL)",
         [],
     )
     .unwrap();
-    let custom_id = raw.last_insert_rowid();
     raw.execute(
-        "INSERT INTO dictionary_words (language_id, term, normalized_term, frequency) VALUES (?1, 'customword', 'customword', 10)",
-        [custom_id],
+        "INSERT INTO dictionary_words (language_id, term, normalized_term, frequency) VALUES (1, 'legacyru', 'legacyru', 10)",
+        [],
     )
     .unwrap();
-    raw.pragma_update(None, "user_version", 3).unwrap();
+    raw.pragma_update(None, "user_version", 4).unwrap();
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 4);
+    assert_eq!(migrated.schema_version().unwrap(), 5);
     drop(migrated);
     let raw = Connection::open(path.as_path()).unwrap();
-    let builtin_count: i64 = raw
+    let exists: i64 = raw
         .query_row(
-            "SELECT count(*) FROM dictionary_words JOIN languages ON languages.id = dictionary_words.language_id WHERE languages.code IN ('ru', 'en')",
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'dictionary_words'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    let custom_count: i64 = raw
-        .query_row(
-            "SELECT count(*) FROM dictionary_words JOIN languages ON languages.id = dictionary_words.language_id WHERE languages.code = 'xx' AND term = 'customword'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(builtin_count, 0);
-    assert_eq!(custom_count, 1);
+    assert_eq!(exists, 0);
 }
 
 #[test]
@@ -439,24 +411,13 @@ fn certification_settings_are_canonical_and_survive_reopen() {
 }
 
 #[test]
-fn certification_foreign_keys_own_dictionary_and_clipboard_child_lifecycles() {
-    let path = TempDatabasePath::new("foreign-keys");
+fn certification_clipboard_child_rows_are_owned_by_parent_entry() {
+    let path = TempDatabasePath::new("clipboard-foreign-keys");
     let database = Database::open(path.as_path()).unwrap();
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
     raw.pragma_update(None, "foreign_keys", "ON").unwrap();
-    raw.execute(
-        "INSERT INTO languages (code, display_name) VALUES ('zz-test', 'Test')",
-        [],
-    )
-    .unwrap();
-    let test_language_id = raw.last_insert_rowid();
-    raw.execute(
-        "INSERT INTO dictionary_words (language_id, term, normalized_term, frequency) VALUES (?1, 'cascade_probe', 'cascade_probe', 10)",
-        [test_language_id],
-    )
-    .unwrap();
     raw.execute(
         "INSERT INTO clipboard_entries (id, kind, last_seen_at_ms, content_hash) VALUES (5, 'files', 1, X'01')",
         [],
@@ -468,22 +429,12 @@ fn certification_foreign_keys_own_dictionary_and_clipboard_child_lifecycles() {
     )
     .unwrap();
 
-    raw.execute("DELETE FROM languages WHERE id = ?1", [test_language_id])
-        .unwrap();
     raw.execute("DELETE FROM clipboard_entries WHERE id = 5", [])
         .unwrap();
 
-    let dictionary_count: i64 = raw
-        .query_row(
-            "SELECT count(*) FROM dictionary_words WHERE term = 'cascade_probe'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     let file_count: i64 = raw
         .query_row("SELECT count(*) FROM clipboard_files", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(dictionary_count, 0);
     assert_eq!(file_count, 0);
 }
 
@@ -502,7 +453,7 @@ fn certification_newer_database_schema_fails_closed() {
         error,
         DatabaseError::SchemaTooNew {
             found: 999,
-            supported: 4
+            supported: 5
         }
     ));
 }

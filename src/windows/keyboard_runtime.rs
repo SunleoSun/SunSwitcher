@@ -8,18 +8,20 @@ use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, INPUT, INPUT_KEYBOARD,
-    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx, VK_BACK, VK_CAPITAL,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT,
-    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_OEM_1, VK_OEM_3, VK_OEM_4,
-    VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN,
-    VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB, VK_UP,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx,
+    VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
+    VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK,
+    VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE,
+    VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT,
+    VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
+    PostMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_USER, WM_XBUTTONDOWN,
 };
 
 use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
@@ -31,7 +33,13 @@ use crate::replacement::{
     SelectedTextDecision, UndoOutcome,
 };
 
-use super::selected_text_runtime::SelectedTextSession;
+use super::selected_text_runtime::{SelectedTextSession, SelectionCaptureIntent};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardCommand {
+    OpenCurrent,
+    OpenPinned,
+}
 
 const SUNSWITCHER_INJECTED_MARKER: usize = 0x5355_4E53_5749_5443;
 const TO_UNICODE_DO_NOT_CHANGE_STATE: u32 = 0x4;
@@ -58,9 +66,19 @@ pub trait InputProcessor: Send + 'static {
         None
     }
 
+    fn tracked_layout_switch_text(&self) -> Option<String> {
+        None
+    }
+
+    fn tracked_layout_switch_applied(&mut self, _text: &str) {}
+
     fn completion_command(&mut self, _command: CompletionCommand) -> CompletionCommandResult {
         CompletionCommandResult::Pass
     }
+
+    fn clipboard_command(&mut self, _command: ClipboardCommand, _target_window_id: usize) {}
+
+    fn completion_suffix_outcome(&mut self, _outcome: CompletionApplyOutcome) {}
 
     fn completion_word_outcome(&mut self, _outcome: CompletionApplyOutcome) {}
 }
@@ -196,6 +214,81 @@ impl DoubleShiftTracker {
     }
 }
 
+const MOUSE_SELECTION_DRAG_THRESHOLD_PX: i32 = 4;
+const MOUSE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+const MOUSE_DOUBLE_CLICK_DISTANCE_PX: i32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MouseSelectionEffect {
+    None,
+    InvalidateOnly,
+    UserSelectionIntent,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MouseSelectionTracker {
+    left_button_down_at: Option<(i32, i32)>,
+    drag_observed: bool,
+    last_left_button_up: Option<(Instant, i32, i32)>,
+}
+
+impl MouseSelectionTracker {
+    pub(super) fn observe(&mut self, message: u32, x: i32, y: i32) -> MouseSelectionEffect {
+        self.observe_at(message, x, y, Instant::now())
+    }
+
+    pub(super) fn observe_at(
+        &mut self,
+        message: u32,
+        x: i32,
+        y: i32,
+        now: Instant,
+    ) -> MouseSelectionEffect {
+        match message {
+            WM_LBUTTONDOWN => {
+                self.left_button_down_at = Some((x, y));
+                self.drag_observed = false;
+                MouseSelectionEffect::InvalidateOnly
+            }
+            WM_MOUSEMOVE => {
+                if let Some((start_x, start_y)) = self.left_button_down_at {
+                    let moved_x = (x - start_x).abs() >= MOUSE_SELECTION_DRAG_THRESHOLD_PX;
+                    let moved_y = (y - start_y).abs() >= MOUSE_SELECTION_DRAG_THRESHOLD_PX;
+                    if moved_x || moved_y {
+                        self.drag_observed = true;
+                    }
+                }
+                MouseSelectionEffect::None
+            }
+            WM_LBUTTONUP => {
+                let had_drag = self.left_button_down_at.take().is_some() && self.drag_observed;
+                self.drag_observed = false;
+                let had_double_click = !had_drag
+                    && self
+                        .last_left_button_up
+                        .is_some_and(|(previous, last_x, last_y)| {
+                            now.saturating_duration_since(previous) <= MOUSE_DOUBLE_CLICK_WINDOW
+                                && (x - last_x).abs() <= MOUSE_DOUBLE_CLICK_DISTANCE_PX
+                                && (y - last_y).abs() <= MOUSE_DOUBLE_CLICK_DISTANCE_PX
+                        });
+                self.last_left_button_up = if had_drag { None } else { Some((now, x, y)) };
+                if had_drag || had_double_click {
+                    MouseSelectionEffect::UserSelectionIntent
+                } else {
+                    MouseSelectionEffect::None
+                }
+            }
+            message if mouse_message_invalidates_tracking(message) => {
+                self.left_button_down_at = None;
+                self.drag_observed = false;
+                self.last_left_button_up = None;
+                MouseSelectionEffect::InvalidateOnly
+            }
+            _ => MouseSelectionEffect::None,
+        }
+    }
+}
+
 struct RuntimeState {
     processor: Box<dyn InputProcessor>,
     keyboard_state: [u8; 256],
@@ -204,12 +297,12 @@ struct RuntimeState {
     undo_hotkey: UndoHotkey,
     input_revision: u64,
     double_shift: DoubleShiftTracker,
+    selection_capture_intent: SelectionCaptureIntent,
+    mouse_selection: MouseSelectionTracker,
 }
 
 impl RuntimeState {
     fn new(mut processor: Box<dyn InputProcessor>, undo_hotkey: UndoHotkey) -> Self {
-        // The runtime cannot prove where the caret is when a hook is attached. Start fail-closed;
-        // stale text is discarded, while the first newly typed character may establish fresh ownership.
         let _ = processor.process(InputEvent::Invalidate);
         Self {
             processor,
@@ -219,6 +312,8 @@ impl RuntimeState {
             undo_hotkey,
             input_revision: 0,
             double_shift: DoubleShiftTracker::default(),
+            selection_capture_intent: SelectionCaptureIntent::Unknown,
+            mouse_selection: MouseSelectionTracker::default(),
         }
     }
 
@@ -245,6 +340,10 @@ impl RuntimeState {
             return None;
         }
         Some(command)
+    }
+
+    fn clipboard_hotkey_command(&self, vk_code: u32) -> Option<ClipboardCommand> {
+        clipboard_hotkey_command(vk_code, &self.keyboard_state)
     }
 
     fn suppress_keyup(&mut self, vk_code: u32, route: SuppressedKeyUpRoute) {
@@ -286,12 +385,31 @@ impl RuntimeState {
     const fn ownership_stamp(&self) -> InputOwnershipStamp {
         InputOwnershipStamp::new(self.input_revision, self.foreground_window_id)
     }
+
+    fn observe_selection_capture_intent(&mut self, vk_code: u32, is_key_down: bool) {
+        if !is_key_down {
+            return;
+        }
+        if let Some(intent) = selection_capture_intent_for_navigation(
+            vk_code,
+            self.keyboard_state[VK_SHIFT as usize] & 0x80 != 0,
+        ) {
+            self.selection_capture_intent = intent;
+        } else if !is_modifier_key(vk_code) {
+            self.selection_capture_intent = SelectionCaptureIntent::Unknown;
+        }
+    }
+
+    fn clear_selection_capture_intent(&mut self) {
+        self.selection_capture_intent = SelectionCaptureIntent::Unknown;
+    }
 }
 
 static RUNTIME: Mutex<Option<RuntimeState>> = Mutex::new(None);
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 const WM_SUNSWITCHER_STOP: u32 = WM_USER + 0x535;
+const WM_SUNSWITCHER_DOUBLE_SHIFT: u32 = WM_USER + 0x536;
 
 struct RuntimeRegistration;
 
@@ -457,6 +575,21 @@ pub fn run_global_keyboard_hook(
                 if result == 0 || message.message == WM_SUNSWITCHER_STOP {
                     break Ok(());
                 }
+                if message.message == WM_SUNSWITCHER_DOUBLE_SHIFT {
+                    let shift_still_down = GetAsyncKeyState(VK_SHIFT as i32) < 0;
+                    eprintln!(
+                        "[double-shift] deferred dispatch after hook shift_still_down={shift_still_down}"
+                    );
+                    if shift_still_down {
+                        eprintln!(
+                            "[double-shift] deferred dispatch aborted because a physical Shift is still down"
+                        );
+                        invalidate_runtime_tracking();
+                        continue;
+                    }
+                    switch_selected_or_previous_text();
+                    continue;
+                }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
@@ -520,7 +653,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             runtime.note_external_input();
             if next_result == 0 {
                 runtime.update_key_state(event.vkCode, is_key_down);
+                runtime.observe_selection_capture_intent(event.vkCode, is_key_down);
             }
+            runtime.clear_selection_capture_intent();
             let _ = runtime.processor.process(InputEvent::Invalidate);
         }
         return next_result;
@@ -538,6 +673,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         if is_key_down {
             let foreground_window_id = current_foreground_window_id();
             if runtime.sync_foreground_window(foreground_window_id) {
+                runtime.clear_selection_capture_intent();
                 let _ = runtime.processor.process(InputEvent::Invalidate);
             }
         }
@@ -552,6 +688,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             DoubleShiftEvent::None
         };
         runtime.update_key_state(event.vkCode, is_key_down);
+        runtime.observe_selection_capture_intent(event.vkCode, is_key_down);
         let ownership_stamp = runtime.ownership_stamp();
 
         if double_shift == DoubleShiftEvent::Trigger {
@@ -569,6 +706,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         {
             runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
             HookEventState::SunSwitcherOnlyKeyDown
+        } else if let Some(command) = runtime.clipboard_hotkey_command(event.vkCode) {
+            HookEventState::ClipboardHotkey {
+                command,
+                target_window_id: runtime.foreground_window_id,
+            }
         } else if runtime.undo_hotkey_matches(event.vkCode) {
             HookEventState::UndoHotkey { ownership_stamp }
         } else if let Some(command) = runtime.completion_hotkey_command(event.vkCode) {
@@ -577,6 +719,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 ownership_stamp,
             }
         } else {
+            if is_key_down && is_state_invalidating_key(event.vkCode) {
+                let had_tracked_span = runtime.processor.tracked_layout_switch_text().is_some();
+                eprintln!(
+                    "[double-shift] keyboard navigation/edit vk=0x{:02X} invalidates tracked_span={had_tracked_span}",
+                    event.vkCode
+                );
+            }
             let directive = classify_key_down(event, runtime)
                 .map(|input_event| runtime.processor.process(input_event))
                 .unwrap_or(RuntimeDirective::Pass);
@@ -604,7 +753,21 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         }
         HookEventState::SunSwitcherOnlyKeyDown => 1,
         HookEventState::DoubleShift => {
-            switch_selected_or_previous_text();
+            // The gesture fires while the second physical Shift key-up is still inside the
+            // low-level hook callback. Never run SendInput/clipboard capture from that callback:
+            // queue the editing effect so injected selection/copy events can be processed only
+            // after the hook returns and Windows completes the physical modifier transition.
+            let thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
+            let shift_down_in_hook = unsafe { GetAsyncKeyState(VK_SHIFT as i32) } < 0;
+            let queued = thread_id != 0
+                && unsafe { PostThreadMessageW(thread_id, WM_SUNSWITCHER_DOUBLE_SHIFT, 0, 0) != 0 };
+            eprintln!(
+                "[double-shift] trigger queued={queued} shift_down_in_hook={shift_down_in_hook}"
+            );
+            if !queued {
+                eprintln!("[double-shift] failed to queue deferred gesture effect; invalidating");
+                invalidate_runtime_tracking();
+            }
             1
         }
         HookEventState::KeyDownPass => {
@@ -613,6 +776,20 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 invalidate_runtime_tracking();
             }
             next_result
+        }
+        HookEventState::ClipboardHotkey {
+            command,
+            target_window_id,
+        } => {
+            if let Ok(mut runtime_slot) = RUNTIME.lock()
+                && let Some(runtime) = runtime_slot.as_mut()
+            {
+                runtime
+                    .processor
+                    .clipboard_command(command, target_window_id);
+                runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
+            }
+            1
         }
         HookEventState::CompletionHotkey {
             command,
@@ -657,12 +834,18 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 CompletionCommandResult::AcceptSuffix(suffix) => {
                     let injection_result = inject_completion_suffix(&suffix);
                     let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
-                    invalidate_runtime_tracking();
+                    let outcome = if injection_result.is_ok() && ownership_unchanged {
+                        CompletionApplyOutcome::Applied
+                    } else {
+                        CompletionApplyOutcome::Uncertain
+                    };
                     if let Ok(mut runtime_slot) = RUNTIME.lock()
                         && let Some(runtime) = runtime_slot.as_mut()
                     {
+                        runtime.processor.completion_suffix_outcome(outcome);
                         runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
                     }
+                    invalidate_runtime_tracking();
                     if let Err(error) = injection_result {
                         eprintln!("SunSwitcher completion injection failed: {error:?}");
                     } else if !ownership_unchanged {
@@ -827,6 +1010,10 @@ enum HookEventState {
     UndoHotkey {
         ownership_stamp: InputOwnershipStamp,
     },
+    ClipboardHotkey {
+        command: ClipboardCommand,
+        target_window_id: usize,
+    },
     CompletionHotkey {
         command: CompletionCommand,
         ownership_stamp: InputOwnershipStamp,
@@ -836,58 +1023,57 @@ enum HookEventState {
     },
 }
 
-fn switch_selected_or_previous_text() {
-    let session = match SelectedTextSession::capture_existing_selection() {
-        Some(session) => Some(session),
-        None => match SelectedTextSession::capture_previous_word() {
-            Ok(session) => session,
-            Err(error) => {
-                eprintln!("SunSwitcher previous-word capture failed: {error:?}");
-                None
-            }
-        },
-    };
-    let Some(session) = session else {
-        invalidate_runtime_tracking();
-        return;
-    };
-
+fn switch_captured_text(session: SelectedTextSession) {
     let source = session.selected_text().clone();
+    eprintln!(
+        "[double-shift] captured source={:?} chars={}",
+        source.as_str(),
+        source.as_str().chars().count()
+    );
     let switch = RUNTIME.lock().ok().and_then(|runtime_slot| {
         runtime_slot
             .as_ref()
             .and_then(|runtime| runtime.processor.switch_layout_text(source.as_str()))
     });
     let Some(switch) = switch else {
+        eprintln!(
+            "[double-shift] no layout transform for captured source; restoring capture state"
+        );
         if let Err(error) = session.finish_without_replacement() {
             eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
         }
-        invalidate_runtime_tracking();
         return;
     };
 
+    eprintln!(
+        "[double-shift] transform source={:?} replacement={:?} target_language={}",
+        source.as_str(),
+        switch.text(),
+        switch.target_language().as_str()
+    );
     let replacement = match SelectedReplacementText::try_new(switch.text().to_owned()) {
         Ok(replacement) => replacement,
         Err(_) => {
+            eprintln!("[double-shift] transformed text failed SelectedReplacementText validation");
             if let Err(error) = session.finish_without_replacement() {
                 eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
             }
-            invalidate_runtime_tracking();
             return;
         }
     };
     let Some(action) =
         SelectedReplacementEngine::new().plan(source, SelectedTextDecision::Replace(replacement))
     else {
+        eprintln!("[double-shift] replacement engine produced no action");
         if let Err(error) = session.finish_without_replacement() {
             eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
         }
-        invalidate_runtime_tracking();
         return;
     };
 
     match session.apply_layout_switch(&action) {
         Ok(()) => {
+            eprintln!("[double-shift] replacement input applied");
             if !request_foreground_keyboard_layout(switch.target_language()) {
                 eprintln!(
                     "SunSwitcher could not switch the foreground keyboard layout to {:?}",
@@ -896,6 +1082,102 @@ fn switch_selected_or_previous_text() {
             }
         }
         Err(error) => eprintln!("SunSwitcher layout switch failed: {error:?}"),
+    }
+}
+
+fn switch_selected_or_previous_text() {
+    eprintln!("[double-shift] trigger");
+    let selection_capture_intent = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|runtime_slot| {
+            runtime_slot
+                .as_ref()
+                .map(|runtime| runtime.selection_capture_intent)
+        })
+        .unwrap_or_default();
+
+    let tracked_attempt = RUNTIME.lock().ok().and_then(|runtime_slot| {
+        let runtime = runtime_slot.as_ref()?;
+        let source = runtime.processor.tracked_layout_switch_text()?;
+        let switch = runtime.processor.switch_layout_text(&source);
+        Some((source, switch))
+    });
+    if let Some((source, switch)) = tracked_attempt {
+        eprintln!(
+            "[double-shift] path=tracked-span source={:?} chars={}",
+            source,
+            source.chars().count()
+        );
+        if let Some(switch) = switch {
+            match inject_tracked_text_replacement(source.chars().count(), switch.text()) {
+                Ok(()) => {
+                    eprintln!(
+                        "[double-shift] tracked replacement={:?} target_language={}",
+                        switch.text(),
+                        switch.target_language().as_str()
+                    );
+                    if !request_foreground_keyboard_layout(switch.target_language()) {
+                        eprintln!(
+                            "SunSwitcher could not switch the foreground keyboard layout to {:?}",
+                            switch.target_language().as_str()
+                        );
+                    }
+                    if let Ok(mut runtime_slot) = RUNTIME.lock()
+                        && let Some(runtime) = runtime_slot.as_mut()
+                    {
+                        runtime
+                            .processor
+                            .tracked_layout_switch_applied(switch.text());
+                    }
+                }
+                Err(error) => {
+                    eprintln!("SunSwitcher tracked layout switch failed: {error:?}");
+                    invalidate_runtime_tracking();
+                }
+            }
+            return;
+        }
+
+        eprintln!(
+            "[double-shift] tracked span has no layout transform; dropping ownership and continuing with capture fallback"
+        );
+        invalidate_runtime_tracking();
+    }
+
+    eprintln!(
+        "[double-shift] no transformable tracked span; probing explicit selection intent={selection_capture_intent:?}"
+    );
+    match SelectedTextSession::capture_existing_selection_for_replacement(selection_capture_intent)
+    {
+        Ok(Some(session)) => {
+            eprintln!("[double-shift] path=explicit-selection");
+            switch_captured_text(session);
+            invalidate_runtime_tracking();
+            return;
+        }
+        Ok(None) => {
+            eprintln!("[double-shift] no copyable explicit selection; probing previous text chunk");
+        }
+        Err(error) => {
+            eprintln!("SunSwitcher selected-text capture failed closed: {error:?}");
+            invalidate_runtime_tracking();
+            return;
+        }
+    }
+
+    let session = match SelectedTextSession::capture_previous_word() {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("SunSwitcher previous-word capture failed: {error:?}");
+            None
+        }
+    };
+    if let Some(session) = session {
+        eprintln!("[double-shift] path=previous-caret-chunk");
+        switch_captured_text(session);
+    } else {
+        eprintln!("[double-shift] previous-caret-chunk produced no replaceable text");
     }
     invalidate_runtime_tracking();
 }
@@ -968,6 +1250,7 @@ fn invalidate_runtime_tracking() {
     if let Ok(mut runtime_slot) = RUNTIME.lock()
         && let Some(runtime) = runtime_slot.as_mut()
     {
+        runtime.clear_selection_capture_intent();
         let _ = runtime.processor.process(InputEvent::Invalidate);
     }
 }
@@ -1024,12 +1307,28 @@ pub(super) fn is_foreign_injected_keyboard_event(flags: u32, extra_info: usize) 
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if code >= 0
-        && mouse_message_invalidates_tracking(w_param as u32)
         && let Ok(mut runtime_slot) = RUNTIME.lock()
         && let Some(runtime) = runtime_slot.as_mut()
     {
-        runtime.note_external_input();
-        let _ = runtime.processor.process(InputEvent::Invalidate);
+        let message = w_param as u32;
+        let point = unsafe { (*(l_param as *const MSLLHOOKSTRUCT)).pt };
+        match runtime.mouse_selection.observe(message, point.x, point.y) {
+            MouseSelectionEffect::InvalidateOnly => {
+                let had_tracked_span = runtime.processor.tracked_layout_switch_text().is_some();
+                eprintln!(
+                    "[double-shift] mouse/navigation click message=0x{message:04X} invalidates tracked_span={had_tracked_span}"
+                );
+                runtime.note_external_input();
+                runtime.clear_selection_capture_intent();
+                let _ = runtime.processor.process(InputEvent::Invalidate);
+            }
+            MouseSelectionEffect::UserSelectionIntent => {
+                eprintln!("[double-shift] mouse selection intent message=0x{message:04X}");
+                runtime.note_external_input();
+                runtime.selection_capture_intent = SelectionCaptureIntent::UserSelection;
+            }
+            MouseSelectionEffect::None => {}
+        }
     }
     unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) }
 }
@@ -1137,6 +1436,24 @@ pub(super) const fn suppressed_keyup_calls_downstream(
     !matches!(suppression, Some(SuppressedKeyUpRoute::SunSwitcherOnly))
 }
 
+pub(super) fn clipboard_hotkey_command(
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> Option<ClipboardCommand> {
+    let alt = keyboard_state[VK_MENU as usize] & 0x80 != 0;
+    let ctrl = keyboard_state[VK_CONTROL as usize] & 0x80 != 0;
+    let shift = keyboard_state[VK_SHIFT as usize] & 0x80 != 0;
+    let win = keyboard_state[VK_LWIN as usize] & 0x80 != 0
+        || keyboard_state[VK_RWIN as usize] & 0x80 != 0;
+    if ctrl && shift && !alt && !win && vk_code == VK_SUBTRACT as u32 {
+        return Some(ClipboardCommand::OpenCurrent);
+    }
+    if ctrl && shift && !alt && !win && vk_code == VK_ADD as u32 {
+        return Some(ClipboardCommand::OpenPinned);
+    }
+    None
+}
+
 pub(super) fn completion_hotkey_command(
     vk_code: u32,
     keyboard_state: &[u8; 256],
@@ -1158,10 +1475,29 @@ pub(super) fn completion_hotkey_command(
         VK_ESCAPE => Some(CompletionCommand::Dismiss),
         VK_UP => Some(CompletionCommand::Previous),
         VK_DOWN => Some(CompletionCommand::Next),
-        VK_RETURN | VK_TAB => Some(CompletionCommand::Accept),
+        VK_TAB => Some(CompletionCommand::Accept),
         VK_DELETE => Some(CompletionCommand::DeleteSelected),
         _ => None,
     }
+}
+
+fn is_selection_navigation_key(vk_code: u32) -> bool {
+    [
+        VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
+    ]
+    .into_iter()
+    .any(|key| vk_code == key as u32)
+}
+
+pub(super) fn selection_capture_intent_for_navigation(
+    vk_code: u32,
+    shift_active: bool,
+) -> Option<SelectionCaptureIntent> {
+    is_selection_navigation_key(vk_code).then_some(if shift_active {
+        SelectionCaptureIntent::UserSelection
+    } else {
+        SelectionCaptureIntent::Unknown
+    })
 }
 
 fn is_state_invalidating_key(vk_code: u32) -> bool {
@@ -1257,6 +1593,58 @@ pub(super) fn inject_selected_text(text: &str) -> Result<(), RuntimeError> {
     send_inputs(&build_selected_text_inputs(text))
 }
 
+pub(super) fn inject_selected_replacement(text: &str) -> Result<(), RuntimeError> {
+    send_inputs(&build_selected_replacement_inputs(text))
+}
+
+pub(super) fn inject_backward_selection(select_left_chars: usize) -> Result<(), RuntimeError> {
+    send_inputs(&build_backward_selection_inputs(select_left_chars))
+}
+
+pub(super) fn inject_current_caret_forward_selection(
+    select_right_chars: usize,
+) -> Result<(), RuntimeError> {
+    send_inputs(&build_current_caret_forward_selection_inputs(
+        select_right_chars,
+    ))
+}
+
+pub(super) fn inject_current_caret_forward_replacement(
+    select_right_chars: usize,
+    text: &str,
+) -> Result<(), RuntimeError> {
+    send_inputs(&build_current_caret_forward_replacement_inputs(
+        select_right_chars,
+        text,
+    ))
+}
+
+pub(super) fn inject_previous_caret_range_replacement(
+    selected_chars: usize,
+    trailing_chars: usize,
+    text: &str,
+) -> Result<(), RuntimeError> {
+    send_inputs(&build_previous_caret_range_replacement_inputs(
+        selected_chars,
+        trailing_chars,
+        text,
+    ))
+}
+
+pub(super) fn inject_key_presses(key: u16, count: usize) -> Result<(), RuntimeError> {
+    send_inputs(&build_key_presses_inputs(key, count))
+}
+
+fn inject_tracked_text_replacement(
+    delete_previous_chars: usize,
+    text: &str,
+) -> Result<(), RuntimeError> {
+    send_inputs(&build_tracked_text_replacement_inputs(
+        delete_previous_chars,
+        text,
+    ))
+}
+
 fn inject_completion_suffix(text: &str) -> Result<(), RuntimeError> {
     send_inputs(&build_completion_suffix_inputs(text))
 }
@@ -1294,6 +1682,81 @@ pub(super) fn build_selected_text_inputs(text: &str) -> Vec<INPUT> {
     inputs
 }
 
+pub(super) fn build_selected_replacement_inputs(text: &str) -> Vec<INPUT> {
+    let mut inputs = build_selected_text_inputs("");
+    if !text.is_empty() {
+        inputs.extend(build_selected_text_inputs(text));
+    }
+    inputs
+}
+
+pub(super) fn build_backward_selection_inputs(select_left_chars: usize) -> Vec<INPUT> {
+    let mut inputs = Vec::with_capacity(select_left_chars.saturating_mul(2) + 2);
+    inputs.push(virtual_key_input(VK_LSHIFT, false));
+    append_key_presses(&mut inputs, VK_LEFT, select_left_chars);
+    inputs.push(virtual_key_input(VK_LSHIFT, true));
+    inputs
+}
+
+fn append_key_presses(inputs: &mut Vec<INPUT>, key: u16, count: usize) {
+    for _ in 0..count {
+        inputs.push(virtual_key_input(key, false));
+        inputs.push(virtual_key_input(key, true));
+    }
+}
+
+pub(super) fn build_current_caret_forward_selection_inputs(
+    select_right_chars: usize,
+) -> Vec<INPUT> {
+    let mut inputs = Vec::with_capacity(select_right_chars.saturating_mul(2) + 2);
+    inputs.push(virtual_key_input(VK_LSHIFT, false));
+    append_key_presses(&mut inputs, VK_RIGHT, select_right_chars);
+    inputs.push(virtual_key_input(VK_LSHIFT, true));
+    inputs
+}
+
+pub(super) fn build_current_caret_forward_replacement_inputs(
+    select_right_chars: usize,
+    text: &str,
+) -> Vec<INPUT> {
+    let mut inputs = build_current_caret_forward_selection_inputs(select_right_chars);
+    inputs.extend(build_selected_replacement_inputs(text));
+    inputs
+}
+
+pub(super) fn build_key_presses_inputs(key: u16, count: usize) -> Vec<INPUT> {
+    let mut inputs = Vec::with_capacity(count.saturating_mul(2));
+    append_key_presses(&mut inputs, key, count);
+    inputs
+}
+
+pub(super) fn build_previous_caret_range_replacement_inputs(
+    selected_chars: usize,
+    trailing_chars: usize,
+    text: &str,
+) -> Vec<INPUT> {
+    let mut inputs = build_key_presses_inputs(VK_LEFT, trailing_chars);
+    inputs.extend(build_backward_selection_inputs(selected_chars));
+    inputs.extend(build_selected_replacement_inputs(text));
+    append_key_presses(&mut inputs, VK_RIGHT, trailing_chars);
+    inputs
+}
+
+pub(super) fn build_tracked_text_replacement_inputs(
+    delete_previous_chars: usize,
+    text: &str,
+) -> Vec<INPUT> {
+    let mut inputs = Vec::with_capacity(
+        delete_previous_chars.saturating_mul(2) + text.encode_utf16().count().saturating_mul(2),
+    );
+    for _ in 0..delete_previous_chars {
+        inputs.push(virtual_key_input(VK_BACK, false));
+        inputs.push(virtual_key_input(VK_BACK, true));
+    }
+    inputs.extend(build_completion_suffix_inputs(text));
+    inputs
+}
+
 pub(super) fn inject_ctrl_chord(key: u16) -> Result<(), RuntimeError> {
     send_inputs(&build_ctrl_chord_inputs(key))
 }
@@ -1306,37 +1769,25 @@ pub(super) fn inject_key_press(key: u16) -> Result<(), RuntimeError> {
     send_inputs(&[virtual_key_input(key, false), virtual_key_input(key, true)])
 }
 
-pub(super) fn inject_previous_word_selection() -> Result<(), RuntimeError> {
-    send_inputs(&build_previous_word_selection_inputs())
-}
+// Selected-text reconstruction now uses explicit line-relative and forward-selection builders.
 
-pub(super) fn build_previous_word_selection_inputs() -> Vec<INPUT> {
-    let mut inputs = vec![
-        virtual_key_input(VK_LEFT, false),
-        virtual_key_input(VK_LEFT, true),
-    ];
-    inputs.extend(build_ctrl_chord_inputs(VK_RIGHT));
-    inputs.extend(build_ctrl_shift_chord_inputs(VK_LEFT));
-    inputs
+pub(super) fn build_ctrl_chord_inputs(key: u16) -> Vec<INPUT> {
+    vec![
+        virtual_key_input(VK_LCONTROL, false),
+        virtual_key_input(key, false),
+        virtual_key_input(key, true),
+        virtual_key_input(VK_LCONTROL, true),
+    ]
 }
 
 pub(super) fn build_ctrl_shift_chord_inputs(key: u16) -> Vec<INPUT> {
     vec![
-        virtual_key_input(VK_CONTROL, false),
-        virtual_key_input(VK_SHIFT, false),
+        virtual_key_input(VK_LCONTROL, false),
+        virtual_key_input(VK_LSHIFT, false),
         virtual_key_input(key, false),
         virtual_key_input(key, true),
-        virtual_key_input(VK_SHIFT, true),
-        virtual_key_input(VK_CONTROL, true),
-    ]
-}
-
-pub(super) fn build_ctrl_chord_inputs(key: u16) -> Vec<INPUT> {
-    vec![
-        virtual_key_input(VK_CONTROL, false),
-        virtual_key_input(key, false),
-        virtual_key_input(key, true),
-        virtual_key_input(VK_CONTROL, true),
+        virtual_key_input(VK_LSHIFT, true),
+        virtual_key_input(VK_LCONTROL, true),
     ]
 }
 
@@ -1350,15 +1801,10 @@ fn send_inputs(inputs: &[INPUT]) -> Result<(), RuntimeError> {
 }
 
 pub(super) fn build_replacement_inputs(action: &ReplacementAction) -> Vec<INPUT> {
-    let mut inputs = Vec::new();
-    for _ in 0..action.delete_previous_chars() {
-        inputs.push(virtual_key_input(VK_BACK, false));
-        inputs.push(virtual_key_input(VK_BACK, true));
-    }
-    for unit in action.replacement().as_str().encode_utf16() {
-        inputs.push(unicode_input(unit, false));
-        inputs.push(unicode_input(unit, true));
-    }
+    let mut inputs = build_tracked_text_replacement_inputs(
+        action.delete_previous_chars(),
+        action.replacement().as_str(),
+    );
     match action.boundary() {
         Boundary::Character(character) => {
             for unit in character.encode_utf16(&mut [0u16; 2]).iter().copied() {
@@ -1385,10 +1831,27 @@ pub(super) fn build_replacement_inputs(action: &ReplacementAction) -> Vec<INPUT>
 fn virtual_key_input(key: u16, key_up: bool) -> INPUT {
     let mut input: INPUT = unsafe { zeroed() };
     input.r#type = INPUT_KEYBOARD;
+    let is_extended_navigation = matches!(
+        key,
+        VK_INSERT
+            | VK_DELETE
+            | VK_HOME
+            | VK_END
+            | VK_PRIOR
+            | VK_NEXT
+            | VK_LEFT
+            | VK_RIGHT
+            | VK_UP
+            | VK_DOWN
+    );
     input.Anonymous.ki = KEYBDINPUT {
         wVk: key,
         wScan: 0,
-        dwFlags: if key_up { KEYEVENTF_KEYUP } else { 0 },
+        dwFlags: (if is_extended_navigation {
+            KEYEVENTF_EXTENDEDKEY
+        } else {
+            0
+        }) | if key_up { KEYEVENTF_KEYUP } else { 0 },
         time: 0,
         dwExtraInfo: SUNSWITCHER_INJECTED_MARKER,
     };

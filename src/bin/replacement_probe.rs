@@ -21,6 +21,7 @@ mod windows_probe {
     use sunswitcher::persistence::{Database, UndoHotkey};
     use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome};
     use sunswitcher::windows::{AutocompletePopupHandle, ClipboardTextListener};
+    use sunswitcher::windows::{ClipboardCommand, ClipboardManagerTab};
     use sunswitcher::windows::{
         InputProcessor, RuntimeDirective, UndoDirective, request_global_keyboard_hook_stop,
         run_global_keyboard_hook,
@@ -40,7 +41,7 @@ mod windows_probe {
             "Pause: without a selection, undo the previous correction; with a selected word, remove it from learned user_words."
         );
         println!(
-            "Autocomplete: after 3 typed letters; Up/Down selects, Enter/Tab accepts all, Alt+Right accepts one word, Del removes the selected prediction, Esc closes. Double Shift switches the selected text or previous word between keyboard layouts."
+            "Autocomplete: after 3 typed letters; Up/Down selects, Tab accepts all, Alt+Right accepts one word, Del removes the selected prediction, Esc closes. Double Shift switches the selected text or previous word between keyboard layouts."
         );
         println!("Stop with Ctrl+C in this console.");
 
@@ -95,6 +96,7 @@ mod windows_probe {
         session: AdaptiveCorrectionSession,
         completion: AdaptiveCompletionSession,
         popup: AutocompletePopupHandle,
+        // Clipboard manager state lives in the shared UI runtime.
     }
 
     impl ProbeProcessor {
@@ -114,16 +116,32 @@ mod windows_probe {
             let runtime = AdaptiveLexicalRuntime::start(database, minimum_confidence)
                 .map_err(|error| error.to_string())?;
             let learning = runtime.learning();
+            let clipboard_database_path = database_path.clone();
             let clipboard_listener = ClipboardTextListener::start(move |text| {
-                if let Err(error) = learning.observe_text(text, now_ms()) {
+                let observed_at_ms = now_ms();
+                match Database::open(&clipboard_database_path) {
+                    Ok(database) => {
+                        if let Err(error) = database.record_clipboard_text(&text, observed_at_ms) {
+                            eprintln!("clipboard history skipped: {error}");
+                        }
+                        if let Ok(settings) = database.settings()
+                            && let Err(error) =
+                                database.prune_clipboard_history(settings.clipboard_history_limit())
+                        {
+                            eprintln!("clipboard history prune skipped: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("clipboard history unavailable: {error}"),
+                }
+                if let Err(error) = learning.observe_text(text, observed_at_ms) {
                     eprintln!("clipboard learning skipped: {error}");
                 }
             })
             .map_err(|error| format!("clipboard listener failed: {error:?}"))?;
             let session = runtime.session();
             let completion = runtime.completion_session();
-            let popup = AutocompletePopupHandle::start()
-                .map_err(|error| format!("autocomplete popup failed: {error}"))?;
+            let popup = AutocompletePopupHandle::start(database_path.clone())
+                .map_err(|error| format!("SunSwitcher UI failed: {error}"))?;
             println!("Adaptive state: {}", database_path.display());
             Ok((
                 Self {
@@ -132,6 +150,7 @@ mod windows_probe {
                     session,
                     completion,
                     popup,
+                    // Clipboard manager is owned by popup,
                 },
                 undo_hotkey,
             ))
@@ -165,6 +184,23 @@ mod windows_probe {
         fn switch_layout_text(&self, text: &str) -> Option<KeyboardLayoutSwitch> {
             let snapshot = self.runtime.snapshots().load().ok()?;
             switch_keyboard_layout_text(snapshot.languages(), text)
+        }
+
+        fn tracked_layout_switch_text(&self) -> Option<String> {
+            let text = self.session.current_layout_switch_span();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+
+        fn tracked_layout_switch_applied(&mut self, text: &str) {
+            let observed_at_ms = now_ms();
+            self.session.tracked_layout_switch_applied(text);
+            if let Err(error) = self
+                .completion
+                .process_event(InputEvent::Invalidate, observed_at_ms)
+            {
+                eprintln!("adaptive completion reset after layout switch skipped: {error}");
+            }
+            self.sync_popup();
         }
 
         fn process(&mut self, event: InputEvent) -> RuntimeDirective {
@@ -267,6 +303,25 @@ mod windows_probe {
             }
             self.sync_popup();
             result
+        }
+
+        fn clipboard_command(&mut self, command: ClipboardCommand, target_window_id: usize) {
+            let tab = match command {
+                ClipboardCommand::OpenCurrent => ClipboardManagerTab::Current,
+                ClipboardCommand::OpenPinned => ClipboardManagerTab::Pinned,
+            };
+            self.popup.show_clipboard(tab, target_window_id);
+        }
+
+        fn completion_suffix_outcome(&mut self, outcome: CompletionApplyOutcome) {
+            let observed_at_ms = now_ms();
+            if let Err(error) = self
+                .completion
+                .suffix_acceptance_outcome(outcome, observed_at_ms)
+            {
+                eprintln!("adaptive completion suffix outcome skipped: {error}");
+            }
+            self.sync_popup();
         }
 
         fn completion_word_outcome(&mut self, outcome: CompletionApplyOutcome) {

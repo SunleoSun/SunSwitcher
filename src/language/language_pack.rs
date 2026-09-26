@@ -153,8 +153,10 @@ impl KeyboardLayoutMap {
                 } else {
                     base_target
                 }
-            } else {
+            } else if character.is_alphabetic() {
                 return None;
+            } else {
+                character
             };
             changed |= mapped != character;
             transformed.push(mapped);
@@ -522,6 +524,24 @@ mod tests {
             Some("привет 123! привет")
         );
         assert_eq!(map.transform_text("ghbdtn x"), None);
+    }
+
+    #[test]
+    fn physical_layout_transform_preserves_unmapped_digits() {
+        let map = KeyboardLayoutMap::from_aligned("фа", "aa", 0.15).unwrap();
+        assert_eq!(
+            map.transform_with_physical(
+                "ФФ33",
+                &[
+                    PhysicalKey::Other,
+                    PhysicalKey::Other,
+                    PhysicalKey::Other,
+                    PhysicalKey::Other,
+                ],
+            )
+            .as_deref(),
+            Some("AA33")
+        );
     }
 
     #[test]

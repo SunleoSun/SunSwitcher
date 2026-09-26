@@ -48,6 +48,22 @@ fn plain_punctuation_is_a_boundary_but_layout_ambiguous_physical_key_is_deferred
     };
     assert_eq!(token.text(), "a");
     assert_eq!(token.boundary(), Boundary::Character(','));
+    assert_eq!(plain.current_layout_span(), "a,");
+    assert_eq!(
+        plain.process(InputEvent::character('!')),
+        InputOutcome::Continue
+    );
+    assert_eq!(plain.current_layout_span(), "a,!");
+    assert_eq!(
+        plain.process(InputEvent::character(' ')),
+        InputOutcome::Continue
+    );
+    assert_eq!(plain.current_layout_span(), "a,! ");
+    assert_eq!(
+        plain.process(InputEvent::character('x')),
+        InputOutcome::Continue
+    );
+    assert_eq!(plain.current_layout_span(), "x");
 
     let mut physical = InputBuffer::new();
     physical.process(InputEvent::character('a'));
@@ -56,6 +72,7 @@ fn plain_punctuation_is_a_boundary_but_layout_ambiguous_physical_key_is_deferred
         InputOutcome::Continue
     );
     assert_eq!(physical.current_token(), "a,");
+    assert_eq!(physical.current_layout_span(), "a,");
 }
 
 #[test]
@@ -85,6 +102,46 @@ fn invalidation_discards_old_state_but_first_fresh_character_restarts_tracking()
         panic!("freshly typed text should complete normally after invalidation");
     };
     assert_eq!(token.text(), "x,");
+}
+
+#[test]
+fn invalidation_after_layout_switch_replacement_drops_layout_span_ownership() {
+    let mut buffer = InputBuffer::new();
+    buffer.replace_layout_switch_span("как");
+    assert_eq!(buffer.current_layout_span(), "как");
+
+    assert_eq!(
+        buffer.process(InputEvent::Invalidate),
+        InputOutcome::Invalidated
+    );
+    assert!(buffer.current_layout_span().is_empty());
+    assert!(buffer.current_token().is_empty());
+}
+
+#[test]
+fn explicit_layout_switch_replacement_remains_owned_without_becoming_a_correction_token() {
+    let mut buffer = InputBuffer::new();
+    for character in "привет".chars() {
+        buffer.process(InputEvent::character(character));
+    }
+
+    buffer.replace_layout_switch_span("ghbdtn ");
+    assert_eq!(buffer.current_layout_span(), "ghbdtn ");
+    assert!(buffer.current_token().is_empty());
+
+    assert_eq!(
+        buffer.process(InputEvent::Backspace),
+        InputOutcome::Continue
+    );
+    assert_eq!(buffer.current_layout_span(), "ghbdtn");
+    assert!(buffer.current_token().is_empty());
+
+    assert_eq!(
+        buffer.process(InputEvent::character('x')),
+        InputOutcome::Continue
+    );
+    assert_eq!(buffer.current_layout_span(), "ghbdtnx");
+    assert_eq!(buffer.current_token(), "x");
 }
 
 #[test]

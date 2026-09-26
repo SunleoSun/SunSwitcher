@@ -7,7 +7,7 @@ use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 
 use super::selected_text_runtime::read_observable_clipboard_text;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(40);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 static INTERNAL_CLIPBOARD_OPERATION_DEPTH: AtomicU32 = AtomicU32::new(0);
 static LAST_INTERNAL_CLIPBOARD_SEQUENCE: AtomicU32 = AtomicU32::new(0);
