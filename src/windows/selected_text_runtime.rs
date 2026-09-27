@@ -19,7 +19,7 @@ use super::keyboard_runtime::{
     inject_backward_selection, inject_ctrl_chord, inject_ctrl_shift_chord,
     inject_current_caret_forward_replacement, inject_current_caret_forward_selection,
     inject_key_press, inject_key_presses, inject_previous_caret_range_replacement,
-    inject_selected_replacement, inject_selected_text,
+    inject_selected_text,
 };
 use crate::replacement::{SelectedReplacementAction, SelectedText};
 
@@ -27,12 +27,39 @@ const COPY_TIMEOUT: Duration = Duration::from_millis(700);
 const CLIPBOARD_OPEN_TIMEOUT: Duration = Duration::from_millis(300);
 const RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const VK_C_KEY: u16 = b'C' as u16;
+const VK_V_KEY: u16 = b'V' as u16;
 const VK_INSERT_KEY: u16 = 0x2D;
 const VK_RIGHT_KEY: u16 = 0x27;
 const PREVIOUS_TEXT_LOOKBACK: usize = 64;
 const PREFERRED_DROP_EFFECT_NAME: &str = "Preferred DropEffect";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardImagePayload {
+    format: String,
+    data: Vec<u8>,
+}
+
+impl ClipboardImagePayload {
+    pub fn new(format: String, data: Vec<u8>) -> Self {
+        Self { format, data }
+    }
+
+    pub fn format(&self) -> &str {
+        &self.format
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservableClipboardContent {
+    Text(String),
+    Image(ClipboardImagePayload),
+}
+
+#[derive(Debug)]
 pub enum SelectedTextRuntimeError {
     ClipboardSnapshotFailed,
     UnsupportedClipboardState,
@@ -253,6 +280,7 @@ impl SelectedTextSession {
     }
 
     pub fn capture_previous_word() -> Result<Option<Self>, SelectedTextRuntimeError> {
+        ClipboardSnapshot::verify_preservable()?;
         eprintln!("[double-shift] previous-text probe: Shift+Left({PREVIOUS_TEXT_LOOKBACK})");
         inject_backward_selection(PREVIOUS_TEXT_LOOKBACK)?;
         let ui_after_selection = CaretLocator::new().selected_text();
@@ -271,12 +299,6 @@ impl SelectedTextSession {
         };
         let (mut session, copied, copied_caret_steps, retained_after_copy, source_label) =
             if let Some(session) =
-                Self::capture_previous_chunk_from_uia_selection(origin, ui_after_selection)
-            {
-                let copied = session.selected.as_str().to_owned();
-                let copied_caret_steps = caret_navigation_steps(&copied);
-                (session, copied, copied_caret_steps, true, "UIA")
-            } else if let Some(session) =
                 Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlInsert)?
             {
                 let copied = session.selected.as_str().to_owned();
@@ -332,6 +354,9 @@ impl SelectedTextSession {
 
         let Some(range) = trailing_non_whitespace_range(&copied) else {
             eprintln!("[double-shift] previous-text copied chunk contains only whitespace");
+            if retained_after_copy {
+                inject_key_press(VK_RIGHT_KEY)?;
+            }
             return Ok(None);
         };
         let chars = copied.chars().collect::<Vec<_>>();
@@ -351,24 +376,6 @@ impl SelectedTextSession {
             retained_after_copy,
         };
         Ok(Some(session))
-    }
-
-    fn capture_previous_chunk_from_uia_selection(
-        origin: SelectedTextOrigin,
-        ui_after_selection: Option<String>,
-    ) -> Option<Self> {
-        let text = ui_after_selection?;
-        let selected = SelectedText::try_new(text).ok()?;
-        eprintln!(
-            "[double-shift] previous-text using UIA selected chunk={:?} chars={}",
-            selected.as_str(),
-            selected.as_str().chars().count()
-        );
-        Some(Self {
-            selected,
-            origin,
-            previous_caret_chunk: None,
-        })
     }
 
     fn previous_chunk_retained_after_copy(
@@ -394,7 +401,6 @@ impl SelectedTextSession {
     ) -> Result<Option<Self>, SelectedTextRuntimeError> {
         Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlInsert)
     }
-
     fn capture_current_with_shortcut(
         origin: SelectedTextOrigin,
         shortcut: CopyShortcut,
@@ -498,8 +504,8 @@ impl SelectedTextSession {
             SelectedTextOrigin::ExistingSelection {
                 retained_after_copy: true,
             } => {
-                eprintln!("[double-shift] apply path=selection-still-active Delete+Unicode");
-                inject_selected_replacement(action.replacement().as_str())?;
+                eprintln!("[double-shift] apply path=selection-still-active Ctrl+V paste");
+                paste_selected_replacement_preserving_clipboard(action.replacement().as_str())?;
             }
             SelectedTextOrigin::ExistingSelection {
                 retained_after_copy: false,
@@ -524,10 +530,10 @@ impl SelectedTextSession {
                 let replacement =
                     replace_copied_chunk_range(copied, range, action.replacement().as_str());
                 eprintln!(
-                    "[double-shift] apply path=retained-previous-caret-chunk ReplaceFullSelection chars={}",
+                    "[double-shift] apply path=retained-previous-caret-chunk PasteFullSelection chars={}",
                     replacement.chars().count()
                 );
-                inject_selected_replacement(&replacement)?;
+                paste_selected_replacement_preserving_clipboard(&replacement)?;
             }
             SelectedTextOrigin::PreviousCaretChunk {
                 range,
@@ -572,6 +578,18 @@ impl SelectedTextSession {
         }
         Ok(())
     }
+}
+
+fn paste_selected_replacement_preserving_clipboard(
+    text: &str,
+) -> Result<(), SelectedTextRuntimeError> {
+    let mut snapshot = ClipboardSnapshot::capture()?;
+    let _observation_guard = super::clipboard_listener::InternalClipboardMutationGuard::begin();
+    set_unicode_clipboard(text)?;
+    inject_ctrl_chord(VK_V_KEY)?;
+    sleep(Duration::from_millis(80));
+    snapshot.restore()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,6 +691,11 @@ impl ClipboardSnapshot {
         })
     }
 
+    fn verify_preservable() -> Result<(), SelectedTextRuntimeError> {
+        let mut snapshot = Self::capture()?;
+        snapshot.restored = true;
+        Ok(())
+    }
     fn restore(&mut self) -> Result<(), SelectedTextRuntimeError> {
         if self.restored {
             return Ok(());
@@ -792,6 +815,32 @@ fn wait_for_clipboard_change(previous: u32, timeout: Duration) -> bool {
     false
 }
 
+pub fn read_observable_clipboard_content()
+-> Result<Option<ObservableClipboardContent>, SelectedTextRuntimeError> {
+    let format_count = unsafe { CountClipboardFormats() };
+    let unicode_text_available = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT as u32) } != 0;
+    let file_drop_available = unsafe { IsClipboardFormatAvailable(CF_HDROP as u32) } != 0;
+    let image_available = unsafe {
+        IsClipboardFormatAvailable(CF_DIBV5 as u32) != 0
+            || IsClipboardFormatAvailable(CF_DIB as u32) != 0
+    };
+    match classify_clipboard_snapshot(
+        format_count,
+        unicode_text_available,
+        file_drop_available,
+        image_available,
+    ) {
+        ClipboardSnapshotMode::UnicodeText => Ok(read_unicode_clipboard_text()?
+            .filter(|text| !text.is_empty())
+            .map(ObservableClipboardContent::Text)),
+        ClipboardSnapshotMode::Image => {
+            Ok(read_observable_clipboard_image()?.map(ObservableClipboardContent::Image))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[allow(dead_code)]
 pub(super) fn read_observable_clipboard_text() -> Result<Option<String>, SelectedTextRuntimeError> {
     let format_count = unsafe { CountClipboardFormats() };
     let unicode_text_available = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT as u32) } != 0;
@@ -810,6 +859,25 @@ pub(super) fn read_observable_clipboard_text() -> Result<Option<String>, Selecte
         return Ok(None);
     }
     read_unicode_clipboard_text()
+}
+
+fn read_observable_clipboard_image()
+-> Result<Option<ClipboardImagePayload>, SelectedTextRuntimeError> {
+    let (format, name) = unsafe {
+        if IsClipboardFormatAvailable(CF_DIBV5 as u32) != 0 {
+            (CF_DIBV5 as u32, "CF_DIBV5")
+        } else if IsClipboardFormatAvailable(CF_DIB as u32) != 0 {
+            (CF_DIB as u32, "CF_DIB")
+        } else {
+            return Ok(None);
+        }
+    };
+    let _clipboard = ClipboardOpenGuard::open()?;
+    let bytes = read_open_hglobal_bytes(format)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ClipboardImagePayload::new(name.to_owned(), bytes)))
 }
 
 fn read_unicode_clipboard_text() -> Result<Option<String>, SelectedTextRuntimeError> {
@@ -866,7 +934,7 @@ fn read_open_hglobal_bytes(format: u32) -> Result<Vec<u8>, SelectedTextRuntimeEr
     Ok(bytes)
 }
 
-fn set_unicode_clipboard(text: &str) -> Result<(), SelectedTextRuntimeError> {
+pub(super) fn set_unicode_clipboard(text: &str) -> Result<(), SelectedTextRuntimeError> {
     let units = unicode_clipboard_units(text);
     let bytes = units.len() * size_of::<u16>();
     let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) };
@@ -910,6 +978,27 @@ fn set_unicode_clipboard(text: &str) -> Result<(), SelectedTextRuntimeError> {
         return Err(SelectedTextRuntimeError::ClipboardWriteFailed);
     }
 
+    Ok(())
+}
+
+pub(super) fn set_image_clipboard_payload(
+    format_name: &str,
+    data: &[u8],
+) -> Result<(), SelectedTextRuntimeError> {
+    if data.is_empty() {
+        return Err(SelectedTextRuntimeError::ClipboardWriteFailed);
+    }
+    let format = match format_name {
+        "CF_DIBV5" => CF_DIBV5 as u32,
+        "CF_DIB" => CF_DIB as u32,
+        _ => return Err(SelectedTextRuntimeError::UnsupportedClipboardState),
+    };
+    let clipboard = ClipboardOpenGuard::open()?;
+    if unsafe { EmptyClipboard() } == 0 {
+        return Err(SelectedTextRuntimeError::ClipboardWriteFailed);
+    }
+    set_open_hglobal_bytes(format, data)?;
+    drop(clipboard);
     Ok(())
 }
 

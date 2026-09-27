@@ -11,9 +11,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx,
     VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
     VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK,
-    VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE,
-    VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT,
-    VK_SUBTRACT, VK_TAB, VK_UP,
+    VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+    VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
+    VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
@@ -327,6 +327,12 @@ impl RuntimeState {
         update_keyboard_state(&mut self.keyboard_state, vk_code, is_key_down);
     }
 
+    fn refresh_modifier_state_from_async(&mut self) {
+        refresh_modifier_state_from(&mut self.keyboard_state, |vk_code| unsafe {
+            GetAsyncKeyState(vk_code as i32) < 0
+        });
+    }
+
     fn command_modifier_active(&self) -> bool {
         self.keyboard_state[VK_CONTROL as usize] & 0x80 != 0
             || self.keyboard_state[VK_MENU as usize] & 0x80 != 0
@@ -335,11 +341,7 @@ impl RuntimeState {
     }
 
     fn completion_hotkey_command(&self, vk_code: u32) -> Option<CompletionCommand> {
-        let command = completion_hotkey_command(vk_code, &self.keyboard_state)?;
-        if command == CompletionCommand::AcceptNextWord && !self.owns_alt_modifier() {
-            return None;
-        }
-        Some(command)
+        completion_hotkey_command(vk_code, &self.keyboard_state)
     }
 
     fn clipboard_hotkey_command(&self, vk_code: u32) -> Option<ClipboardCommand> {
@@ -365,13 +367,6 @@ impl RuntimeState {
             .iter()
             .position(|suppressed| suppressed.vk_code == vk_code)?;
         Some(self.suppressed_keyups.swap_remove(index).route)
-    }
-
-    fn owns_alt_modifier(&self) -> bool {
-        self.suppressed_keyups.iter().any(|suppressed| {
-            suppressed.route == SuppressedKeyUpRoute::SunSwitcherOnly
-                && is_alt_modifier_key(suppressed.vk_code)
-        })
     }
 
     fn undo_hotkey_matches(&self, vk_code: u32) -> bool {
@@ -537,6 +532,46 @@ fn sync_generic_modifier(state: &mut [u8; 256], generic: u16, left: u16, right: 
     }
 }
 
+pub(super) fn refresh_modifier_state_from(state: &mut [u8; 256], is_down: impl Fn(u16) -> bool) {
+    refresh_modifier_group(state, VK_SHIFT, VK_LSHIFT, VK_RSHIFT, &is_down);
+    refresh_modifier_group(state, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, &is_down);
+    refresh_modifier_group(state, VK_MENU, VK_LMENU, VK_RMENU, &is_down);
+    refresh_modifier_pair(state, VK_LWIN, VK_RWIN, &is_down);
+}
+
+fn refresh_modifier_group(
+    state: &mut [u8; 256],
+    generic: u16,
+    left: u16,
+    right: u16,
+    is_down: &impl Fn(u16) -> bool,
+) {
+    let generic_down = is_down(generic);
+    let left_down = is_down(left) || generic_down;
+    let right_down = is_down(right);
+    set_virtual_key_down(state, left, left_down);
+    set_virtual_key_down(state, right, right_down);
+    set_virtual_key_down(state, generic, generic_down || left_down || right_down);
+}
+
+fn refresh_modifier_pair(
+    state: &mut [u8; 256],
+    left: u16,
+    right: u16,
+    is_down: &impl Fn(u16) -> bool,
+) {
+    set_virtual_key_down(state, left, is_down(left));
+    set_virtual_key_down(state, right, is_down(right));
+}
+
+fn set_virtual_key_down(state: &mut [u8; 256], vk_code: u16, is_down: bool) {
+    if is_down {
+        state[vk_code as usize] |= 0x80;
+    } else {
+        state[vk_code as usize] &= 0x7f;
+    }
+}
+
 pub fn run_global_keyboard_hook(
     processor: impl InputProcessor,
     undo_hotkey: UndoHotkey,
@@ -688,6 +723,14 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             DoubleShiftEvent::None
         };
         runtime.update_key_state(event.vkCode, is_key_down);
+        if is_key_down
+            && should_refresh_modifier_state_before_key_classification(
+                event.vkCode,
+                &runtime.keyboard_state,
+            )
+        {
+            runtime.refresh_modifier_state_from_async();
+        }
         runtime.observe_selection_capture_intent(event.vkCode, is_key_down);
         let ownership_stamp = runtime.ownership_stamp();
 
@@ -1430,6 +1473,13 @@ pub(super) fn completion_result_passes_through(result: &CompletionCommandResult)
     matches!(result, CompletionCommandResult::Pass)
 }
 
+pub(super) fn should_refresh_modifier_state_before_key_classification(
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> bool {
+    !is_modifier_key(vk_code) && completion_hotkey_command(vk_code, keyboard_state).is_none()
+}
+
 pub(super) const fn suppressed_keyup_calls_downstream(
     suppression: Option<SuppressedKeyUpRoute>,
 ) -> bool {
@@ -1445,11 +1495,13 @@ pub(super) fn clipboard_hotkey_command(
     let shift = keyboard_state[VK_SHIFT as usize] & 0x80 != 0;
     let win = keyboard_state[VK_LWIN as usize] & 0x80 != 0
         || keyboard_state[VK_RWIN as usize] & 0x80 != 0;
-    if ctrl && shift && !alt && !win && vk_code == VK_SUBTRACT as u32 {
-        return Some(ClipboardCommand::OpenCurrent);
-    }
-    if ctrl && shift && !alt && !win && vk_code == VK_ADD as u32 {
+    let plus = vk_code == VK_ADD as u32 || vk_code == VK_OEM_PLUS as u32;
+    let minus = vk_code == VK_SUBTRACT as u32 || vk_code == VK_OEM_MINUS as u32;
+    if ctrl && shift && !alt && !win && plus {
         return Some(ClipboardCommand::OpenPinned);
+    }
+    if ctrl && shift && !alt && !win && minus {
+        return Some(ClipboardCommand::OpenCurrent);
     }
     None
 }
@@ -1593,9 +1645,7 @@ pub(super) fn inject_selected_text(text: &str) -> Result<(), RuntimeError> {
     send_inputs(&build_selected_text_inputs(text))
 }
 
-pub(super) fn inject_selected_replacement(text: &str) -> Result<(), RuntimeError> {
-    send_inputs(&build_selected_replacement_inputs(text))
-}
+// Retained selected-text replacements use clipboard paste in selected_text_runtime.
 
 pub(super) fn inject_backward_selection(select_left_chars: usize) -> Result<(), RuntimeError> {
     send_inputs(&build_backward_selection_inputs(select_left_chars))

@@ -82,6 +82,42 @@ fn clipboard_text_history_deduplicates_orders_filters_and_pins() {
 }
 
 #[test]
+fn clipboard_image_history_is_loaded_with_text_entries() {
+    let database = Database::open_in_memory().unwrap();
+    let text = database.record_clipboard_text("hello", 10).unwrap();
+    let image = database
+        .record_clipboard_image("CF_DIB", &[1, 2, 3, 4], 20)
+        .unwrap();
+
+    assert_eq!(image.kind(), ClipboardEntryKind::Image);
+    assert_eq!(
+        image.content(),
+        &ClipboardEntryContent::Image {
+            format: "CF_DIB".to_owned(),
+            data: vec![1, 2, 3, 4],
+        }
+    );
+    assert_eq!(
+        database
+            .load_clipboard_current("image", 10)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id())
+            .collect::<Vec<_>>(),
+        [image.id()]
+    );
+    assert_eq!(
+        database
+            .load_clipboard_current("", 10)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id())
+            .collect::<Vec<_>>(),
+        [image.id(), text.id()]
+    );
+}
+
+#[test]
 fn clipboard_prune_keeps_pinned_entries_and_recent_current_entries() {
     let database = Database::open_in_memory().unwrap();
     let old = database.record_clipboard_text("old", 10).unwrap();

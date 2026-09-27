@@ -14,6 +14,7 @@ pub use keyboard_runtime::{
     ClipboardCommand, InputProcessor, RuntimeDirective, RuntimeError, UndoDirective,
     request_global_keyboard_hook_stop, run_global_keyboard_hook,
 };
+pub use selected_text_runtime::{ClipboardImagePayload, ObservableClipboardContent};
 pub use selected_text_runtime::{SelectedTextRuntimeError, SelectedTextSession};
 
 #[cfg(test)]

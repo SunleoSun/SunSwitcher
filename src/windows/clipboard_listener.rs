@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 
-use super::selected_text_runtime::read_observable_clipboard_text;
+use super::selected_text_runtime::{ObservableClipboardContent, read_observable_clipboard_content};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -24,7 +24,7 @@ pub struct ClipboardTextListener {
 
 impl ClipboardTextListener {
     pub fn start(
-        mut observer: impl FnMut(String) + Send + 'static,
+        mut observer: impl FnMut(ObservableClipboardContent) + Send + 'static,
     ) -> Result<Self, ClipboardListenerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -48,7 +48,7 @@ impl ClipboardTextListener {
                         continue;
                     }
 
-                    let clipboard_text = match read_observable_clipboard_text() {
+                    let clipboard_content = match read_observable_clipboard_content() {
                         Ok(text) => text,
                         Err(_) => {
                             // Another process may still own the clipboard immediately after the
@@ -75,10 +75,8 @@ impl ClipboardTextListener {
                     }
 
                     last_seen = current;
-                    if let Some(text) = clipboard_text
-                        && !text.is_empty()
-                    {
-                        observer(text);
+                    if let Some(content) = clipboard_content {
+                        observer(content);
                     }
                 }
             })

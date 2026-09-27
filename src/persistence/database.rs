@@ -413,6 +413,7 @@ impl ClipboardEntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardEntryContent {
     Text(String),
+    Image { format: String, data: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,6 +482,7 @@ pub enum DatabaseError {
     InvalidStoredUserWordUseCount(i64),
     InvalidStoredClipboardKind(String),
     InvalidStoredClipboardCopyCount(i64),
+    InvalidClipboardImage,
     InvalidStoredLanguageCode(String),
     ClipboardEntryNotFound(i64),
     InvalidCorrectionText,
@@ -524,6 +526,7 @@ impl Display for DatabaseError {
             Self::InvalidStoredClipboardCopyCount(value) => {
                 write!(formatter, "invalid stored clipboard copy count: {value}")
             }
+            Self::InvalidClipboardImage => formatter.write_str("invalid clipboard image"),
             Self::InvalidStoredLanguageCode(value) => {
                 write!(formatter, "invalid stored language code: {value:?}")
             }
@@ -812,6 +815,43 @@ impl Database {
         self.load_clipboard_entry(ClipboardEntryId(entry_id))
     }
 
+    pub fn record_clipboard_image(
+        &self,
+        format: &str,
+        data: &[u8],
+        observed_at_ms: i64,
+    ) -> Result<ClipboardEntryView, DatabaseError> {
+        validate_clipboard_image(format, data)?;
+        let content_hash = clipboard_content_hash(ClipboardEntryKind::Image, data);
+        let entry_id = self.connection.query_row(
+            r#"
+            INSERT INTO clipboard_entries (kind, last_seen_at_ms, content_hash, copy_count)
+            VALUES (?1, ?2, ?3, 1)
+            ON CONFLICT(kind, content_hash) DO UPDATE SET
+                last_seen_at_ms = excluded.last_seen_at_ms,
+                copy_count = clipboard_entries.copy_count + 1
+            RETURNING id
+            "#,
+            params![
+                ClipboardEntryKind::Image.as_stored(),
+                observed_at_ms,
+                &content_hash
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.connection.execute(
+            r#"
+            INSERT INTO clipboard_images (entry_id, format, data)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(entry_id) DO UPDATE SET
+                format = excluded.format,
+                data = excluded.data
+            "#,
+            params![entry_id, format, data],
+        )?;
+        self.load_clipboard_entry(ClipboardEntryId(entry_id))
+    }
+
     pub fn mark_clipboard_entry_used(
         &self,
         entry_id: ClipboardEntryId,
@@ -890,24 +930,17 @@ impl Database {
         let mut statement = self.connection.prepare(
             r#"
             SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
-                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms, clipboard_text.text
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
+                   clipboard_text.text, clipboard_images.format, clipboard_images.data
             FROM clipboard_entries
-            JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
-            WHERE clipboard_entries.kind = 'text'
+            LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.kind IN ('text', 'image')
             ORDER BY clipboard_entries.last_seen_at_ms DESC, clipboard_entries.id DESC
             "#,
         )?;
         let stored = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?
+            .query_map([], stored_clipboard_row_from_sql)?
             .collect::<Result<Vec<_>, _>>()?;
         clipboard_entries_from_stored(stored, filter, limit)
     }
@@ -920,24 +953,18 @@ impl Database {
         let mut statement = self.connection.prepare(
             r#"
             SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
-                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms, clipboard_text.text
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
+                   clipboard_text.text, clipboard_images.format, clipboard_images.data
             FROM clipboard_entries
-            JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
-            WHERE clipboard_entries.kind = 'text' AND clipboard_entries.pinned_at_ms IS NOT NULL
+            LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.kind IN ('text', 'image')
+              AND clipboard_entries.pinned_at_ms IS NOT NULL
             ORDER BY clipboard_entries.pinned_at_ms DESC, clipboard_entries.id DESC
             "#,
         )?;
         let stored = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?
+            .query_map([], stored_clipboard_row_from_sql)?
             .collect::<Result<Vec<_>, _>>()?;
         clipboard_entries_from_stored(stored, filter, limit)
     }
@@ -949,22 +976,15 @@ impl Database {
         let result = self.connection.query_row(
             r#"
             SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
-                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms, clipboard_text.text
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
+                   clipboard_text.text, clipboard_images.format, clipboard_images.data
             FROM clipboard_entries
-            JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
-            WHERE clipboard_entries.id = ?1 AND clipboard_entries.kind = 'text'
+            LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.id = ?1 AND clipboard_entries.kind IN ('text', 'image')
             "#,
             [entry_id.get()],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
+            stored_clipboard_row_from_sql,
         );
         match result {
             Ok(stored) => clipboard_entry_from_stored(stored),
@@ -1106,6 +1126,13 @@ fn validate_clipboard_text(text: &str) -> Result<(), DatabaseError> {
     Ok(())
 }
 
+fn validate_clipboard_image(format: &str, data: &[u8]) -> Result<(), DatabaseError> {
+    if format.is_empty() || format.contains('\0') || data.is_empty() {
+        return Err(DatabaseError::InvalidClipboardImage);
+    }
+    Ok(())
+}
+
 fn clipboard_content_hash(kind: ClipboardEntryKind, bytes: &[u8]) -> Vec<u8> {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in kind
@@ -1120,24 +1147,72 @@ fn clipboard_content_hash(kind: ClipboardEntryKind, bytes: &[u8]) -> Vec<u8> {
     hash.to_be_bytes().to_vec()
 }
 
+type StoredClipboardRow = (
+    i64,
+    String,
+    i64,
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+);
+
+fn stored_clipboard_row_from_sql(
+    row: &rusqlite::Row<'_>,
+) -> Result<StoredClipboardRow, rusqlite::Error> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, i64>(2)?,
+        row.get::<_, i64>(3)?,
+        row.get::<_, Option<i64>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(6)?,
+        row.get::<_, Option<Vec<u8>>>(7)?,
+    ))
+}
+
 fn clipboard_entry_from_stored(
-    stored: (i64, String, i64, i64, Option<i64>, String),
+    stored: StoredClipboardRow,
 ) -> Result<ClipboardEntryView, DatabaseError> {
-    let (id, stored_kind, last_seen_at_ms, stored_copy_count, pinned_at_ms, text) = stored;
+    let (
+        id,
+        stored_kind,
+        last_seen_at_ms,
+        stored_copy_count,
+        pinned_at_ms,
+        text,
+        image_format,
+        image_data,
+    ) = stored;
+    let kind = ClipboardEntryKind::try_from_stored(&stored_kind)?;
     let copy_count = u32::try_from(stored_copy_count)
         .map_err(|_| DatabaseError::InvalidStoredClipboardCopyCount(stored_copy_count))?;
+    let content = match kind {
+        ClipboardEntryKind::Text => {
+            ClipboardEntryContent::Text(text.ok_or(DatabaseError::ClipboardEntryNotFound(id))?)
+        }
+        ClipboardEntryKind::Image => ClipboardEntryContent::Image {
+            format: image_format.ok_or(DatabaseError::InvalidClipboardImage)?,
+            data: image_data.ok_or(DatabaseError::InvalidClipboardImage)?,
+        },
+        ClipboardEntryKind::Files => {
+            return Err(DatabaseError::InvalidStoredClipboardKind(stored_kind));
+        }
+    };
     Ok(ClipboardEntryView {
         id: ClipboardEntryId(id),
-        kind: ClipboardEntryKind::try_from_stored(&stored_kind)?,
+        kind,
         last_seen_at_ms,
         copy_count,
         pinned_at_ms,
-        content: ClipboardEntryContent::Text(text),
+        content,
     })
 }
 
 fn clipboard_entries_from_stored(
-    stored: Vec<(i64, String, i64, i64, Option<i64>, String)>,
+    stored: Vec<StoredClipboardRow>,
     filter: &str,
     limit: usize,
 ) -> Result<Vec<ClipboardEntryView>, DatabaseError> {
@@ -1152,6 +1227,10 @@ fn clipboard_entries_from_stored(
             || match entry.content() {
                 ClipboardEntryContent::Text(text) => {
                     text.to_lowercase().contains(&normalized_filter)
+                }
+                ClipboardEntryContent::Image { format, .. } => {
+                    "image".contains(&normalized_filter)
+                        || format.to_lowercase().contains(&normalized_filter)
                 }
             };
         if matches_filter {

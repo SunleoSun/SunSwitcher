@@ -21,7 +21,7 @@ mod windows_probe {
     use sunswitcher::persistence::{Database, UndoHotkey};
     use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome};
     use sunswitcher::windows::{AutocompletePopupHandle, ClipboardTextListener};
-    use sunswitcher::windows::{ClipboardCommand, ClipboardManagerTab};
+    use sunswitcher::windows::{ClipboardCommand, ClipboardManagerTab, ObservableClipboardContent};
     use sunswitcher::windows::{
         InputProcessor, RuntimeDirective, UndoDirective, request_global_keyboard_hook_stop,
         run_global_keyboard_hook,
@@ -29,7 +29,8 @@ mod windows_probe {
     use windows_sys::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
     };
-
+    const MAX_CLIPBOARD_LEARNING_CHARS: usize = 4096;
+    const MAX_CLIPBOARD_LEARNING_LINES: usize = 128;
     pub fn run() {
         println!("SunSwitcher replacement probe");
         println!("Bilingual lexical provider: Russian + English, including wrong-layout typos.");
@@ -117,27 +118,50 @@ mod windows_probe {
                 .map_err(|error| error.to_string())?;
             let learning = runtime.learning();
             let clipboard_database_path = database_path.clone();
-            let clipboard_listener = ClipboardTextListener::start(move |text| {
-                let observed_at_ms = now_ms();
-                match Database::open(&clipboard_database_path) {
-                    Ok(database) => {
-                        if let Err(error) = database.record_clipboard_text(&text, observed_at_ms) {
-                            eprintln!("clipboard history skipped: {error}");
-                        }
-                        if let Ok(settings) = database.settings()
-                            && let Err(error) =
-                                database.prune_clipboard_history(settings.clipboard_history_limit())
-                        {
-                            eprintln!("clipboard history prune skipped: {error}");
-                        }
+            let clipboard_listener = ClipboardTextListener::start(move |content| {
+    let observed_at_ms = now_ms();
+    match Database::open(&clipboard_database_path) {
+        Ok(database) => {
+            match &content {
+                ObservableClipboardContent::Text(text) => {
+                    if let Err(error) = database.record_clipboard_text(text, observed_at_ms) {
+                        eprintln!("clipboard history skipped: {error}");
                     }
-                    Err(error) => eprintln!("clipboard history unavailable: {error}"),
                 }
-                if let Err(error) = learning.observe_text(text, observed_at_ms) {
-                    eprintln!("clipboard learning skipped: {error}");
+                ObservableClipboardContent::Image(image) => {
+                    if let Err(error) = database.record_clipboard_image(
+                        image.format(),
+                        image.data(),
+                        observed_at_ms,
+                    ) {
+                        eprintln!("clipboard image history skipped: {error}");
+                    }
                 }
-            })
-            .map_err(|error| format!("clipboard listener failed: {error:?}"))?;
+            }
+            if let Ok(settings) = database.settings()
+                && let Err(error) = database.prune_clipboard_history(settings.clipboard_history_limit())
+            {
+                eprintln!("clipboard history prune skipped: {error}");
+            }
+        }
+        Err(error) => eprintln!("clipboard history unavailable: {error}"),
+    }
+    if let ObservableClipboardContent::Text(text) = content {
+        if should_learn_clipboard_text(&text) {
+            if let Err(error) = learning.observe_text(text, observed_at_ms) {
+                eprintln!("clipboard learning skipped: {error}");
+            }
+        } else {
+            eprintln!(
+                "clipboard learning skipped for large text: bytes={} limit_chars={} limit_lines={}",
+                text.len(),
+                MAX_CLIPBOARD_LEARNING_CHARS,
+                MAX_CLIPBOARD_LEARNING_LINES
+            );
+        }
+    }
+})
+.map_err(|error| format!("clipboard listener failed: {error:?}"))?;
             let session = runtime.session();
             let completion = runtime.completion_session();
             let popup = AutocompletePopupHandle::start(database_path.clone())
@@ -169,6 +193,12 @@ mod windows_probe {
         }
     }
 
+    fn should_learn_clipboard_text(text: &str) -> bool {
+        text.chars().take(MAX_CLIPBOARD_LEARNING_CHARS + 1).count() <= MAX_CLIPBOARD_LEARNING_CHARS
+            && text.lines().take(MAX_CLIPBOARD_LEARNING_LINES + 1).count()
+                <= MAX_CLIPBOARD_LEARNING_LINES
+    }
+
     fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -185,7 +215,6 @@ mod windows_probe {
             let snapshot = self.runtime.snapshots().load().ok()?;
             switch_keyboard_layout_text(snapshot.languages(), text)
         }
-
         fn tracked_layout_switch_text(&self) -> Option<String> {
             let text = self.session.current_layout_switch_span();
             (!text.is_empty()).then(|| text.to_owned())
@@ -338,6 +367,33 @@ mod windows_probe {
                 eprintln!("adaptive completion word outcome skipped: {error}");
             }
             self.sync_popup();
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn clipboard_learning_guard_accepts_short_text_and_rejects_large_text() {
+            assert!(should_learn_clipboard_text("hello world"));
+
+            let exact_char_limit = "a".repeat(MAX_CLIPBOARD_LEARNING_CHARS);
+            assert!(should_learn_clipboard_text(&exact_char_limit));
+
+            let long_text = "a".repeat(MAX_CLIPBOARD_LEARNING_CHARS + 1);
+            assert!(!should_learn_clipboard_text(&long_text));
+
+            let exact_line_limit = (0..MAX_CLIPBOARD_LEARNING_LINES)
+                .map(|_| "x")
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(should_learn_clipboard_text(&exact_line_limit));
+
+            let many_lines = (0..=MAX_CLIPBOARD_LEARNING_LINES)
+                .map(|_| "x")
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!should_learn_clipboard_text(&many_lines));
         }
     }
 }

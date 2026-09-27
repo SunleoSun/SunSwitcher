@@ -1057,10 +1057,168 @@ fn canonical_sequence_word(text: &str) -> Option<String> {
     tokens.next().is_none().then_some(token)
 }
 
-fn extract_tokens(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|character: char| {
-        !(character.is_alphanumeric() || matches!(character, '_' | '-' | '\'' | '’'))
-    })
-    .map(|token| token.trim_matches(['-', '_', '\'', '’']))
-    .filter(|token| !token.is_empty())
+fn extract_tokens(text: &str) -> ExtractTokens<'_> {
+    if text.is_ascii() {
+        ExtractTokens::Ascii(AsciiExtractTokens { text, cursor: 0 })
+    } else {
+        ExtractTokens::Unicode(UnicodeExtractTokens { text, cursor: 0 })
+    }
+}
+
+enum ExtractTokens<'a> {
+    Ascii(AsciiExtractTokens<'a>),
+    Unicode(UnicodeExtractTokens<'a>),
+}
+
+impl<'a> Iterator for ExtractTokens<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Ascii(tokens) => tokens.next(),
+            Self::Unicode(tokens) => tokens.next(),
+        }
+    }
+}
+
+struct AsciiExtractTokens<'a> {
+    text: &'a str,
+    cursor: usize,
+}
+
+impl<'a> Iterator for AsciiExtractTokens<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.text.as_bytes();
+        while self.cursor < bytes.len() {
+            while self.cursor < bytes.len() && !is_ascii_token_byte(bytes[self.cursor]) {
+                self.cursor += 1;
+            }
+            if self.cursor == bytes.len() {
+                return None;
+            }
+
+            let mut start = self.cursor;
+            let mut end = start;
+            while end < bytes.len() && is_ascii_token_byte(bytes[end]) {
+                end += 1;
+            }
+            self.cursor = end;
+
+            while start < end && is_ascii_edge_trim_byte(bytes[start]) {
+                start += 1;
+            }
+            while end > start && is_ascii_edge_trim_byte(bytes[end - 1]) {
+                end -= 1;
+            }
+            if start < end {
+                return Some(&self.text[start..end]);
+            }
+        }
+        None
+    }
+}
+
+struct UnicodeExtractTokens<'a> {
+    text: &'a str,
+    cursor: usize,
+}
+
+impl<'a> Iterator for UnicodeExtractTokens<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.cursor < self.text.len() {
+            let Some(start) = find_next_token_start(self.text, self.cursor) else {
+                self.cursor = self.text.len();
+                return None;
+            };
+            let end = find_token_end(self.text, start);
+            self.cursor = end;
+            let token = self.text[start..end].trim_matches(is_edge_trim_character);
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+        None
+    }
+}
+
+fn find_next_token_start(text: &str, cursor: usize) -> Option<usize> {
+    text[cursor..]
+        .char_indices()
+        .find_map(|(offset, character)| is_token_character(character).then_some(cursor + offset))
+}
+
+fn find_token_end(text: &str, start: usize) -> usize {
+    text[start..]
+        .char_indices()
+        .find_map(|(offset, character)| (!is_token_character(character)).then_some(start + offset))
+        .unwrap_or(text.len())
+}
+
+fn is_token_character(character: char) -> bool {
+    character.is_alphanumeric() || is_edge_trim_character(character)
+}
+
+fn is_edge_trim_character(character: char) -> bool {
+    matches!(character, '_' | '-' | '\'' | '’')
+}
+
+fn is_ascii_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || is_ascii_edge_trim_byte(byte)
+}
+
+fn is_ascii_edge_trim_byte(byte: u8) -> bool {
+    matches!(byte, b'_' | b'-' | b'\'')
+}
+
+#[cfg(test)]
+mod token_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_token_extraction_trims_edges_without_allocating_tokens() {
+        let tokens = extract_tokens("--alpha _beta_ can't x---y ___ ''").collect::<Vec<_>>();
+
+        assert_eq!(tokens, vec!["alpha", "beta", "can't", "x---y"]);
+    }
+
+    #[test]
+    fn unicode_token_extraction_matches_supported_word_punctuation() {
+        let tokens = extract_tokens("--привет’s_тест!! hello-мир — '’").collect::<Vec<_>>();
+
+        assert_eq!(tokens, vec!["привет’s_тест", "hello-мир"]);
+    }
+
+    #[test]
+    fn optimized_token_extraction_matches_reference_semantics_for_edge_cases() {
+        for text in [
+            "hello,world",
+            "--alpha _beta_ can't x---y ___ ''",
+            "foo_bar end- 'quote'",
+            "123 45_67 --89--",
+            "emoji🙂word mixed\r\nlines",
+            "--привет’s_тест!! hello-мир — '’",
+            "русский English123 __edge__",
+            "\t spaced\nwords\r\nnext",
+        ] {
+            let optimized = extract_tokens(text).collect::<Vec<_>>();
+            let reference = reference_extract_tokens(text);
+            assert_eq!(
+                optimized, reference,
+                "token extraction changed for {text:?}"
+            );
+        }
+    }
+
+    fn reference_extract_tokens(text: &str) -> Vec<&str> {
+        text.split(|character: char| {
+            !(character.is_alphanumeric() || matches!(character, '_' | '-' | '\'' | '’'))
+        })
+        .map(|token| token.trim_matches(['-', '_', '\'', '’']))
+        .filter(|token| !token.is_empty())
+        .collect()
+    }
 }

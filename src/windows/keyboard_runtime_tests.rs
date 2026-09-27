@@ -1,8 +1,9 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_KEYBOARD, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_ADD, VK_BACK,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LSHIFT, VK_MENU,
-    VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SUBTRACT, VK_TAB, VK_UP,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU,
+    VK_LSHIFT, VK_MENU, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
+    VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -20,9 +21,10 @@ use super::keyboard_runtime::{
     foreground_change_requires_invalidation, injected_marker, input_ownership_matches,
     is_foreign_injected_keyboard_event, is_physical_keyboard_event, is_shift_modifier_key,
     is_toggle_key, keyup_suppression_after_injection, mouse_message_invalidates_tracking,
-    pause_hotkey_action, physical_key_from_vk, preclassify_key_down,
-    selection_capture_intent_for_navigation, undo_hotkey_matches, undo_outcome_after_injection,
-    update_keyboard_state,
+    pause_hotkey_action, physical_key_from_vk, preclassify_key_down, refresh_modifier_state_from,
+    selection_capture_intent_for_navigation,
+    should_refresh_modifier_state_before_key_classification, undo_hotkey_matches,
+    undo_outcome_after_injection, update_keyboard_state,
 };
 use super::selected_text_runtime::SelectionCaptureIntent;
 use crate::completion::CompletionCommand;
@@ -271,6 +273,48 @@ fn foreign_injected_keyboard_events_fail_closed_but_owned_injection_does_not() {
 }
 
 #[test]
+fn stale_generic_modifier_state_is_reconciled_from_physical_state() {
+    let mut state = [0u8; 256];
+    update_keyboard_state(&mut state, VK_CONTROL as u32, true);
+    assert_ne!(state[VK_CONTROL as usize] & 0x80, 0);
+
+    refresh_modifier_state_from(&mut state, |_| false);
+    assert_eq!(state[VK_LCONTROL as usize] & 0x80, 0);
+    assert_eq!(state[VK_RCONTROL as usize] & 0x80, 0);
+    assert_eq!(state[VK_CONTROL as usize] & 0x80, 0);
+}
+
+#[test]
+fn right_physical_modifier_reconciliation_updates_generic_state() {
+    let mut state = [0u8; 256];
+    refresh_modifier_state_from(&mut state, |vk_code| vk_code == VK_RCONTROL);
+    assert_eq!(state[VK_LCONTROL as usize] & 0x80, 0);
+    assert_ne!(state[VK_RCONTROL as usize] & 0x80, 0);
+    assert_ne!(state[VK_CONTROL as usize] & 0x80, 0);
+
+    refresh_modifier_state_from(&mut state, |vk_code| {
+        matches!(vk_code, VK_RSHIFT | VK_LMENU | VK_RWIN)
+    });
+    assert_eq!(state[VK_CONTROL as usize] & 0x80, 0);
+    assert_ne!(state[VK_SHIFT as usize] & 0x80, 0);
+    assert_ne!(state[VK_MENU as usize] & 0x80, 0);
+    assert_ne!(state[VK_RWIN as usize] & 0x80, 0);
+}
+
+#[test]
+fn generic_physical_alt_reconciliation_preserves_alt_right_completion_command() {
+    let mut state = [0u8; 256];
+    refresh_modifier_state_from(&mut state, |vk_code| vk_code == VK_MENU);
+    assert_ne!(state[VK_MENU as usize] & 0x80, 0);
+    assert_ne!(state[VK_LMENU as usize] & 0x80, 0);
+    assert_eq!(state[VK_RMENU as usize] & 0x80, 0);
+    assert_eq!(
+        completion_hotkey_command(VK_RIGHT as u32, &state),
+        Some(CompletionCommand::AcceptNextWord)
+    );
+}
+
+#[test]
 fn pause_undo_hotkey_requires_an_unmodified_keypress() {
     let mut state = [0u8; 256];
     assert!(undo_hotkey_matches(
@@ -322,9 +366,50 @@ fn clipboard_manager_hotkey_mapping_uses_ctrl_shift_numpad_plus_minus() {
         Some(ClipboardCommand::OpenPinned)
     );
     assert_eq!(clipboard_hotkey_command(VK_RIGHT as u32, &state), None);
+    assert_eq!(
+        clipboard_hotkey_command(VK_OEM_PLUS as u32, &state),
+        Some(ClipboardCommand::OpenPinned)
+    );
+    assert_eq!(
+        clipboard_hotkey_command(VK_OEM_MINUS as u32, &state),
+        Some(ClipboardCommand::OpenCurrent)
+    );
     state[VK_MENU as usize] = 0x80;
     assert_eq!(clipboard_hotkey_command(VK_ADD as u32, &state), None);
+
+    let mut stale_modifier_state = [0u8; 256];
+    update_keyboard_state(&mut stale_modifier_state, VK_CONTROL as u32, true);
+    update_keyboard_state(&mut stale_modifier_state, VK_SHIFT as u32, true);
+    assert!(should_refresh_modifier_state_before_key_classification(
+        VK_ADD as u32,
+        &stale_modifier_state,
+    ));
+    assert!(should_refresh_modifier_state_before_key_classification(
+        VK_OEM_MINUS as u32,
+        &stale_modifier_state,
+    ));
 }
+
+#[test]
+fn stale_ctrl_shift_after_clipboard_hotkey_does_not_steal_plain_plus_minus() {
+    let mut state = [0u8; 256];
+    update_keyboard_state(&mut state, VK_CONTROL as u32, true);
+    update_keyboard_state(&mut state, VK_SHIFT as u32, true);
+    assert_eq!(
+        clipboard_hotkey_command(VK_ADD as u32, &state),
+        Some(ClipboardCommand::OpenPinned)
+    );
+
+    refresh_modifier_state_from(&mut state, |_| false);
+
+    assert_eq!(clipboard_hotkey_command(VK_ADD as u32, &state), None);
+    assert_eq!(clipboard_hotkey_command(VK_OEM_PLUS as u32, &state), None);
+    assert_eq!(clipboard_hotkey_command(VK_SUBTRACT as u32, &state), None);
+    assert_eq!(clipboard_hotkey_command(VK_OEM_MINUS as u32, &state), None);
+    assert_eq!(state[VK_CONTROL as usize] & 0x80, 0);
+    assert_eq!(state[VK_SHIFT as usize] & 0x80, 0);
+}
+
 #[test]
 fn completion_hotkeys_require_exact_default_modifier_contract() {
     let mut state = [0u8; 256];
@@ -359,6 +444,30 @@ fn completion_hotkeys_require_exact_default_modifier_contract() {
     update_keyboard_state(&mut state, VK_MENU as u32, false);
     update_keyboard_state(&mut state, VK_CONTROL as u32, true);
     assert_eq!(completion_hotkey_command(VK_RETURN as u32, &state), None);
+    let mut stale_ctrl_state = [0u8; 256];
+    update_keyboard_state(&mut stale_ctrl_state, VK_CONTROL as u32, true);
+    assert!(should_refresh_modifier_state_before_key_classification(
+        b'A' as u32,
+        &stale_ctrl_state
+    ));
+    assert!(should_refresh_modifier_state_before_key_classification(
+        VK_TAB as u32,
+        &stale_ctrl_state
+    ));
+}
+
+#[test]
+fn modifier_refresh_is_deferred_for_alt_right_completion_hotkey() {
+    let mut state = [0u8; 256];
+    update_keyboard_state(&mut state, VK_MENU as u32, true);
+    assert_eq!(
+        completion_hotkey_command(VK_RIGHT as u32, &state),
+        Some(CompletionCommand::AcceptNextWord)
+    );
+    assert!(!should_refresh_modifier_state_before_key_classification(
+        VK_RIGHT as u32,
+        &state
+    ));
 }
 
 #[test]

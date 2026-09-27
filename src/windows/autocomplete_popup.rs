@@ -1,22 +1,28 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::{env, path::PathBuf};
 
-use eframe::egui::{self, ViewportBuilder, ViewportCommand, pos2, vec2};
+use eframe::egui::{self, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2};
 
-use super::caret_locator::{CaretAnchor, CaretLocator, popup_placement};
+use super::caret_locator::{CaretAnchor, CaretLocator, CaretSource, popup_placement};
 use super::clipboard_manager::{
     ClipboardManagerApp, ClipboardManagerHandle, ClipboardManagerState, ClipboardManagerTab,
 };
 use super::tray_icon::TrayIcon;
 
 const POPUP_WIDTH: f32 = 360.0;
+const MAX_POPUP_SUGGESTIONS: usize = 8;
 const ROW_HEIGHT: f32 = 24.0;
 const POPUP_PADDING: f32 = 12.0;
 const CARET_GAP: f32 = 6.0;
 const PARKED_POSITION: f32 = -32_000.0;
+const SUGGESTION_BG: egui::Color32 = egui::Color32::from_rgb(30, 32, 38);
+const SUGGESTION_SELECTED: egui::Color32 = egui::Color32::from_rgb(77, 63, 28);
+const SUGGESTION_TEXT: egui::Color32 = egui::Color32::from_rgb(244, 242, 226);
+const SUGGESTION_BORDER: egui::Color32 = egui::Color32::from_rgb(104, 84, 32);
+const CLIPBOARD_ICON_PATH: &str = "assets/icon.png";
 
 fn install_system_font(ctx: &egui::Context) -> std::io::Result<()> {
     let windows_dir = std::env::var_os("WINDIR")
@@ -49,25 +55,86 @@ fn install_system_font(ctx: &egui::Context) -> std::io::Result<()> {
     ))
 }
 
+fn window_icon_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(current_dir) = env::current_dir() {
+        paths.push(current_dir.join(CLIPBOARD_ICON_PATH));
+    }
+    if let Ok(executable) = env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        paths.push(directory.join(CLIPBOARD_ICON_PATH));
+    }
+    paths
+}
+
+fn load_window_icon() -> Option<Arc<egui::IconData>> {
+    for path in window_icon_candidates() {
+        let Ok(reader) = image::ImageReader::open(path) else {
+            continue;
+        };
+        let Ok(decoded) = reader.decode() else {
+            continue;
+        };
+        let rgba = decoded.to_rgba8();
+        let width = rgba.width();
+        let height = rgba.height();
+        return Some(Arc::new(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        }));
+    }
+    None
+}
+
+fn suggestion_viewport_id() -> ViewportId {
+    ViewportId::from_hash_of("sunswitcher_suggestions_child")
+}
+
+fn render_suggestion_rows(ui: &mut egui::Ui, state: &PopupState) {
+    let bounds = ui.max_rect();
+    ui.painter().rect_filled(bounds, 6.0, SUGGESTION_BG);
+    ui.painter().rect_stroke(
+        bounds.shrink(0.5),
+        6.0,
+        egui::Stroke::new(1.0, SUGGESTION_BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let row_width = POPUP_WIDTH - POPUP_PADDING * 2.0;
+    let origin = bounds.left_top() + vec2(POPUP_PADDING, POPUP_PADDING);
+    for (index, suggestion) in state
+        .suggestions
+        .iter()
+        .take(MAX_POPUP_SUGGESTIONS)
+        .enumerate()
+    {
+        let row = egui::Rect::from_min_size(
+            origin + vec2(0.0, ROW_HEIGHT * index as f32),
+            vec2(row_width, ROW_HEIGHT),
+        );
+        if index == state.selected {
+            ui.painter().rect_filled(row, 4.0, SUGGESTION_SELECTED);
+            ui.painter().line_segment(
+                [row.left_top(), row.left_bottom()],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(226, 184, 63)),
+            );
+        }
+        ui.painter().text(
+            row.left_center() + vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            suggestion,
+            egui::FontId::proportional(15.0),
+            SUGGESTION_TEXT,
+        );
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PopupState {
     suggestions: Vec<String>,
     selected: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PopupLayout {
-    position: egui::Pos2,
-    size: egui::Vec2,
-}
-
-impl PopupLayout {
-    fn approximately_matches(self, other: Self) -> bool {
-        (self.position.x - other.position.x).abs() < 0.5
-            && (self.position.y - other.position.y).abs() < 0.5
-            && (self.size.x - other.size.x).abs() < 0.5
-            && (self.size.y - other.size.y).abs() < 0.5
-    }
 }
 
 pub struct AutocompletePopupHandle {
@@ -100,23 +167,27 @@ impl AutocompletePopupHandle {
         let worker_shutdown = Arc::clone(&shutdown);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
+            let mut viewport = ViewportBuilder::default()
+                .with_title("SunSwitcher UI")
+                .with_inner_size(vec2(1.0, 1.0))
+                .with_position(pos2(PARKED_POSITION, PARKED_POSITION))
+                .with_resizable(false)
+                .with_decorations(false)
+                .with_taskbar(false)
+                .with_active(false)
+                .with_visible(true)
+                .with_always_on_top()
+                .with_mouse_passthrough(false)
+                .with_transparent(false);
+            if let Some(icon) = load_window_icon() {
+                viewport = viewport.with_icon(icon);
+            }
             let options = eframe::NativeOptions {
                 event_loop_builder: Some(Box::new(|builder| {
                     use winit::platform::windows::EventLoopBuilderExtWindows as _;
                     builder.with_any_thread(true);
                 })),
-                viewport: ViewportBuilder::default()
-                    .with_title("SunSwitcher UI")
-                    .with_inner_size(vec2(1.0, 1.0))
-                    .with_position(pos2(PARKED_POSITION, PARKED_POSITION))
-                    .with_resizable(false)
-                    .with_decorations(false)
-                    .with_taskbar(false)
-                    .with_active(false)
-                    .with_visible(false)
-                    .with_always_on_top()
-                    .with_mouse_passthrough(false)
-                    .with_transparent(false),
+                viewport,
                 ..Default::default()
             };
 
@@ -135,7 +206,6 @@ impl AutocompletePopupHandle {
                         locator: CaretLocator::new(),
                         fallback_anchor: None,
                         shown: false,
-                        last_layout: None,
                     }))
                 }),
             );
@@ -147,7 +217,11 @@ impl AutocompletePopupHandle {
         match ready_receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(repaint_ctx)) => {
                 let clipboard = ClipboardManagerHandle::new(clipboard_state, repaint_ctx.clone());
-                let tray = TrayIcon::start(clipboard.clone());
+                let tray = TrayIcon::start(
+                    clipboard.clone(),
+                    Arc::clone(&shutdown),
+                    repaint_ctx.clone(),
+                );
                 Ok(Self {
                     state,
                     clipboard,
@@ -171,6 +245,7 @@ impl AutocompletePopupHandle {
     pub fn update<'a>(&self, suggestions: impl IntoIterator<Item = &'a str>, selected: usize) {
         let suggestions = suggestions
             .into_iter()
+            .take(MAX_POPUP_SUGGESTIONS)
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let next = PopupState {
@@ -180,6 +255,8 @@ impl AutocompletePopupHandle {
         let changed = replace_popup_state(&self.state, next);
         if changed {
             self.repaint_ctx.request_repaint();
+            self.repaint_ctx
+                .request_repaint_of(suggestion_viewport_id());
         }
     }
 
@@ -187,6 +264,8 @@ impl AutocompletePopupHandle {
         let changed = replace_popup_state(&self.state, PopupState::default());
         if changed {
             self.repaint_ctx.request_repaint();
+            self.repaint_ctx
+                .request_repaint_of(suggestion_viewport_id());
         }
     }
 
@@ -212,39 +291,86 @@ struct AutocompletePopupApp {
     locator: CaretLocator,
     fallback_anchor: Option<CaretAnchor>,
     shown: bool,
-    last_layout: Option<PopupLayout>,
+}
+
+fn park_root_viewport(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+    ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
+    ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(1.0, 1.0)));
+    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(
+        PARKED_POSITION,
+        PARKED_POSITION,
+    )));
+    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+}
+
+fn root_viewport_anchor(ctx: &egui::Context) -> Option<CaretAnchor> {
+    ctx.input(|input| {
+        let viewport = input.viewport();
+        let root = viewport.outer_rect.or(viewport.inner_rect)?;
+        let x = root.left() + POPUP_PADDING;
+        let y = (root.bottom() - POPUP_PADDING - ROW_HEIGHT).max(root.top() + POPUP_PADDING);
+        Some(CaretAnchor::new(
+            x,
+            y,
+            ROW_HEIGHT,
+            CaretSource::ForegroundWindowFallback,
+        ))
+    })
 }
 
 impl AutocompletePopupApp {
-    fn hide_popup(&mut self, ctx: &egui::Context) {
-        self.fallback_anchor = None;
-        self.last_layout = None;
-        if self.shown {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            self.shown = false;
+    fn show_suggestion_viewport(&mut self, ctx: &egui::Context, prefer_root_anchor: bool) {
+        let state = self
+            .state
+            .read()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        if state.suggestions.is_empty() {
+            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
+            return;
         }
-    }
 
-    fn prepare_popup_viewport(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(ViewportCommand::Title("SunSwitcher suggestions".to_owned()));
-        ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
-        ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
-    }
+        let anchor = if prefer_root_anchor {
+            root_viewport_anchor(ctx).or_else(|| self.locator.fallback_anchor())
+        } else if let Some(anchor) = self.locator.locate() {
+            self.fallback_anchor = None;
+            Some(anchor)
+        } else {
+            if self.fallback_anchor.is_none() {
+                self.fallback_anchor = self.locator.fallback_anchor();
+            }
+            self.fallback_anchor
+        };
+        let Some(anchor) = anchor else {
+            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
+            return;
+        };
 
-    fn apply_layout(&mut self, ctx: &egui::Context, layout: PopupLayout) {
-        let layout_changed = self
-            .last_layout
-            .is_none_or(|previous| !previous.approximately_matches(layout));
-        if !self.shown || layout_changed {
-            self.prepare_popup_viewport(ctx);
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(layout.size));
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(layout.position));
-            self.last_layout = Some(layout);
-        }
-        if !self.shown {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-            self.shown = true;
-        }
+        let visible_rows = state.suggestions.len().min(MAX_POPUP_SUGGESTIONS);
+        let popup_height = POPUP_PADDING * 2.0 + ROW_HEIGHT * visible_rows as f32;
+        let placement = popup_placement(anchor, POPUP_WIDTH, popup_height, CARET_GAP);
+        let state_handle = Arc::clone(&self.state);
+        let viewport = ViewportBuilder::default()
+            .with_title("SunSwitcher suggestions")
+            .with_inner_size(vec2(POPUP_WIDTH, popup_height))
+            .with_position(pos2(placement.x, placement.y))
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(false)
+            .with_visible(true)
+            .with_transparent(false);
+        ctx.show_viewport_deferred(suggestion_viewport_id(), viewport, move |ui, _class| {
+            let state = state_handle
+                .read()
+                .map(|state| state.clone())
+                .unwrap_or_default();
+            if !state.suggestions.is_empty() {
+                render_suggestion_rows(ui, &state);
+            }
+        });
     }
 }
 
@@ -257,44 +383,26 @@ impl eframe::App for AutocompletePopupApp {
 
         if self.clipboard.logic(ctx) {
             self.fallback_anchor = None;
-            self.last_layout = None;
             self.shown = false;
+            self.show_suggestion_viewport(ctx, true);
             return;
         }
 
-        let state = self
+        let has_suggestions = self
             .state
             .read()
-            .map(|state| state.clone())
-            .unwrap_or_default();
-        if state.suggestions.is_empty() {
-            self.hide_popup(ctx);
+            .is_ok_and(|state| !state.suggestions.is_empty());
+        if !has_suggestions {
+            self.fallback_anchor = None;
+            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
             return;
         }
 
-        let anchor = if let Some(anchor) = self.locator.locate() {
-            self.fallback_anchor = None;
-            anchor
-        } else {
-            if self.fallback_anchor.is_none() {
-                self.fallback_anchor = self.locator.fallback_anchor();
-            }
-            let Some(anchor) = self.fallback_anchor else {
-                self.hide_popup(ctx);
-                return;
-            };
-            anchor
-        };
-
-        let popup_height = POPUP_PADDING * 2.0 + ROW_HEIGHT * state.suggestions.len() as f32;
-        let placement = popup_placement(anchor, POPUP_WIDTH, popup_height, CARET_GAP);
-        self.apply_layout(
-            ctx,
-            PopupLayout {
-                position: pos2(placement.x, placement.y),
-                size: vec2(POPUP_WIDTH, popup_height),
-            },
-        );
+        if !self.shown {
+            park_root_viewport(ctx);
+            self.shown = true;
+        }
+        self.show_suggestion_viewport(ctx, false);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -302,46 +410,17 @@ impl eframe::App for AutocompletePopupApp {
             return;
         }
         if self.clipboard.ui(ui) {
-            return;
-        }
-
-        let state = self
-            .state
-            .read()
-            .map(|state| state.clone())
-            .unwrap_or_default();
-        if state.suggestions.is_empty() {
-            return;
-        }
-
-        let bounds = ui.max_rect();
-        ui.painter()
-            .rect_filled(bounds, 6.0, egui::Color32::from_rgb(30, 30, 30));
-
-        let row_width = POPUP_WIDTH - POPUP_PADDING * 2.0;
-        let origin = bounds.left_top() + vec2(POPUP_PADDING, POPUP_PADDING);
-        for (index, suggestion) in state.suggestions.iter().enumerate() {
-            let row = egui::Rect::from_min_size(
-                origin + vec2(0.0, ROW_HEIGHT * index as f32),
-                vec2(row_width, ROW_HEIGHT),
-            );
-            if index == state.selected {
-                ui.painter()
-                    .rect_filled(row, 4.0, egui::Color32::from_rgb(62, 76, 96));
-            }
-            ui.painter().text(
-                row.left_center() + vec2(8.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                suggestion,
-                egui::FontId::proportional(15.0),
-                egui::Color32::WHITE,
-            );
+            self.show_suggestion_viewport(ui.ctx(), true);
         }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let channel = 30.0 / 255.0;
-        [channel, channel, channel, 1.0]
+        [
+            f32::from(SUGGESTION_BG.r()) / 255.0,
+            f32::from(SUGGESTION_BG.g()) / 255.0,
+            f32::from(SUGGESTION_BG.b()) / 255.0,
+            1.0,
+        ]
     }
 }
 
