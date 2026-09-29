@@ -148,7 +148,14 @@ impl KeyboardLayoutMap {
             let mapped = if let Some(mapped) = self.map.get(&character).copied() {
                 mapped
             } else if let Some(base_target) = self.physical_map.get(&physical_key).copied() {
-                if physical_key.is_shifted_symbol(character) && base_target.is_alphabetic() {
+                if physical_key.shifted_symbol().is_some()
+                    && !physical_key.is_shifted_symbol(character)
+                {
+                    if character.is_alphabetic() {
+                        return None;
+                    }
+                    character
+                } else if base_target.is_alphabetic() {
                     single_uppercase(base_target).unwrap_or(base_target)
                 } else {
                     base_target
@@ -524,6 +531,21 @@ mod tests {
             Some("привет 123! привет")
         );
         assert_eq!(map.transform_text("ghbdtn x"), None);
+    }
+
+    #[test]
+    fn unshifted_digit_seven_is_not_reinterpreted_as_shifted_layout_punctuation() {
+        let map = KeyboardLayoutMap::from_aligned("&a", "?ф", 0.15).unwrap();
+        assert_eq!(
+            map.transform_with_physical("a7", &[PhysicalKey::Other, PhysicalKey::Digit7])
+                .as_deref(),
+            Some("ф7")
+        );
+        assert_eq!(
+            map.transform_with_physical("a&", &[PhysicalKey::Other, PhysicalKey::Digit7])
+                .as_deref(),
+            Some("ф?")
+        );
     }
 
     #[test]

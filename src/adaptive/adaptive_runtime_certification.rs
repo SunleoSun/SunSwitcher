@@ -336,6 +336,33 @@ fn certification_copied_plain_word_becomes_a_typo_target_after_text_observation(
 }
 
 #[test]
+fn certification_repeated_copied_user_word_preserves_per_occurrence_usage() {
+    let database = Database::open_in_memory().unwrap();
+    database
+        .record_user_word("QuantileEntryStrategy", 10)
+        .unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+
+    runtime
+        .learning()
+        .observe_text("QuantileEntryStrategy QuantileEntryStrategy", 100)
+        .unwrap();
+    runtime.flush().unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert_eq!(
+        snapshot
+            .user_lexicon()
+            .exact("quantileentrystrategy")
+            .unwrap()
+            .use_count(),
+        3,
+        "each kept clipboard occurrence must advance the canonical user-word usage count"
+    );
+}
+
+#[test]
 fn certification_copied_text_uses_words_learned_earlier_in_the_same_payload() {
     let runtime = AdaptiveLexicalRuntime::start(
         Database::open_in_memory().unwrap(),
@@ -579,6 +606,13 @@ fn certification_live_completion_activates_at_three_characters_and_uses_sequence
             .process_event(InputEvent::character(character), 320)
             .unwrap();
     }
+    assert!(completion.is_active());
+    assert!(
+        completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "сделать проект")
+    );
     for character in "сде".chars() {
         completion
             .process_event(InputEvent::character(character), 330)
@@ -592,6 +626,205 @@ fn certification_live_completion_activates_at_three_characters_and_uses_sequence
             .iter()
             .any(|candidate| candidate.text() == "сделать проект")
     );
+}
+
+#[test]
+fn certification_layout_switch_refreshes_completion_context() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    runtime.learning().observe_text("привет мир", 100).unwrap();
+    runtime.flush().unwrap();
+
+    let mut completion = runtime.completion_session();
+    for character in "ghbdtn ".chars() {
+        completion
+            .process_event(InputEvent::character(character), 200)
+            .unwrap();
+    }
+    assert!(
+        !completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "мир")
+    );
+
+    completion.layout_switch_applied("привет", 250).unwrap();
+    assert!(completion.is_active());
+    assert!(
+        completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "мир")
+    );
+}
+
+#[test]
+fn certification_layout_switch_replaces_an_active_completion_prefix() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut completion = runtime.completion_session();
+    for character in "ghbd".chars() {
+        completion
+            .process_event(InputEvent::character(character), 200)
+            .unwrap();
+    }
+
+    completion.layout_switch_applied("прив", 250).unwrap();
+    assert!(
+        completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "привет"),
+        "a switch of the currently typed word must refresh from the replacement prefix"
+    );
+}
+
+#[test]
+fn certification_automatic_correction_refreshes_completion_context() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    runtime.learning().observe_text("hello world", 100).unwrap();
+    runtime.flush().unwrap();
+
+    let mut correction = runtime.session();
+    let mut completion = runtime.completion_session();
+    for character in "руддщ".chars() {
+        let event = InputEvent::character(character);
+        completion.process_event(event, 200).unwrap();
+        assert_eq!(
+            correction.process(event, 200).unwrap(),
+            AdaptiveCorrectionDirective::Pass
+        );
+    }
+
+    let boundary = InputEvent::character(' ');
+    completion.process_event(boundary, 201).unwrap();
+    let AdaptiveCorrectionDirective::Replace(action) = correction.process(boundary, 201).unwrap()
+    else {
+        panic!("wrong-layout hello must be corrected before completion refresh");
+    };
+    assert_eq!(action.replacement().as_str(), "hello");
+    assert!(
+        !completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "world")
+    );
+
+    correction
+        .replacement_outcome(ReplacementOutcome::Applied)
+        .unwrap();
+    let canonical = correction
+        .take_resolved_completion_word()
+        .expect("applied correction must expose a canonical completion word");
+    completion.layout_switch_applied(&canonical, 202).unwrap();
+    assert!(completion.is_active());
+    assert!(
+        completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "world")
+    );
+}
+
+#[test]
+fn certification_non_space_correction_does_not_reopen_sequence_context() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    runtime.learning().observe_text("hello world", 100).unwrap();
+    runtime.flush().unwrap();
+
+    let mut correction = runtime.session();
+    let mut completion = runtime.completion_session();
+    for character in "руддщ".chars() {
+        let event = InputEvent::character(character);
+        completion.process_event(event, 200).unwrap();
+        assert_eq!(
+            correction.process(event, 200).unwrap(),
+            AdaptiveCorrectionDirective::Pass
+        );
+    }
+
+    let boundary = InputEvent::character('.');
+    completion.process_event(boundary, 201).unwrap();
+    let AdaptiveCorrectionDirective::Replace(action) = correction.process(boundary, 201).unwrap()
+    else {
+        panic!("wrong-layout hello before punctuation must be corrected");
+    };
+    assert_eq!(action.replacement().as_str(), "hello");
+    correction
+        .replacement_outcome(ReplacementOutcome::Applied)
+        .unwrap();
+    let canonical = correction
+        .take_resolved_completion_word()
+        .expect("applied correction must expose canonical completion word");
+    completion.layout_switch_applied(&canonical, 202).unwrap();
+    assert!(
+        !completion
+            .suggestions()
+            .iter()
+            .any(|candidate| candidate.text() == "world"),
+        "punctuation must keep sequence context cleared after correction"
+    );
+}
+
+#[test]
+fn certification_live_prefix_reverse_switch_uses_hysteresis_state() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    runtime.learning().observe_text("data", 100).unwrap();
+    runtime.flush().unwrap();
+
+    let mut session = runtime.live_session();
+    let mut directive = AdaptiveCorrectionDirective::Pass;
+    for character in "dhtv".chars() {
+        directive = session
+            .process(InputEvent::character(character), 200)
+            .unwrap();
+    }
+    let AdaptiveCorrectionDirective::ReplaceLivePrefix(action) = directive else {
+        panic!("obvious wrong-layout English prefix must switch to Russian live prefix");
+    };
+    assert_eq!(action.replacement().as_str(), "врем");
+    assert_eq!(action.target_language().unwrap().as_str(), "ru");
+    session
+        .live_prefix_replacement_outcome(ReplacementOutcome::Applied)
+        .unwrap();
+    assert_eq!(session.take_resolved_live_prefix().as_deref(), Some("врем"));
+
+    for _ in 0.."врем".chars().count() {
+        assert_eq!(
+            session.process(InputEvent::Backspace, 250).unwrap(),
+            AdaptiveCorrectionDirective::Pass
+        );
+    }
+
+    let mut reverse = AdaptiveCorrectionDirective::Pass;
+    for character in "вфеф".chars() {
+        reverse = session
+            .process(InputEvent::character(character), 300)
+            .unwrap();
+    }
+    let AdaptiveCorrectionDirective::ReplaceLivePrefix(action) = reverse else {
+        panic!("strong opposite evidence must reverse an active live-prefix layout switch");
+    };
+    assert_eq!(action.replacement().as_str(), "data");
+    assert_eq!(action.target_language().unwrap().as_str(), "en");
 }
 
 #[test]

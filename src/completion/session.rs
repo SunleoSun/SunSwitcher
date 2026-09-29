@@ -138,23 +138,32 @@ impl CompletionSession {
         }
     }
 
+    pub fn replace_current_prefix_for_live_layout(&mut self, replacement: &str) {
+        self.pending_word_acceptance = None;
+        self.protected_continuation = None;
+        self.continuation_mode = false;
+        self.input
+            .replace_current_token_for_live_prefix(replacement);
+    }
+
     pub fn refresh(&mut self, provider: &CompletionProvider, now_ms: i64) {
         let prefix = self.input.current_token();
         let prefix_chars = prefix.chars().count();
-        if prefix_chars < self.minimum_prefix_chars && !self.continuation_mode {
+        let context_refs = self.context.iter().map(String::as_str).collect::<Vec<_>>();
+        let has_context = !context_refs.is_empty();
+        if prefix_chars < self.minimum_prefix_chars && !self.continuation_mode && !has_context {
             self.dismiss();
             return;
         }
 
         let normalized_prefix = normalize_word(prefix);
-        if normalized_prefix.is_empty() && !self.continuation_mode {
+        if normalized_prefix.is_empty() && !self.continuation_mode && !has_context {
             self.dismiss();
             return;
         }
 
         let mut suggestions = Vec::new();
         let mut seen = HashSet::new();
-        let context_refs = self.context.iter().map(String::as_str).collect::<Vec<_>>();
         // While a previously visible continuation is protected, do not let the normal UI limit
         // hide a valid extension behind higher-ranked incompatible branches. SequenceHistory
         // already scans/sorts all matching rows before truncation, so this only defers truncation.
@@ -355,6 +364,10 @@ impl CompletionSession {
 
     pub fn current_prefix(&self) -> &str {
         self.input.current_token()
+    }
+
+    pub fn context_tokens(&self) -> &[String] {
+        &self.context
     }
 
     pub fn is_active(&self) -> bool {

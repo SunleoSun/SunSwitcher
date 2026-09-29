@@ -147,6 +147,7 @@ fn explicit_layout_switch_replacement_remains_owned_without_becoming_a_correctio
 #[test]
 fn physical_key_recognizes_base_and_shifted_oem_symbols() {
     for (character, expected) in [
+        ('&', PhysicalKey::Digit7),
         ('`', PhysicalKey::Grave),
         ('~', PhysicalKey::Grave),
         ('[', PhysicalKey::LeftBracket),

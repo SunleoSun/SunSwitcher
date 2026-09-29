@@ -38,6 +38,7 @@ fn certification_common_unambiguous_boundaries_complete_exactly_the_owned_token(
 #[test]
 fn certification_all_layout_ambiguous_oem_keys_can_remain_in_a_potential_token() {
     let cases = [
+        ('&', PhysicalKey::Digit7),
         ('`', PhysicalKey::Grave),
         ('[', PhysicalKey::LeftBracket),
         (']', PhysicalKey::RightBracket),

@@ -10,7 +10,7 @@ use crate::language::{
 };
 use crate::lexicon::{UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 const SCHEMA_V1: &str = r#"
 CREATE TABLE app_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -206,21 +206,21 @@ CREATE TABLE text_history (
 ) STRICT;
 
 CREATE TABLE clipboard_entries (
-    id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('text', 'image', 'files')),
-    last_seen_at_ms INTEGER NOT NULL,
-    content_hash BLOB NOT NULL,
-    copy_count INTEGER NOT NULL DEFAULT 1 CHECK (copy_count > 0),
-    pinned_at_ms INTEGER,
-    UNIQUE (kind, content_hash)
+id INTEGER PRIMARY KEY,
+kind TEXT NOT NULL CHECK (kind IN ('text', 'image', 'files')),
+last_seen_at_ms INTEGER NOT NULL,
+content_hash BLOB NOT NULL,
+copy_count INTEGER NOT NULL DEFAULT 1 CHECK (copy_count > 0),
+pinned_at_ms INTEGER,
+UNIQUE (kind, content_hash)
 ) STRICT;
 
 CREATE INDEX clipboard_entries_recent_idx
-    ON clipboard_entries(last_seen_at_ms DESC);
+ON clipboard_entries(last_seen_at_ms DESC);
 
 CREATE INDEX clipboard_entries_pinned_idx
-    ON clipboard_entries(pinned_at_ms DESC)
-    WHERE pinned_at_ms IS NOT NULL;
+ON clipboard_entries(pinned_at_ms DESC)
+WHERE pinned_at_ms IS NOT NULL;
 
 CREATE TABLE clipboard_text (
     entry_id INTEGER PRIMARY KEY REFERENCES clipboard_entries(id) ON DELETE CASCADE,
@@ -261,6 +261,18 @@ const SCHEMA_V4: &str = r#""#;
 
 const SCHEMA_V5: &str = r#"
 DROP TABLE IF EXISTS dictionary_words;
+"#;
+
+const SCHEMA_V6: &str = r#"
+UPDATE clipboard_entries SET current_order_index = last_seen_at_ms WHERE current_order_index = 0;
+UPDATE clipboard_entries SET pinned_order_index = pinned_at_ms WHERE pinned_order_index IS NULL AND pinned_at_ms IS NOT NULL;
+DROP INDEX IF EXISTS clipboard_entries_recent_idx;
+DROP INDEX IF EXISTS clipboard_entries_pinned_idx;
+CREATE INDEX IF NOT EXISTS clipboard_entries_current_order_idx
+ON clipboard_entries(current_order_index DESC, id DESC);
+CREATE INDEX IF NOT EXISTS clipboard_entries_pinned_order_idx
+ON clipboard_entries(pinned_order_index DESC, id DESC)
+WHERE pinned_at_ms IS NOT NULL;
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +394,18 @@ impl ClipboardEntryId {
     pub const fn get(self) -> i64 {
         self.0
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardEntryList {
+    Current,
+    Pinned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardReorderPosition {
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -670,6 +694,25 @@ impl Database {
         upsert_user_word(&self.connection, &input)
     }
 
+    pub fn record_user_words_batch(
+        &mut self,
+        terms: &[String],
+        used_at_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        if terms.is_empty() {
+            return Ok(false);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for term in terms {
+            let input = UserWord::try_new(term.as_str(), 1, used_at_ms)?;
+            upsert_user_word(&transaction, &input)?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn delete_user_word(&self, term: &str) -> Result<bool, DatabaseError> {
         let normalized_term = normalize_word(term.trim());
         if normalized_term.is_empty() {
@@ -774,6 +817,25 @@ impl Database {
         upsert_text_history(&self.connection, &input)
     }
 
+    pub fn record_text_history_batch(
+        &mut self,
+        texts: &[String],
+        used_at_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        if texts.is_empty() {
+            return Ok(false);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for text in texts {
+            let input = SequenceCandidate::try_new(text.as_str(), 1, used_at_ms)?;
+            upsert_text_history(&transaction, &input)?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn delete_text_history(&self, text: &str) -> Result<bool, DatabaseError> {
         Ok(self
             .connection
@@ -790,13 +852,15 @@ impl Database {
         let content_hash = clipboard_content_hash(ClipboardEntryKind::Text, text.as_bytes());
         let entry_id = self.connection.query_row(
             r#"
-            INSERT INTO clipboard_entries (kind, last_seen_at_ms, content_hash, copy_count)
-            VALUES (?1, ?2, ?3, 1)
-            ON CONFLICT(kind, content_hash) DO UPDATE SET
-                last_seen_at_ms = excluded.last_seen_at_ms,
-                copy_count = clipboard_entries.copy_count + 1
-            RETURNING id
-            "#,
+INSERT INTO clipboard_entries (
+kind, last_seen_at_ms, content_hash, copy_count, current_order_index
+)
+VALUES (?1, ?2, ?3, 1, ?2)
+ON CONFLICT(kind, content_hash) DO UPDATE SET
+current_order_index = excluded.current_order_index,
+copy_count = clipboard_entries.copy_count + 1
+RETURNING id
+"#,
             params![
                 ClipboardEntryKind::Text.as_stored(),
                 observed_at_ms,
@@ -806,10 +870,10 @@ impl Database {
         )?;
         self.connection.execute(
             r#"
-            INSERT INTO clipboard_text (entry_id, text)
-            VALUES (?1, ?2)
-            ON CONFLICT(entry_id) DO UPDATE SET text = excluded.text
-            "#,
+INSERT INTO clipboard_text (entry_id, text)
+VALUES (?1, ?2)
+ON CONFLICT(entry_id) DO UPDATE SET text = excluded.text
+"#,
             params![entry_id, text],
         )?;
         self.load_clipboard_entry(ClipboardEntryId(entry_id))
@@ -825,13 +889,15 @@ impl Database {
         let content_hash = clipboard_content_hash(ClipboardEntryKind::Image, data);
         let entry_id = self.connection.query_row(
             r#"
-            INSERT INTO clipboard_entries (kind, last_seen_at_ms, content_hash, copy_count)
-            VALUES (?1, ?2, ?3, 1)
-            ON CONFLICT(kind, content_hash) DO UPDATE SET
-                last_seen_at_ms = excluded.last_seen_at_ms,
-                copy_count = clipboard_entries.copy_count + 1
-            RETURNING id
-            "#,
+INSERT INTO clipboard_entries (
+kind, last_seen_at_ms, content_hash, copy_count, current_order_index
+)
+VALUES (?1, ?2, ?3, 1, ?2)
+ON CONFLICT(kind, content_hash) DO UPDATE SET
+current_order_index = excluded.current_order_index,
+copy_count = clipboard_entries.copy_count + 1
+RETURNING id
+"#,
             params![
                 ClipboardEntryKind::Image.as_stored(),
                 observed_at_ms,
@@ -841,12 +907,12 @@ impl Database {
         )?;
         self.connection.execute(
             r#"
-            INSERT INTO clipboard_images (entry_id, format, data)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(entry_id) DO UPDATE SET
-                format = excluded.format,
-                data = excluded.data
-            "#,
+INSERT INTO clipboard_images (entry_id, format, data)
+VALUES (?1, ?2, ?3)
+ON CONFLICT(entry_id) DO UPDATE SET
+format = excluded.format,
+data = excluded.data
+"#,
             params![entry_id, format, data],
         )?;
         self.load_clipboard_entry(ClipboardEntryId(entry_id))
@@ -859,11 +925,11 @@ impl Database {
     ) -> Result<ClipboardEntryView, DatabaseError> {
         self.connection.execute(
             r#"
-            UPDATE clipboard_entries
-            SET last_seen_at_ms = ?1,
-                copy_count = copy_count + 1
-            WHERE id = ?2
-            "#,
+UPDATE clipboard_entries
+SET current_order_index = ?1,
+copy_count = copy_count + 1
+WHERE id = ?2
+"#,
             params![used_at_ms, entry_id.get()],
         )?;
         self.load_clipboard_entry(entry_id)
@@ -875,7 +941,12 @@ impl Database {
         pinned_at_ms: i64,
     ) -> Result<ClipboardEntryView, DatabaseError> {
         self.connection.execute(
-            "UPDATE clipboard_entries SET pinned_at_ms = ?1 WHERE id = ?2",
+            r#"
+UPDATE clipboard_entries
+SET pinned_at_ms = COALESCE(pinned_at_ms, ?1),
+pinned_order_index = COALESCE(pinned_order_index, ?1)
+WHERE id = ?2
+"#,
             params![pinned_at_ms, entry_id.get()],
         )?;
         self.load_clipboard_entry(entry_id)
@@ -886,12 +957,78 @@ impl Database {
         entry_id: ClipboardEntryId,
     ) -> Result<ClipboardEntryView, DatabaseError> {
         self.connection.execute(
-            "UPDATE clipboard_entries SET pinned_at_ms = NULL WHERE id = ?1",
-            [entry_id.get()],
-        )?;
+"UPDATE clipboard_entries SET pinned_at_ms = NULL, pinned_order_index = NULL WHERE id = ?1",
+[entry_id.get()],
+)?;
         self.load_clipboard_entry(entry_id)
     }
 
+    pub fn reorder_clipboard_entry(
+        &mut self,
+        list: ClipboardEntryList,
+        moved_entry_id: ClipboardEntryId,
+        target_entry_id: ClipboardEntryId,
+        position: ClipboardReorderPosition,
+    ) -> Result<(), DatabaseError> {
+        if moved_entry_id == target_entry_id {
+            return Ok(());
+        }
+
+        let (select_sql, update_sql, max_sql) = match list {
+            ClipboardEntryList::Current => (
+                "SELECT id FROM clipboard_entries WHERE kind IN ('text', 'image') ORDER BY current_order_index DESC, id DESC",
+                "UPDATE clipboard_entries SET current_order_index = ?1 WHERE id = ?2",
+                "SELECT MAX(current_order_index) FROM clipboard_entries WHERE kind IN ('text', 'image')",
+            ),
+            ClipboardEntryList::Pinned => (
+                "SELECT id FROM clipboard_entries WHERE kind IN ('text', 'image') AND pinned_at_ms IS NOT NULL ORDER BY pinned_order_index DESC, id DESC",
+                "UPDATE clipboard_entries SET pinned_order_index = ?1 WHERE id = ?2",
+                "SELECT MAX(pinned_order_index) FROM clipboard_entries WHERE kind IN ('text', 'image') AND pinned_at_ms IS NOT NULL",
+            ),
+        };
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare(select_sql)?;
+        let mut entry_ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        let moved_id = moved_entry_id.get();
+        let target_id = target_entry_id.get();
+        let Some(moved_index) = entry_ids.iter().position(|id| *id == moved_id) else {
+            return Err(DatabaseError::ClipboardEntryNotFound(moved_id));
+        };
+        if !entry_ids.contains(&target_id) {
+            return Err(DatabaseError::ClipboardEntryNotFound(target_id));
+        }
+
+        let moved = entry_ids.remove(moved_index);
+        let target_index = entry_ids
+            .iter()
+            .position(|id| *id == target_id)
+            .expect("target was checked before moved entry removal");
+        let insert_index = match position {
+            ClipboardReorderPosition::Before => target_index,
+            ClipboardReorderPosition::After => target_index + 1,
+        };
+        entry_ids.insert(insert_index, moved);
+
+        let max_order = transaction
+            .query_row(max_sql, [], |row| row.get::<_, Option<i64>>(0))?
+            .unwrap_or(0);
+        let base_order = max_order.max(entry_ids.len() as i64);
+        let mut update = transaction.prepare(update_sql)?;
+        for (index, entry_id) in entry_ids.iter().enumerate() {
+            let order_value = base_order + (entry_ids.len() - index) as i64;
+            update.execute(params![order_value, entry_id])?;
+        }
+        drop(update);
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn delete_clipboard_entry(
         &self,
         entry_id: ClipboardEntryId,
@@ -908,16 +1045,16 @@ impl Database {
     ) -> Result<usize, DatabaseError> {
         Ok(self.connection.execute(
             r#"
-            DELETE FROM clipboard_entries
-            WHERE pinned_at_ms IS NULL
-              AND id NOT IN (
-                  SELECT id
-                  FROM clipboard_entries
-                  WHERE pinned_at_ms IS NULL
-                  ORDER BY last_seen_at_ms DESC, id DESC
-                  LIMIT ?1
-              )
-            "#,
+DELETE FROM clipboard_entries
+WHERE pinned_at_ms IS NULL
+AND id NOT IN (
+SELECT id
+FROM clipboard_entries
+WHERE pinned_at_ms IS NULL
+ORDER BY current_order_index DESC, id DESC
+LIMIT ?1
+)
+"#,
             [i64::from(limit.get())],
         )?)
     }
@@ -929,15 +1066,15 @@ impl Database {
     ) -> Result<Vec<ClipboardEntryView>, DatabaseError> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
-                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
-                   clipboard_text.text, clipboard_images.format, clipboard_images.data
-            FROM clipboard_entries
-            LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
-            LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
-            WHERE clipboard_entries.kind IN ('text', 'image')
-            ORDER BY clipboard_entries.last_seen_at_ms DESC, clipboard_entries.id DESC
-            "#,
+SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
+clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
+clipboard_text.text, clipboard_images.format, clipboard_images.data
+FROM clipboard_entries
+LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
+WHERE clipboard_entries.kind IN ('text', 'image')
+ORDER BY clipboard_entries.current_order_index DESC, clipboard_entries.id DESC
+"#,
         )?;
         let stored = statement
             .query_map([], stored_clipboard_row_from_sql)?
@@ -952,16 +1089,16 @@ impl Database {
     ) -> Result<Vec<ClipboardEntryView>, DatabaseError> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
-                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
-                   clipboard_text.text, clipboard_images.format, clipboard_images.data
-            FROM clipboard_entries
-            LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
-            LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
-            WHERE clipboard_entries.kind IN ('text', 'image')
-              AND clipboard_entries.pinned_at_ms IS NOT NULL
-            ORDER BY clipboard_entries.pinned_at_ms DESC, clipboard_entries.id DESC
-            "#,
+SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
+clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
+clipboard_text.text, clipboard_images.format, clipboard_images.data
+FROM clipboard_entries
+LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
+WHERE clipboard_entries.kind IN ('text', 'image')
+AND clipboard_entries.pinned_at_ms IS NOT NULL
+ORDER BY clipboard_entries.pinned_order_index DESC, clipboard_entries.id DESC
+"#,
         )?;
         let stored = statement
             .query_map([], stored_clipboard_row_from_sql)?
@@ -1269,6 +1406,23 @@ fn user_word_from_stored(stored: (String, String, i64, i64)) -> Result<UserWord,
     Ok(UserWord::try_new(term, use_count, last_used_at_ms)?)
 }
 
+fn sqlite_column_exists(
+    connection: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, DatabaseError> {
+    let query = format!("PRAGMA table_info({table_name})");
+    let mut statement = connection.prepare(&query)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let stored_column_name: String = row.get(1)?;
+        if stored_column_name == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn schema_version(connection: &Connection) -> Result<i64, DatabaseError> {
     Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
@@ -1318,6 +1472,26 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V5)?;
         transaction.pragma_update(None, "user_version", 5)?;
+        transaction.commit()?;
+        version = 5;
+    }
+
+    if version < 6 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !sqlite_column_exists(&transaction, "clipboard_entries", "current_order_index")? {
+            transaction.execute(
+"ALTER TABLE clipboard_entries ADD COLUMN current_order_index INTEGER NOT NULL DEFAULT 0",
+[],
+)?;
+        }
+        if !sqlite_column_exists(&transaction, "clipboard_entries", "pinned_order_index")? {
+            transaction.execute(
+                "ALTER TABLE clipboard_entries ADD COLUMN pinned_order_index INTEGER",
+                [],
+            )?;
+        }
+        transaction.execute_batch(SCHEMA_V6)?;
+        transaction.pragma_update(None, "user_version", 6)?;
         transaction.commit()?;
     }
 

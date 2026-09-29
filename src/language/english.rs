@@ -1,7 +1,7 @@
 use super::{KeyboardLayoutMap, LanguagePackError};
 
-const LATIN_QWERTY: &str = "`qwertyuiop[]asdfghjkl;'zxcvbnm,./?";
-const RUSSIAN_JCUKEN: &str = "ёйцукенгшщзхъфывапролджэячсмитьбю.,";
+const LATIN_QWERTY: &str = "`qwertyuiop[]asdfghjkl;'zxcvbnm,./?&";
+const RUSSIAN_JCUKEN: &str = "ёйцукенгшщзхъфывапролджэячсмитьбю.,?";
 
 pub(super) fn layout_transforms() -> Result<Vec<KeyboardLayoutMap>, LanguagePackError> {
     Ok(vec![KeyboardLayoutMap::from_aligned(
@@ -10,3 +10,4 @@ pub(super) fn layout_transforms() -> Result<Vec<KeyboardLayoutMap>, LanguagePack
         0.15,
     )?])
 }
+// end english layout transforms

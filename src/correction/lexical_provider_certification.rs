@@ -134,6 +134,7 @@ fn certification_layout_ambiguous_punctuation_keys_cover_full_russian_keyboard_w
         (",scnhj", "быстро"),
         ("k.lb", "люди"),
         ("`krf", "ёлка"),
+        ("rfr&", "как?"),
     ] {
         assert_eq!(
             replacement_for_physical_input(observed).as_deref(),

@@ -159,6 +159,10 @@ unsafe extern "system" fn tray_window_proc(
         match (lparam as u32) & 0xFFFF {
             WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT => {
                 let target_window_id = unsafe { GetForegroundWindow() } as usize;
+                eprintln!(
+                    "[tray] left click received target_window_id={} tray_hwnd={}",
+                    target_window_id, hwnd as usize
+                );
                 unsafe { SetForegroundWindow(hwnd) };
                 open_clipboard_from_tray(target_window_id);
                 return 0;
@@ -177,12 +181,22 @@ unsafe extern "system" fn tray_window_proc(
 }
 
 fn open_clipboard_from_tray(target_window_id: usize) {
-    if let Ok(slot) = TRAY_STATE.lock()
-        && let Some(state) = slot.as_ref()
-    {
-        state
-            .clipboard
-            .show(ClipboardManagerTab::Current, target_window_id);
+    eprintln!(
+        "[tray] open clipboard requested target_window_id={}",
+        target_window_id
+    );
+    match TRAY_STATE.lock() {
+        Ok(slot) => {
+            if let Some(state) = slot.as_ref() {
+                eprintln!("[tray] dispatching clipboard show to UI handle");
+                state
+                    .clipboard
+                    .show(ClipboardManagerTab::Current, target_window_id);
+            } else {
+                eprintln!("[tray] clipboard show skipped: tray state is empty");
+            }
+        }
+        Err(_) => eprintln!("[tray] clipboard show skipped: tray state lock failed"),
     }
 }
 
@@ -217,12 +231,14 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 }
 
 fn request_exit_from_tray() {
+    eprintln!("[tray] exit requested");
     let _ = request_global_keyboard_hook_stop();
     if let Ok(slot) = TRAY_STATE.lock()
         && let Some(state) = slot.as_ref()
     {
         state.shutdown.store(true, Ordering::Release);
         state.repaint_ctx.request_repaint();
+        eprintln!("[tray] shutdown flag set and UI repaint requested");
     }
 }
 

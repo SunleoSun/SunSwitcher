@@ -2,7 +2,8 @@ mod replacement_engine;
 mod selected_replacement;
 
 pub use replacement_engine::{
-    ReplacementAction, ReplacementEngine, ReplacementOutcome, UndoOutcome,
+    LivePrefixReplacementAction, ReplacementAction, ReplacementEngine, ReplacementOutcome,
+    UndoOutcome, UndoReplacementAction,
 };
 pub use selected_replacement::{
     SelectedReplacementAction, SelectedReplacementEngine, SelectedReplacementText,

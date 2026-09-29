@@ -137,6 +137,21 @@ struct PopupState {
     selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuggestionViewportSpec {
+    state: PopupState,
+    prefer_root_anchor: bool,
+    x: i32,
+    y: i32,
+    height: i32,
+}
+
+#[derive(Debug, Default)]
+struct SuggestionViewportCache {
+    visible: bool,
+    spec: Option<SuggestionViewportSpec>,
+}
+
 pub struct AutocompletePopupHandle {
     state: Arc<RwLock<PopupState>>,
     clipboard: ClipboardManagerHandle,
@@ -206,6 +221,7 @@ impl AutocompletePopupHandle {
                         locator: CaretLocator::new(),
                         fallback_anchor: None,
                         shown: false,
+                        suggestion_viewport: SuggestionViewportCache::default(),
                     }))
                 }),
             );
@@ -216,6 +232,7 @@ impl AutocompletePopupHandle {
 
         match ready_receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(repaint_ctx)) => {
+                eprintln!("[ui-start] SunSwitcher UI runtime initialized");
                 let clipboard = ClipboardManagerHandle::new(clipboard_state, repaint_ctx.clone());
                 let tray = TrayIcon::start(
                     clipboard.clone(),
@@ -237,6 +254,7 @@ impl AutocompletePopupHandle {
             }
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
+                eprintln!("[ui-start] SunSwitcher UI did not initialize: {error}");
                 Err(format!("SunSwitcher UI did not initialize: {error}"))
             }
         }
@@ -270,7 +288,15 @@ impl AutocompletePopupHandle {
     }
 
     pub fn show_clipboard(&self, active_tab: ClipboardManagerTab, target_window_id: usize) {
+        eprintln!(
+            "[ui-command] show_clipboard dispatch tab={:?} target_window_id={}",
+            active_tab, target_window_id
+        );
         self.clipboard.show(active_tab, target_window_id);
+    }
+
+    pub fn clipboard_handle(&self) -> ClipboardManagerHandle {
+        self.clipboard.clone()
     }
 }
 
@@ -291,6 +317,7 @@ struct AutocompletePopupApp {
     locator: CaretLocator,
     fallback_anchor: Option<CaretAnchor>,
     shown: bool,
+    suggestion_viewport: SuggestionViewportCache,
 }
 
 fn park_root_viewport(ctx: &egui::Context) {
@@ -320,6 +347,14 @@ fn root_viewport_anchor(ctx: &egui::Context) -> Option<CaretAnchor> {
 }
 
 impl AutocompletePopupApp {
+    fn hide_suggestion_viewport(&mut self, ctx: &egui::Context) {
+        if self.suggestion_viewport.visible {
+            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
+        }
+        self.suggestion_viewport.visible = false;
+        self.suggestion_viewport.spec = None;
+    }
+
     fn show_suggestion_viewport(&mut self, ctx: &egui::Context, prefer_root_anchor: bool) {
         let state = self
             .state
@@ -327,7 +362,16 @@ impl AutocompletePopupApp {
             .map(|state| state.clone())
             .unwrap_or_default();
         if state.suggestions.is_empty() {
-            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
+            self.hide_suggestion_viewport(ctx);
+            return;
+        }
+
+        if !prefer_root_anchor
+            && let Some(spec) = self.suggestion_viewport.spec.clone().filter(|spec| {
+                self.suggestion_viewport.visible && spec.state == state && !spec.prefer_root_anchor
+            })
+        {
+            self.render_suggestion_viewport(ctx, &spec);
             return;
         }
 
@@ -343,18 +387,37 @@ impl AutocompletePopupApp {
             self.fallback_anchor
         };
         let Some(anchor) = anchor else {
-            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
+            self.hide_suggestion_viewport(ctx);
             return;
         };
 
         let visible_rows = state.suggestions.len().min(MAX_POPUP_SUGGESTIONS);
         let popup_height = POPUP_PADDING * 2.0 + ROW_HEIGHT * visible_rows as f32;
         let placement = popup_placement(anchor, POPUP_WIDTH, popup_height, CARET_GAP);
+        let spec = SuggestionViewportSpec {
+            state,
+            prefer_root_anchor,
+            x: placement.x.round() as i32,
+            y: placement.y.round() as i32,
+            height: popup_height.round() as i32,
+        };
+        if self.suggestion_viewport.visible && self.suggestion_viewport.spec.as_ref() == Some(&spec)
+        {
+            self.render_suggestion_viewport(ctx, &spec);
+            return;
+        }
+
+        self.render_suggestion_viewport(ctx, &spec);
+        self.suggestion_viewport.visible = true;
+        self.suggestion_viewport.spec = Some(spec);
+    }
+
+    fn render_suggestion_viewport(&self, ctx: &egui::Context, spec: &SuggestionViewportSpec) {
         let state_handle = Arc::clone(&self.state);
         let viewport = ViewportBuilder::default()
             .with_title("SunSwitcher suggestions")
-            .with_inner_size(vec2(POPUP_WIDTH, popup_height))
-            .with_position(pos2(placement.x, placement.y))
+            .with_inner_size(vec2(POPUP_WIDTH, spec.height as f32))
+            .with_position(pos2(spec.x as f32, spec.y as f32))
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
@@ -394,7 +457,7 @@ impl eframe::App for AutocompletePopupApp {
             .is_ok_and(|state| !state.suggestions.is_empty());
         if !has_suggestions {
             self.fallback_anchor = None;
-            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
+            self.hide_suggestion_viewport(ctx);
             return;
         }
 

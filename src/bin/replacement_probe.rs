@@ -6,7 +6,7 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod windows_probe {
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use sunswitcher::adaptive::{
         AdaptiveCompletionSession, AdaptiveCorrectionDirective, AdaptiveCorrectionSession,
@@ -19,7 +19,7 @@ mod windows_probe {
     use sunswitcher::input::InputEvent;
     use sunswitcher::language::{KeyboardLayoutSwitch, switch_keyboard_layout_text};
     use sunswitcher::persistence::{Database, UndoHotkey};
-    use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome};
+    use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome, UndoReplacementAction};
     use sunswitcher::windows::{AutocompletePopupHandle, ClipboardTextListener};
     use sunswitcher::windows::{ClipboardCommand, ClipboardManagerTab, ObservableClipboardContent};
     use sunswitcher::windows::{
@@ -29,8 +29,11 @@ mod windows_probe {
     use windows_sys::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
     };
+    #[cfg(test)]
     const MAX_CLIPBOARD_LEARNING_CHARS: usize = 4096;
+    #[cfg(test)]
     const MAX_CLIPBOARD_LEARNING_LINES: usize = 128;
+
     pub fn run() {
         println!("SunSwitcher replacement probe");
         println!("Bilingual lexical provider: Russian + English, including wrong-layout typos.");
@@ -117,55 +120,82 @@ mod windows_probe {
             let runtime = AdaptiveLexicalRuntime::start(database, minimum_confidence)
                 .map_err(|error| error.to_string())?;
             let learning = runtime.learning();
-            let clipboard_database_path = database_path.clone();
-            let clipboard_listener = ClipboardTextListener::start(move |content| {
-    let observed_at_ms = now_ms();
-    match Database::open(&clipboard_database_path) {
-        Ok(database) => {
-            match &content {
-                ObservableClipboardContent::Text(text) => {
-                    if let Err(error) = database.record_clipboard_text(text, observed_at_ms) {
-                        eprintln!("clipboard history skipped: {error}");
-                    }
-                }
-                ObservableClipboardContent::Image(image) => {
-                    if let Err(error) = database.record_clipboard_image(
-                        image.format(),
-                        image.data(),
-                        observed_at_ms,
-                    ) {
-                        eprintln!("clipboard image history skipped: {error}");
-                    }
-                }
-            }
-            if let Ok(settings) = database.settings()
-                && let Err(error) = database.prune_clipboard_history(settings.clipboard_history_limit())
-            {
-                eprintln!("clipboard history prune skipped: {error}");
-            }
-        }
-        Err(error) => eprintln!("clipboard history unavailable: {error}"),
-    }
-    if let ObservableClipboardContent::Text(text) = content {
-        if should_learn_clipboard_text(&text) {
-            if let Err(error) = learning.observe_text(text, observed_at_ms) {
-                eprintln!("clipboard learning skipped: {error}");
-            }
-        } else {
-            eprintln!(
-                "clipboard learning skipped for large text: bytes={} limit_chars={} limit_lines={}",
-                text.len(),
-                MAX_CLIPBOARD_LEARNING_CHARS,
-                MAX_CLIPBOARD_LEARNING_LINES
-            );
-        }
-    }
-})
-.map_err(|error| format!("clipboard listener failed: {error:?}"))?;
-            let session = runtime.session();
-            let completion = runtime.completion_session();
             let popup = AutocompletePopupHandle::start(database_path.clone())
                 .map_err(|error| format!("SunSwitcher UI failed: {error}"))?;
+            let clipboard_updates = popup.clipboard_handle();
+            let clipboard_database_path = database_path.clone();
+            let clipboard_listener = ClipboardTextListener::start(move |content| {
+let started_at = Instant::now();
+let observed_at_ms = now_ms();
+let profile = ClipboardContentProfile::from(&content);
+let mut history_ms = 0;
+let mut prune_ms = 0;
+let mut learning_queue_ms = 0;
+let mut adaptive_learning = "skipped";
+let mut history_changed = false;
+
+let history_started_at = Instant::now();
+match Database::open(&clipboard_database_path) {
+Ok(database) => {
+match &content {
+ObservableClipboardContent::Text(text) => {
+match database.record_clipboard_text(text, observed_at_ms) {
+Ok(_) => history_changed = true,
+Err(error) => eprintln!("clipboard history skipped: {error}"),
+}
+}
+ObservableClipboardContent::Image(image) => {
+match database.record_clipboard_image(
+image.format(),
+image.data(),
+observed_at_ms,
+) {
+Ok(_) => history_changed = true,
+Err(error) => eprintln!("clipboard image history skipped: {error}"),
+}
+}
+}
+history_ms = elapsed_ms(history_started_at);
+let prune_started_at = Instant::now();
+if let Ok(settings) = database.settings()
+&& let Err(error) = database.prune_clipboard_history(settings.clipboard_history_limit())
+{
+eprintln!("clipboard history prune skipped: {error}");
+}
+prune_ms = elapsed_ms(prune_started_at);
+}
+Err(error) => eprintln!("clipboard history unavailable: {error}"),
+}
+if history_changed {
+clipboard_updates.notify_history_changed();
+}
+
+if let ObservableClipboardContent::Text(text) = &content {
+let learning_started_at = Instant::now();
+match learning.observe_text(text.as_str(), observed_at_ms) {
+Ok(()) => adaptive_learning = "queued",
+Err(error) => eprintln!("clipboard learning skipped: {error}"),
+}
+learning_queue_ms = elapsed_ms(learning_started_at);
+}
+
+let total_ms = elapsed_ms(started_at);
+eprintln!(
+"[clipboard-profile] kind={} bytes={} chars={} lines={} history_ms={} prune_ms={} learning_queue_ms={} total_ms={} adaptive_learning={}",
+profile.kind,
+profile.bytes,
+profile.chars,
+profile.lines,
+history_ms,
+prune_ms,
+learning_queue_ms,
+total_ms,
+adaptive_learning
+);
+})
+.map_err(|error| format!("clipboard listener failed: {error:?}"))?;
+            let session = runtime.live_session();
+            let completion = runtime.completion_session();
             println!("Adaptive state: {}", database_path.display());
             Ok((
                 Self {
@@ -193,6 +223,37 @@ mod windows_probe {
         }
     }
 
+    struct ClipboardContentProfile {
+        kind: String,
+        bytes: usize,
+        chars: usize,
+        lines: usize,
+    }
+
+    impl ClipboardContentProfile {
+        fn from(content: &ObservableClipboardContent) -> Self {
+            match content {
+                ObservableClipboardContent::Text(text) => Self {
+                    kind: "text".to_owned(),
+                    bytes: text.len(),
+                    chars: text.chars().count(),
+                    lines: text.lines().count(),
+                },
+                ObservableClipboardContent::Image(image) => Self {
+                    kind: image.format().to_owned(),
+                    bytes: image.data().len(),
+                    chars: 0,
+                    lines: 0,
+                },
+            }
+        }
+    }
+
+    fn elapsed_ms(started_at: Instant) -> u128 {
+        started_at.elapsed().as_millis()
+    }
+
+    #[cfg(test)]
     fn should_learn_clipboard_text(text: &str) -> bool {
         text.chars().take(MAX_CLIPBOARD_LEARNING_CHARS + 1).count() <= MAX_CLIPBOARD_LEARNING_CHARS
             && text.lines().take(MAX_CLIPBOARD_LEARNING_LINES + 1).count()
@@ -223,11 +284,8 @@ mod windows_probe {
         fn tracked_layout_switch_applied(&mut self, text: &str) {
             let observed_at_ms = now_ms();
             self.session.tracked_layout_switch_applied(text);
-            if let Err(error) = self
-                .completion
-                .process_event(InputEvent::Invalidate, observed_at_ms)
-            {
-                eprintln!("adaptive completion reset after layout switch skipped: {error}");
+            if let Err(error) = self.completion.layout_switch_applied(text, observed_at_ms) {
+                eprintln!("adaptive completion refresh after layout switch skipped: {error}");
             }
             self.sync_popup();
         }
@@ -243,13 +301,25 @@ mod windows_probe {
                     println!("[REPLACE] -> {:?}", action.replacement().as_str());
                     RuntimeDirective::Replace(action)
                 }
+                Ok(AdaptiveCorrectionDirective::ReplaceLivePrefix(action)) => {
+                    println!(
+                        "[LIVE REPLACE] {:?} -> {:?}",
+                        action.original_visible(),
+                        action.replacement().as_str()
+                    );
+                    RuntimeDirective::ReplaceLivePrefix(action)
+                }
                 Err(error) => {
                     eprintln!("adaptive correction skipped: {error}");
                     RuntimeDirective::Pass
                 }
             };
-            if let Some(canonical) = self.session.take_resolved_completion_word() {
-                self.completion.canonicalize_last_context_word(&canonical);
+            if let Some(canonical) = self.session.take_resolved_completion_word()
+                && let Err(error) = self
+                    .completion
+                    .layout_switch_applied(&canonical, observed_at_ms)
+            {
+                eprintln!("adaptive completion refresh after correction skipped: {error}");
             }
             self.sync_popup();
             directive
@@ -261,12 +331,27 @@ mod windows_probe {
             }
             if outcome == ReplacementOutcome::Applied
                 && let Some(canonical) = self.session.take_resolved_completion_word()
+                && let Err(error) = self.completion.layout_switch_applied(&canonical, now_ms())
             {
-                self.completion.canonicalize_last_context_word(&canonical);
+                eprintln!("adaptive completion refresh after correction outcome skipped: {error}");
             }
             self.sync_popup();
         }
 
+        fn live_prefix_replacement_outcome(&mut self, outcome: ReplacementOutcome) {
+            if let Err(error) = self.session.live_prefix_replacement_outcome(outcome) {
+                eprintln!("adaptive live-prefix correction outcome was not persisted: {error}");
+            }
+            if outcome == ReplacementOutcome::Applied
+                && let Some(prefix) = self.session.take_resolved_live_prefix()
+                && let Err(error) = self.completion.live_prefix_replaced(&prefix, now_ms())
+            {
+                eprintln!(
+                    "adaptive completion refresh after live-prefix correction skipped: {error}"
+                );
+            }
+            self.sync_popup();
+        }
         fn delete_user_word(&mut self, text: &str) {
             if let Err(error) = self.runtime.learning().delete_user_word(text.to_owned()) {
                 eprintln!("user-word deletion skipped: {error}");
@@ -290,7 +375,14 @@ mod windows_probe {
         fn undo(&mut self) -> UndoDirective {
             match self.session.request_undo(now_ms()) {
                 Ok(Some(action)) => {
-                    println!("[UNDO] -> {:?}", action.replacement().as_str());
+                    match &action {
+                        UndoReplacementAction::Completed(action) => {
+                            println!("[UNDO] -> {:?}", action.replacement().as_str());
+                        }
+                        UndoReplacementAction::LivePrefix(action) => {
+                            println!("[UNDO LIVE] -> {:?}", action.replacement().as_str());
+                        }
+                    }
                     UndoDirective::Restore(action)
                 }
                 Ok(None) => UndoDirective::Pass,
@@ -307,8 +399,15 @@ mod windows_probe {
             }
             if outcome == UndoOutcome::Applied
                 && let Some(canonical) = self.session.take_resolved_completion_word()
+                && let Err(error) = self.completion.layout_switch_applied(&canonical, now_ms())
             {
-                self.completion.canonicalize_last_context_word(&canonical);
+                eprintln!("adaptive completion refresh after undo outcome skipped: {error}");
+            }
+            if outcome == UndoOutcome::Applied
+                && let Some(prefix) = self.session.take_resolved_live_prefix()
+                && let Err(error) = self.completion.live_prefix_replaced(&prefix, now_ms())
+            {
+                eprintln!("adaptive completion refresh after live-prefix undo skipped: {error}");
             }
             self.sync_popup();
         }
@@ -335,10 +434,14 @@ mod windows_probe {
         }
 
         fn clipboard_command(&mut self, command: ClipboardCommand, target_window_id: usize) {
-            let tab = match command {
-                ClipboardCommand::OpenCurrent => ClipboardManagerTab::Current,
-                ClipboardCommand::OpenPinned => ClipboardManagerTab::Pinned,
+            let (tab, command_label) = match command {
+                ClipboardCommand::OpenCurrent => (ClipboardManagerTab::Current, "open_current"),
+                ClipboardCommand::OpenPinned => (ClipboardManagerTab::Pinned, "open_pinned"),
             };
+            eprintln!(
+                "[hotkey] clipboard command received command={} target_window_id={}",
+                command_label, target_window_id
+            );
             self.popup.show_clipboard(tab, target_window_id);
         }
 

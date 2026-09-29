@@ -39,7 +39,7 @@ The producer lowercases, keeps alphabetic forms, deduplicates, sorts, and writes
 
 SQLite `languages` remains the enablement/configuration authority for built-in language IDs. Built-in `ru`/`en` vocabulary content lives only in immutable FST assets; schema v5 drops the obsolete `dictionary_words` table and `Database::load_enabled_language_packs` fails closed on enabled non-built-in language IDs instead of rebuilding mutable custom dictionaries.
 
-Keyboard-layout maps remain in `src/language/russian.rs` and `src/language/english.rs`; they are not dictionary data. `KeyboardLayoutMap::transform_text`, mixed-layout Double Shift behavior, and `TextCasePattern` remain independent typed behavior owners.
+Keyboard-layout maps remain in `src/language/russian.rs` and `src/language/english.rs`; they are not dictionary data. The RU/EN maps include the ordinary punctuation tail plus shifted number-row punctuation that participates in wrong-layout words, so `rfr&` switches to `как?` instead of preserving a literal `&`; the physical-key fallback applies that shifted mapping only when the produced symbol is actually shifted, so an ordinary unshifted `7` remains `7`. `KeyboardLayoutMap::transform_text`, mixed-layout Double Shift behavior, and `TextCasePattern` remain independent typed behavior owners.
 
 ## Validation
 

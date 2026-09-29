@@ -1,4 +1,8 @@
 mod adaptive_runtime;
+mod live_prefix;
+
+#[cfg(test)]
+mod live_prefix_certification;
 
 pub use adaptive_runtime::{
     AdaptiveCompletionSession, AdaptiveCorrectionDirective, AdaptiveCorrectionSession,

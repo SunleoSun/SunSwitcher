@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhysicalKey {
     Other,
+    Digit7,
     Grave,
     LeftBracket,
     RightBracket,
@@ -17,6 +18,7 @@ impl PhysicalKey {
 
     pub const fn from_layout_symbol(character: char) -> Self {
         match character {
+            '&' => Self::Digit7,
             '`' | '~' => Self::Grave,
             '[' | '{' => Self::LeftBracket,
             ']' | '}' => Self::RightBracket,
@@ -27,6 +29,7 @@ impl PhysicalKey {
             _ => Self::Other,
         }
     }
+    // shifted-symbol helpers continue below
 
     pub fn is_shifted_symbol(self, character: char) -> bool {
         self.shifted_symbol() == Some(character)
@@ -34,6 +37,7 @@ impl PhysicalKey {
 
     pub const fn shifted_symbol(self) -> Option<char> {
         match self {
+            Self::Digit7 => Some('&'),
             Self::Grave => Some('~'),
             Self::LeftBracket => Some('{'),
             Self::RightBracket => Some('}'),
@@ -45,6 +49,7 @@ impl PhysicalKey {
         }
     }
 }
+// end PhysicalKey helpers
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypedCharacter {
@@ -237,8 +242,21 @@ impl InputBuffer {
         &self.token
     }
 
+    pub fn current_physical_keys(&self) -> &[PhysicalKey] {
+        &self.physical_keys
+    }
+
     pub fn current_layout_span(&self) -> &str {
         &self.layout_span
+    }
+
+    pub fn replace_current_token_for_live_prefix(&mut self, text: &str) {
+        self.token.clear();
+        self.token.push_str(text);
+        self.physical_keys = vec![PhysicalKey::Other; text.chars().count()];
+        self.layout_span.clear();
+        self.layout_span.push_str(text);
+        self.synchronized = true;
     }
 
     pub fn replace_layout_switch_span(&mut self, text: &str) {

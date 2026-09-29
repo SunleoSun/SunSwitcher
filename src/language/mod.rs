@@ -229,11 +229,32 @@ mod tests {
                 .text(),
             "тво,"
         );
+        assert_eq!(
+            switch_keyboard_layout_text(&[english.clone(), russian.clone()], "rfr&")
+                .unwrap()
+                .text(),
+            "как?"
+        );
 
         let to_english = switch_keyboard_layout_text(&[english, russian], "руддщ")
             .expect("Russian physical spelling should map to English");
         assert_eq!(to_english.text(), "hello");
         assert_eq!(to_english.target_language().as_str(), "en");
+
+        let english = language_pack_from_entries(
+            LanguageId::try_new("en").unwrap(),
+            vec![DictionaryEntry::try_new("hello", 1).unwrap()],
+        )
+        .unwrap();
+        let russian = language_pack_from_entries(
+            LanguageId::try_new("ru").unwrap(),
+            vec![DictionaryEntry::try_new("как", 1).unwrap()],
+        )
+        .unwrap();
+        let to_english_question = switch_keyboard_layout_text(&[english, russian], "как?")
+            .expect("Russian shifted question mark key should map back to Latin shifted key");
+        assert_eq!(to_english_question.text(), "rfr&");
+        assert_eq!(to_english_question.target_language().as_str(), "en");
     }
 
     #[test]

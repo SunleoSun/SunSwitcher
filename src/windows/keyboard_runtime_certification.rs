@@ -246,6 +246,11 @@ fn certification_replacement_outcome_matches_actual_injection_effect() {
 }
 
 #[test]
+fn certification_shifted_digit_seven_is_a_layout_ambiguous_physical_key() {
+    assert_eq!(physical_key_from_vk(0x37), PhysicalKey::Digit7);
+}
+
+#[test]
 fn certification_failed_injection_never_suppresses_the_physical_keyup() {
     let failed = Err(RuntimeError::InjectionFailed {
         expected: 12,

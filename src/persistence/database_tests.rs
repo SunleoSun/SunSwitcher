@@ -1,13 +1,14 @@
 use super::{
-    AppSettings, ClipboardEntryContent, ClipboardEntryKind, ClipboardHistoryLimit, Database,
-    DatabaseError, SettingsError, UndoHotkey,
+    AppSettings, ClipboardEntryContent, ClipboardEntryKind, ClipboardEntryList,
+    ClipboardHistoryLimit, ClipboardReorderPosition, Database, DatabaseError, SettingsError,
+    UndoHotkey,
 };
 
 #[test]
 fn default_settings_use_the_explicit_clipboard_history_limit() {
     let database = Database::open_in_memory().expect("fresh in-memory database should open");
 
-    assert_eq!(database.schema_version().unwrap(), 5);
+    assert_eq!(database.schema_version().unwrap(), 6);
     assert_eq!(
         database.settings().unwrap().clipboard_history_limit(),
         ClipboardHistoryLimit::DEFAULT
@@ -50,7 +51,7 @@ fn clipboard_text_history_deduplicates_orders_filters_and_pins() {
     assert_eq!(hello_again.id(), hello.id());
     assert_eq!(hello_again.kind(), ClipboardEntryKind::Text);
     assert_eq!(hello_again.copy_count(), 2);
-    assert_eq!(hello_again.last_seen_at_ms(), 30);
+    assert_eq!(hello_again.last_seen_at_ms(), 10);
     assert_eq!(
         hello_again.content(),
         &ClipboardEntryContent::Text("Hello".to_owned())
@@ -81,6 +82,90 @@ fn clipboard_text_history_deduplicates_orders_filters_and_pins() {
     );
 }
 
+#[test]
+fn clipboard_current_entries_can_be_reordered_without_rewriting_entry_times() {
+    let mut database = Database::open_in_memory().unwrap();
+
+    let first = database.record_clipboard_text("first", 10).unwrap();
+    let second = database.record_clipboard_text("second", 20).unwrap();
+    let third = database.record_clipboard_text("third", 30).unwrap();
+
+    database
+        .reorder_clipboard_entry(
+            ClipboardEntryList::Current,
+            first.id(),
+            third.id(),
+            ClipboardReorderPosition::Before,
+        )
+        .unwrap();
+    let current = database.load_clipboard_current("", 10).unwrap();
+    assert_eq!(
+        current.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
+        [first.id(), third.id(), second.id()]
+    );
+    assert_eq!(
+        current
+            .iter()
+            .map(|entry| entry.last_seen_at_ms())
+            .collect::<Vec<_>>(),
+        [10, 30, 20]
+    );
+
+    database
+        .reorder_clipboard_entry(
+            ClipboardEntryList::Current,
+            second.id(),
+            first.id(),
+            ClipboardReorderPosition::After,
+        )
+        .unwrap();
+    let current = database.load_clipboard_current("", 10).unwrap();
+    assert_eq!(
+        current.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
+        [first.id(), second.id(), third.id()]
+    );
+    assert_eq!(
+        current
+            .iter()
+            .map(|entry| entry.last_seen_at_ms())
+            .collect::<Vec<_>>(),
+        [10, 20, 30]
+    );
+}
+
+#[test]
+fn clipboard_pinned_entries_can_be_reordered_without_rewriting_pin_times() {
+    let mut database = Database::open_in_memory().unwrap();
+
+    let first = database.record_clipboard_text("first", 10).unwrap();
+    let second = database.record_clipboard_text("second", 20).unwrap();
+    let third = database.record_clipboard_text("third", 30).unwrap();
+    database.pin_clipboard_entry(first.id(), 40).unwrap();
+    database.pin_clipboard_entry(second.id(), 50).unwrap();
+    database.pin_clipboard_entry(third.id(), 60).unwrap();
+
+    database
+        .reorder_clipboard_entry(
+            ClipboardEntryList::Pinned,
+            first.id(),
+            third.id(),
+            ClipboardReorderPosition::Before,
+        )
+        .unwrap();
+
+    let pinned = database.load_clipboard_pinned("", 10).unwrap();
+    assert_eq!(
+        pinned.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
+        [first.id(), third.id(), second.id()]
+    );
+    assert_eq!(
+        pinned
+            .iter()
+            .map(|entry| entry.pinned_at_ms())
+            .collect::<Vec<_>>(),
+        [Some(40), Some(60), Some(50)]
+    );
+}
 #[test]
 fn clipboard_image_history_is_loaded_with_text_entries() {
     let database = Database::open_in_memory().unwrap();

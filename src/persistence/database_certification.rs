@@ -38,7 +38,7 @@ impl Drop for TempDatabasePath {
 fn certification_fresh_database_has_only_the_required_application_tables() {
     let path = TempDatabasePath::new("schema");
     let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 5);
+    assert_eq!(database.schema_version().unwrap(), 6);
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -155,7 +155,7 @@ fn certification_builtin_vocabulary_is_not_duplicated_in_sqlite() {
     let path = TempDatabasePath::new("builtin-dictionary-authority");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 5);
+        assert_eq!(database.schema_version().unwrap(), 6);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -174,7 +174,7 @@ fn certification_unknown_enabled_language_fails_closed() {
     let path = TempDatabasePath::new("unknown-language");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 5);
+        assert_eq!(database.schema_version().unwrap(), 6);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -268,7 +268,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     let path = TempDatabasePath::new("schema-v1-to-v2");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 5);
+        assert_eq!(database.schema_version().unwrap(), 6);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -278,7 +278,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 5);
+    assert_eq!(migrated.schema_version().unwrap(), 6);
     migrated.hide_completion_word("hello").unwrap();
     assert!(
         migrated
@@ -293,7 +293,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     let path = TempDatabasePath::new("schema-v2-grave-cleanup");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 5);
+        assert_eq!(database.schema_version().unwrap(), 6);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -311,7 +311,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 5);
+    assert_eq!(migrated.schema_version().unwrap(), 6);
     assert!(
         migrated
             .load_user_lexicon()
@@ -334,7 +334,7 @@ fn certification_schema_v4_drops_obsolete_dictionary_table() {
     let path = TempDatabasePath::new("schema-v4-dictionary-drop");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 5);
+        assert_eq!(database.schema_version().unwrap(), 6);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -352,7 +352,7 @@ fn certification_schema_v4_drops_obsolete_dictionary_table() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 5);
+    assert_eq!(migrated.schema_version().unwrap(), 6);
     drop(migrated);
     let raw = Connection::open(path.as_path()).unwrap();
     let exists: i64 = raw
@@ -453,7 +453,7 @@ fn certification_newer_database_schema_fails_closed() {
         error,
         DatabaseError::SchemaTooNew {
             found: 999,
-            supported: 5
+            supported: 6
         }
     ));
 }

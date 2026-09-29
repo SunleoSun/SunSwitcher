@@ -29,8 +29,8 @@ use crate::input::{Boundary, InputEvent, PhysicalKey, TypedCharacter};
 use crate::language::{KeyboardLayoutSwitch, LanguageId};
 use crate::persistence::UndoHotkey;
 use crate::replacement::{
-    ReplacementAction, ReplacementOutcome, SelectedReplacementEngine, SelectedReplacementText,
-    SelectedTextDecision, UndoOutcome,
+    LivePrefixReplacementAction, ReplacementAction, ReplacementOutcome, SelectedReplacementEngine,
+    SelectedReplacementText, SelectedTextDecision, UndoOutcome, UndoReplacementAction,
 };
 
 use super::selected_text_runtime::{SelectedTextSession, SelectionCaptureIntent};
@@ -49,6 +49,8 @@ pub trait InputProcessor: Send + 'static {
     fn process(&mut self, event: InputEvent) -> RuntimeDirective;
 
     fn replacement_outcome(&mut self, _outcome: ReplacementOutcome) {}
+
+    fn live_prefix_replacement_outcome(&mut self, _outcome: ReplacementOutcome) {}
 
     fn undo(&mut self) -> UndoDirective {
         UndoDirective::Pass
@@ -87,12 +89,13 @@ pub trait InputProcessor: Send + 'static {
 pub enum RuntimeDirective {
     Pass,
     Replace(ReplacementAction),
+    ReplaceLivePrefix(LivePrefixReplacementAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoDirective {
     Pass,
-    Restore(ReplacementAction),
+    Restore(UndoReplacementAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -778,6 +781,12 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                     action,
                     ownership_stamp,
                 },
+                RuntimeDirective::ReplaceLivePrefix(action) => {
+                    HookEventState::KeyDownLivePrefixReplace {
+                        action,
+                        ownership_stamp,
+                    }
+                }
             }
         }
     };
@@ -954,7 +963,12 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                         })
                         .unwrap_or(UndoDirective::Pass);
                     if let UndoDirective::Restore(action) = directive {
-                        let injection_result = inject_replacement(&action);
+                        let injection_result = match &action {
+                            UndoReplacementAction::Completed(action) => inject_replacement(action),
+                            UndoReplacementAction::LivePrefix(action) => {
+                                inject_live_prefix_replacement(action)
+                            }
+                        };
                         let ownership_unchanged =
                             runtime_input_ownership_unchanged(ownership_stamp);
                         let outcome =
@@ -1038,6 +1052,61 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             }
             next_result
         }
+        HookEventState::KeyDownLivePrefixReplace {
+            action,
+            ownership_stamp,
+        } => {
+            let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+            if next_result != 0 {
+                notify_runtime_live_prefix_replacement_outcome(ReplacementOutcome::Aborted);
+                invalidate_runtime_tracking();
+                return next_result;
+            }
+            if !runtime_input_ownership_unchanged(ownership_stamp) {
+                notify_runtime_live_prefix_replacement_outcome(ReplacementOutcome::Aborted);
+                invalidate_runtime_tracking();
+                return next_result;
+            }
+
+            let injection_result = inject_live_prefix_replacement(&action);
+            let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
+            let replacement_outcome =
+                replacement_outcome_after_injection(&injection_result, ownership_unchanged);
+            if replacement_outcome == ReplacementOutcome::Applied
+                && let Some(target_language) = action.target_language()
+                && !request_foreground_keyboard_layout(target_language)
+            {
+                eprintln!(
+                    "SunSwitcher could not switch the foreground keyboard layout after live-prefix correction to {:?}",
+                    target_language.as_str()
+                );
+            }
+            if let Some(vk_code) =
+                keyup_suppression_after_injection(event.vkCode, &injection_result)
+            {
+                if let Ok(mut runtime_slot) = RUNTIME.lock()
+                    && let Some(runtime) = runtime_slot.as_mut()
+                {
+                    runtime.suppress_keyup(vk_code, SuppressedKeyUpRoute::DownstreamThenSuppress);
+                    runtime
+                        .processor
+                        .live_prefix_replacement_outcome(replacement_outcome);
+                    if replacement_outcome == ReplacementOutcome::Aborted {
+                        let _ = runtime.processor.process(InputEvent::Invalidate);
+                    }
+                }
+                return 1;
+            }
+
+            notify_runtime_live_prefix_replacement_outcome(replacement_outcome);
+            if replacement_outcome == ReplacementOutcome::Aborted {
+                invalidate_runtime_tracking();
+            }
+            if let Err(error) = injection_result {
+                eprintln!("SunSwitcher live-prefix replacement injection failed: {error:?}");
+            }
+            next_result
+        }
     }
 }
 
@@ -1048,6 +1117,10 @@ enum HookEventState {
     KeyDownPass,
     KeyDownReplace {
         action: ReplacementAction,
+        ownership_stamp: InputOwnershipStamp,
+    },
+    KeyDownLivePrefixReplace {
+        action: LivePrefixReplacementAction,
         ownership_stamp: InputOwnershipStamp,
     },
     UndoHotkey {
@@ -1286,6 +1359,14 @@ fn notify_runtime_replacement_outcome(outcome: ReplacementOutcome) {
         && let Some(runtime) = runtime_slot.as_mut()
     {
         runtime.processor.replacement_outcome(outcome);
+    }
+}
+
+fn notify_runtime_live_prefix_replacement_outcome(outcome: ReplacementOutcome) {
+    if let Ok(mut runtime_slot) = RUNTIME.lock()
+        && let Some(runtime) = runtime_slot.as_mut()
+    {
+        runtime.processor.live_prefix_replacement_outcome(outcome);
     }
 }
 
@@ -1594,6 +1675,7 @@ fn translate_key(event: &KBDLLHOOKSTRUCT, keyboard_state: &[u8; 256]) -> Option<
 
 pub(super) fn physical_key_from_vk(vk_code: u32) -> PhysicalKey {
     match vk_code as u16 {
+        0x37 => PhysicalKey::Digit7,
         VK_OEM_3 => PhysicalKey::Grave,
         VK_OEM_4 => PhysicalKey::LeftBracket,
         VK_OEM_6 => PhysicalKey::RightBracket,
@@ -1607,6 +1689,12 @@ pub(super) fn physical_key_from_vk(vk_code: u32) -> PhysicalKey {
 
 fn inject_replacement(action: &ReplacementAction) -> Result<(), RuntimeError> {
     send_inputs(&build_replacement_inputs(action))
+}
+
+fn inject_live_prefix_replacement(
+    action: &LivePrefixReplacementAction,
+) -> Result<(), RuntimeError> {
+    send_inputs(&build_live_prefix_replacement_inputs(action))
 }
 
 pub(super) fn undo_outcome_after_injection(
@@ -1848,6 +1936,15 @@ fn send_inputs(inputs: &[INPUT]) -> Result<(), RuntimeError> {
         return Err(RuntimeError::InjectionFailed { expected, sent });
     }
     Ok(())
+}
+
+pub(super) fn build_live_prefix_replacement_inputs(
+    action: &LivePrefixReplacementAction,
+) -> Vec<INPUT> {
+    build_tracked_text_replacement_inputs(
+        action.delete_previous_chars(),
+        action.replacement().as_str(),
+    )
 }
 
 pub(super) fn build_replacement_inputs(action: &ReplacementAction) -> Vec<INPUT> {

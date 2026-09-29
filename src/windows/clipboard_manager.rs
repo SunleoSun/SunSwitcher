@@ -19,7 +19,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow,
 };
 
-use crate::persistence::{ClipboardEntryContent, ClipboardEntryId, ClipboardEntryView, Database};
+use crate::persistence::{
+    ClipboardEntryContent, ClipboardEntryId, ClipboardEntryList, ClipboardEntryView,
+    ClipboardReorderPosition, Database,
+};
 
 use super::clipboard_listener::InternalClipboardMutationGuard;
 use super::keyboard_runtime::{RuntimeError, inject_ctrl_chord};
@@ -31,9 +34,12 @@ const PREVIEW_WIDTH: f32 = WINDOW_WIDTH;
 const PREVIEW_HEIGHT: f32 = WINDOW_HEIGHT;
 const PREVIEW_GAP: f32 = 8.0;
 const PREVIEW_HIDE_DELAY: Duration = Duration::from_secs(1);
+const PREVIEW_SHOW_DELAY: Duration = Duration::from_millis(500);
+const PREVIEW_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(750);
 const PARKED_POSITION: f32 = -32_000.0;
 const ENTRY_LIMIT: usize = 100;
 const INSERT_FOCUS_DELAY: Duration = Duration::from_millis(45);
+const ENTRY_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 const ENTRY_ROW_HEIGHT: f32 = 26.0;
 const NUMBER_BUTTON_WIDTH: f32 = 28.0;
 const TAB_BUTTON_WIDTH: f32 = 74.0;
@@ -110,26 +116,48 @@ impl ClipboardManagerHandle {
         Self { state, repaint_ctx }
     }
     pub fn show(&self, active_tab: ClipboardManagerTab, target_window_id: usize) {
-        let next = self
+        let previous = self
             .state
             .read()
-            .map(|state| ClipboardManagerState {
-                visible: true,
-                active_tab,
-                target_window_id,
-                serial: state.serial.wrapping_add(1),
-            })
-            .unwrap_or(ClipboardManagerState {
-                visible: true,
-                active_tab,
-                target_window_id,
-                serial: 1,
-            });
-        let _ = replace_clipboard_manager_state(&self.state, next);
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        let next = ClipboardManagerState {
+            visible: true,
+            active_tab,
+            target_window_id,
+            serial: previous.serial.wrapping_add(1),
+        };
+        let next_serial = next.serial;
+        let state_changed = replace_clipboard_manager_state(&self.state, next);
+        eprintln!(
+            "[ui-command] clipboard show requested tab={:?} target_window_id={} previous_visible={} previous_serial={} next_serial={} state_changed={}",
+            active_tab,
+            target_window_id,
+            previous.visible,
+            previous.serial,
+            next_serial,
+            state_changed
+        );
         self.repaint_ctx
             .send_viewport_cmd(egui::ViewportCommand::Visible(true));
         self.repaint_ctx
             .send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.repaint_ctx.request_repaint();
+        eprintln!("[ui-command] clipboard show viewport commands sent");
+    }
+
+    pub fn notify_history_changed(&self) {
+        match self.state.write() {
+            Ok(mut state) => {
+                let previous_serial = state.serial;
+                state.serial = state.serial.wrapping_add(1);
+                eprintln!(
+                    "[ui-command] clipboard history changed visible={} serial={} next_serial={}",
+                    state.visible, previous_serial, state.serial
+                );
+            }
+            Err(_) => eprintln!("[ui-command] clipboard history changed but state lock failed"),
+        }
         self.repaint_ctx.request_repaint();
     }
 }
@@ -143,7 +171,12 @@ pub(crate) struct ClipboardManagerApp {
     last_serial: u64,
     preview: Arc<RwLock<Option<ClipboardPreview>>>,
     preview_hovered_at: Arc<RwLock<Option<Instant>>>,
+    preview_candidate: Option<ClipboardPreviewCandidate>,
     preview_shown: bool,
+    style_applied: bool,
+    title_bar_styled: bool,
+    entries_cache: Option<ClipboardEntriesCache>,
+    dragging: Option<ClipboardDrag>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +191,26 @@ struct ClipboardPreview {
     last_hovered: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct ClipboardPreviewCandidate {
+    entry: ClipboardEntryView,
+    requested_at: Instant,
+    last_hovered: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ClipboardEntriesCache {
+    active_tab: ClipboardManagerTab,
+    filter: String,
+    refreshed_at: Instant,
+    result: Result<Arc<Vec<ClipboardEntryView>>, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipboardDrag {
+    entry_id: ClipboardEntryId,
+    active_tab: ClipboardManagerTab,
+}
 impl ClipboardManagerApp {
     pub(crate) fn new(database_path: PathBuf, state: Arc<RwLock<ClipboardManagerState>>) -> Self {
         Self {
@@ -169,7 +222,12 @@ impl ClipboardManagerApp {
             last_serial: 0,
             preview: Arc::new(RwLock::new(None)),
             preview_hovered_at: Arc::new(RwLock::new(None)),
+            preview_candidate: None,
             preview_shown: false,
+            style_applied: false,
+            title_bar_styled: false,
+            entries_cache: None,
+            dragging: None,
         }
     }
     pub(crate) fn logic(&mut self, ctx: &egui::Context) -> bool {
@@ -185,12 +243,35 @@ impl ClipboardManagerApp {
             .map(|state| state.clone())
             .unwrap_or_default();
         if state.serial != self.last_serial {
+            let previous_serial = self.last_serial;
             self.last_serial = state.serial;
+            self.invalidate_entries_cache();
+            eprintln!(
+                "[ui-frame] clipboard state observed previous_serial={} current_serial={} visible={} shown={} tab={:?} target_window_id={}",
+                previous_serial,
+                state.serial,
+                state.visible,
+                self.shown,
+                state.active_tab,
+                state.target_window_id
+            );
             ctx.request_repaint();
         }
         self.set_visible(ctx, state.visible);
         if state.visible {
-            apply_clipboard_title_bar_color();
+            ctx.request_repaint_after(ENTRY_CACHE_REFRESH_INTERVAL);
+        }
+        if state.visible {
+            if !self.style_applied {
+                self.apply_style(ctx);
+                self.style_applied = true;
+            }
+            if !self.title_bar_styled {
+                self.title_bar_styled = apply_clipboard_title_bar_color();
+                if !self.title_bar_styled {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+            }
         }
         state.visible
     }
@@ -204,7 +285,7 @@ impl ClipboardManagerApp {
         if !state.visible {
             return false;
         }
-        self.apply_style(ui.ctx());
+        // Style is applied once from logic() instead of every repaint.
         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.hide_shared(ui.ctx());
             return true;
@@ -219,7 +300,7 @@ impl ClipboardManagerApp {
             .read()
             .map(|state| state.clone())
             .unwrap_or_default();
-        let entries = match self.load_entries(state.active_tab) {
+        let entries = match self.load_entries_cached(state.active_tab) {
             Ok(entries) => entries,
             Err(error) => {
                 egui::Frame::new().fill(WINDOW_BG).show(ui, |ui| {
@@ -260,10 +341,24 @@ impl ClipboardManagerApp {
                             .max_height(available_height)
                             .show(ui, |ui| {
                                 if entries.is_empty() {
+                                    self.preview_candidate = None;
                                     ui.colored_label(MUTED_TEXT, "Clipboard history is empty");
                                 } else {
+                                    let mut preview_candidate_touched = false;
                                     for (index, entry) in entries.iter().enumerate() {
-                                        self.entry_row(ui, index, entry, state.target_window_id);
+                                        preview_candidate_touched |= self.entry_row(
+                                            ui,
+                                            state.active_tab,
+                                            index,
+                                            entry,
+                                            state.target_window_id,
+                                        );
+                                    }
+                                    if !preview_candidate_touched {
+                                        self.preview_candidate = None;
+                                    }
+                                    if ui.input(|input| input.pointer.any_released()) {
+                                        self.dragging = None;
                                     }
                                 }
                             });
@@ -289,6 +384,7 @@ impl ClipboardManagerApp {
                         );
                     }
                     if response.changed() {
+                        self.invalidate_entries_cache();
                         ui.ctx().request_repaint();
                     }
                     if gear_button(ui).clicked() {
@@ -329,10 +425,55 @@ impl ClipboardManagerApp {
 
     fn expire_preview(&mut self, ctx: &egui::Context) {
         if self
+            .preview_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.last_hovered.elapsed() > PREVIEW_SHOW_DELAY)
+        {
+            self.preview_candidate = None;
+        }
+        if self
             .preview_last_activity()
             .is_some_and(|last_activity| last_activity.elapsed() > PREVIEW_HIDE_DELAY)
         {
             self.clear_preview(ctx);
+        }
+    }
+
+    fn queue_preview_entry(&mut self, ctx: &egui::Context, entry: ClipboardEntryView) {
+        let now = Instant::now();
+        let mut promote = None;
+        match self.preview_candidate.as_mut() {
+            Some(candidate) if candidate.entry.id() == entry.id() => {
+                candidate.last_hovered = now;
+                let elapsed = now.duration_since(candidate.requested_at);
+                if elapsed >= PREVIEW_SHOW_DELAY {
+                    promote = Some(candidate.entry.clone());
+                } else {
+                    ctx.request_repaint_after(PREVIEW_SHOW_DELAY - elapsed);
+                }
+            }
+            _ => {
+                let current_preview_id = self
+                    .preview
+                    .read()
+                    .ok()
+                    .and_then(|preview| preview.as_ref().map(|preview| preview.entry.id()));
+                if current_preview_id.is_some_and(|id| id != entry.id()) {
+                    if let Ok(mut preview) = self.preview.write() {
+                        *preview = None;
+                    }
+                    self.hide_preview_viewport(ctx);
+                }
+                self.preview_candidate = Some(ClipboardPreviewCandidate {
+                    entry,
+                    requested_at: now,
+                    last_hovered: now,
+                });
+                ctx.request_repaint_after(PREVIEW_SHOW_DELAY);
+            }
+        }
+        if let Some(entry) = promote {
+            self.set_preview_entry(ctx, entry);
         }
     }
 
@@ -356,10 +497,11 @@ impl ClipboardManagerApp {
             ctx.request_repaint();
             ctx.request_repaint_of(preview_viewport_id());
         }
-        ctx.request_repaint_after(Duration::from_millis(150));
+        ctx.request_repaint_after(PREVIEW_KEEPALIVE_INTERVAL);
     }
 
     fn clear_preview(&mut self, ctx: &egui::Context) {
+        self.preview_candidate = None;
         if let Ok(mut preview) = self.preview.write() {
             *preview = None;
         }
@@ -414,12 +556,14 @@ impl ClipboardManagerApp {
     fn entry_row(
         &mut self,
         ui: &mut egui::Ui,
+        active_tab: ClipboardManagerTab,
         index: usize,
         entry: &ClipboardEntryView,
         target_window_id: usize,
-    ) {
+    ) -> bool {
         let mut activation = None;
         let mut pin_action = None;
+        let mut preview_candidate_touched = false;
         ui.horizontal(|ui| {
             if index < 9 {
                 let button =
@@ -437,15 +581,47 @@ impl ClipboardManagerApp {
             }
 
             let summary = entry_summary(entry);
-            let (response, text_truncated) = entry_text_response(ui, &summary);
-            if response.hovered() {
+            let is_dragging = self
+                .dragging
+                .is_some_and(|drag| drag.active_tab == active_tab && drag.entry_id == entry.id());
+            let (response, text_truncated) = entry_text_response(ui, &summary, is_dragging);
+            if response.drag_started() {
+                self.dragging = Some(ClipboardDrag {
+                    entry_id: entry.id(),
+                    active_tab,
+                });
+                self.clear_preview(ui.ctx());
+                ui.ctx().request_repaint();
+            }
+            if let Some(drag) = self.dragging
+                && drag.active_tab == active_tab
+                && drag.entry_id != entry.id()
+                && response.hovered()
+                && ui.input(|input| input.pointer.any_released())
+            {
+                let position = ui
+                    .input(|input| input.pointer.interact_pos())
+                    .map(|pointer| {
+                        if pointer.y <= response.rect.center().y {
+                            ClipboardReorderPosition::Before
+                        } else {
+                            ClipboardReorderPosition::After
+                        }
+                    })
+                    .unwrap_or(ClipboardReorderPosition::After);
+                self.reorder_entry(active_tab, drag.entry_id, entry.id(), position);
+                self.dragging = None;
+                ui.ctx().request_repaint();
+            }
+            if response.hovered() && self.dragging.is_none() {
                 if entry_has_preview(entry, text_truncated) {
-                    self.set_preview_entry(ui.ctx(), entry.clone());
+                    self.queue_preview_entry(ui.ctx(), entry.clone());
+                    preview_candidate_touched = true;
                 } else {
                     self.clear_preview(ui.ctx());
                 }
             }
-            let clicked = response.clicked();
+            let clicked = response.clicked() && self.dragging.is_none();
             let pinned = entry.pinned_at_ms().is_some();
             let pin_label = if pinned { "Unpin" } else { "Pin" };
             response.context_menu(|ui| {
@@ -461,11 +637,13 @@ impl ClipboardManagerApp {
 
         if let Some(pinned) = pin_action {
             self.pin_entry(entry.id(), pinned);
+            self.invalidate_entries_cache();
             ui.ctx().request_repaint();
         }
         if let Some(activation) = activation {
             self.activate_entry(ui.ctx(), entry, target_window_id, activation);
         }
+        preview_candidate_touched
     }
 
     fn quick_insert_index(&self, ctx: &egui::Context, entry_count: usize) -> Option<usize> {
@@ -522,7 +700,12 @@ impl ClipboardManagerApp {
         if self.shown == visible {
             return;
         }
+        eprintln!(
+            "[ui-viewport] clipboard set_visible requested visible={} previous_shown={}",
+            visible, self.shown
+        );
         if visible {
+            self.title_bar_styled = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(
                 CLIPBOARD_WINDOW_TITLE.to_owned(),
             ));
@@ -537,16 +720,27 @@ impl ClipboardManagerApp {
             )));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            eprintln!("[ui-viewport] clipboard visible/focus commands sent");
         } else {
+            self.title_bar_styled = false;
+            self.entries_cache = None;
+            self.dragging = None;
             park_hidden_root_viewport(ctx);
+            eprintln!("[ui-viewport] clipboard parked hidden root viewport");
         }
         self.shown = visible;
+        eprintln!(
+            "[ui-viewport] clipboard shown state updated shown={}",
+            self.shown
+        );
     }
 
     fn hide_shared(&mut self, ctx: &egui::Context) {
+        eprintln!("[ui-command] clipboard hide requested shown={}", self.shown);
         if let Ok(mut state) = self.state.write() {
             state.visible = false;
             state.serial = state.serial.wrapping_add(1);
+            eprintln!("[ui-command] clipboard hide state serial={}", state.serial);
         }
         if let Ok(mut preview) = self.preview.write() {
             *preview = None;
@@ -554,6 +748,39 @@ impl ClipboardManagerApp {
         self.hide_preview_viewport(ctx);
         self.set_visible(ctx, false);
         ctx.request_repaint();
+    }
+
+    fn load_entries_cached(
+        &mut self,
+        active_tab: ClipboardManagerTab,
+    ) -> Result<Arc<Vec<ClipboardEntryView>>, String> {
+        let cache_valid = self.entries_cache.as_ref().is_some_and(|cache| {
+            cache.active_tab == active_tab
+                && cache.filter == self.filter
+                && cache.refreshed_at.elapsed() < ENTRY_CACHE_REFRESH_INTERVAL
+        });
+        if !cache_valid {
+            let result = self.load_entries(active_tab).map(Arc::new);
+            self.entries_cache = Some(ClipboardEntriesCache {
+                active_tab,
+                filter: self.filter.clone(),
+                refreshed_at: Instant::now(),
+                result,
+            });
+        }
+        match &self
+            .entries_cache
+            .as_ref()
+            .expect("cache was just filled")
+            .result
+        {
+            Ok(entries) => Ok(Arc::clone(entries)),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn invalidate_entries_cache(&mut self) {
+        self.entries_cache = None;
     }
 
     fn load_entries(
@@ -583,6 +810,28 @@ impl ClipboardManagerApp {
         if let Err(error) = result {
             eprintln!("clipboard pin update skipped: {error}");
         }
+    }
+
+    fn reorder_entry(
+        &mut self,
+        active_tab: ClipboardManagerTab,
+        moved_entry_id: ClipboardEntryId,
+        target_entry_id: ClipboardEntryId,
+        position: ClipboardReorderPosition,
+    ) {
+        let Ok(mut database) = Database::open(&self.database_path) else {
+            return;
+        };
+        let list = match active_tab {
+            ClipboardManagerTab::Current => ClipboardEntryList::Current,
+            ClipboardManagerTab::Pinned => ClipboardEntryList::Pinned,
+        };
+        if let Err(error) =
+            database.reorder_clipboard_entry(list, moved_entry_id, target_entry_id, position)
+        {
+            eprintln!("clipboard reorder skipped: {error}");
+        }
+        self.invalidate_entries_cache();
     }
 
     fn mark_entry_used(&self, entry_id: ClipboardEntryId) {
@@ -661,7 +910,7 @@ impl ClipboardManagerApp {
             .with_active(false)
             .with_visible(true);
         ctx.show_viewport_deferred(preview_viewport_id(), viewport, move |ui, _class| {
-            apply_preview_style(ui.ctx());
+            // Preview inherits the manager style; avoid resetting style every preview frame.
             let bounds = ui.max_rect();
             if ui.input(|input| {
                 input
@@ -672,7 +921,7 @@ impl ClipboardManagerApp {
                 if let Ok(mut hovered_at) = hover_state.write() {
                     *hovered_at = Some(Instant::now());
                 }
-                ui.ctx().request_repaint_after(Duration::from_millis(150));
+                ui.ctx().request_repaint_after(PREVIEW_KEEPALIVE_INTERVAL);
             }
             if let Some(preview) = preview_state
                 .read()
@@ -683,7 +932,7 @@ impl ClipboardManagerApp {
             }
         });
         self.preview_shown = true;
-        ctx.request_repaint_after(Duration::from_millis(150));
+        // Keepalive repaint is scheduled only when preview hover or entry state changes.
     }
 
     fn hide_preview_viewport(&mut self, ctx: &egui::Context) {
@@ -713,10 +962,13 @@ impl ClipboardManagerApp {
     }
 }
 
-fn entry_text_response(ui: &mut egui::Ui, text: &str) -> (egui::Response, bool) {
+fn entry_text_response(ui: &mut egui::Ui, text: &str, dragging: bool) -> (egui::Response, bool) {
     let width = ui.available_width().max(80.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, ENTRY_ROW_HEIGHT), Sense::click());
-    let fill = if response.hovered() {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(width, ENTRY_ROW_HEIGHT), Sense::click_and_drag());
+    let fill = if dragging {
+        SELECTED_TAB
+    } else if response.hovered() {
         ROW_HOVER_BG
     } else {
         ROW_BG
@@ -855,36 +1107,10 @@ fn preview_window_position(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 
     })
 }
 
-fn apply_preview_style(ctx: &egui::Context) {
-    for theme in [egui::Theme::Light, egui::Theme::Dark] {
-        let mut style = (*ctx.style_of(theme)).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.override_text_color = Some(TEXT);
-        style.visuals.window_fill = WINDOW_BG;
-        style.visuals.panel_fill = PANEL_BG;
-        style.visuals.extreme_bg_color = PANEL_BG;
-        style.visuals.faint_bg_color = ROW_BG;
-        style.spacing.scroll = egui::style::ScrollStyle::solid();
-        style.visuals.selection.bg_fill = SELECTED_TAB;
-        style.visuals.selection.stroke.color = TEXT;
-        style.visuals.widgets.noninteractive.fg_stroke.color = TEXT;
-        style.visuals.widgets.inactive.bg_fill = ROW_BG;
-        style.visuals.widgets.inactive.weak_bg_fill = ROW_BG;
-        style.visuals.widgets.inactive.fg_stroke.color = TEXT;
-        style.visuals.widgets.hovered.bg_fill = ACCENT_DIM;
-        style.visuals.widgets.hovered.weak_bg_fill = ACCENT_DIM;
-        style.visuals.widgets.hovered.fg_stroke.color = TEXT;
-        style.visuals.widgets.open.bg_fill = ACCENT;
-        style.visuals.widgets.open.weak_bg_fill = ACCENT_DIM;
-        style.visuals.widgets.active.bg_fill = ACCENT;
-        style.visuals.widgets.active.fg_stroke.color = TEXT;
-        ctx.set_style_of(theme, style);
-    }
-}
-
-fn apply_clipboard_title_bar_color() {
+// Preview style is inherited from the manager root viewport.
+fn apply_clipboard_title_bar_color() -> bool {
     let Some(hwnd) = find_current_process_window(CLIPBOARD_WINDOW_TITLE) else {
-        return;
+        return false;
     };
     unsafe {
         let dark_mode: i32 = 1;
@@ -907,6 +1133,7 @@ fn apply_clipboard_title_bar_color() {
             size_of::<u32>() as u32,
         );
     }
+    true
 }
 
 struct WindowSearch {

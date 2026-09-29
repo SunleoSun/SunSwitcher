@@ -39,6 +39,34 @@ impl CompletionCandidate {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PrefixEvidence {
+    pub has_exact_word: bool,
+    pub best_user_use_count: u32,
+    pub best_system_frequency: u32,
+    pub best_sequence_score: f64,
+    pub candidate_count_capped: u8,
+}
+
+impl PrefixEvidence {
+    pub fn score(self) -> f32 {
+        let exact = if self.has_exact_word { 2.0 } else { 0.0 };
+        let user = if self.best_user_use_count == 0 {
+            0.0
+        } else {
+            1.5 + (1.0 + self.best_user_use_count as f32).ln()
+        };
+        let system = if self.best_system_frequency == 0 {
+            0.0
+        } else {
+            (1.0 + self.best_system_frequency as f32).ln() * 0.35
+        };
+        let sequence = (self.best_sequence_score as f32).min(4.0) * 0.8;
+        let count = self.candidate_count_capped as f32 * 0.15;
+        exact + user + system + sequence + count
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionSnapshotError {
     Unavailable,
@@ -162,6 +190,69 @@ impl CompletionProvider {
         }
     }
 
+    pub fn lexical_snapshot(&self) -> &LexicalSnapshot {
+        &self.snapshot
+    }
+
+    pub fn prefix_evidence(
+        &self,
+        context_tokens: &[&str],
+        prefix: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> PrefixEvidence {
+        let normalized = normalize_completion_prefix(prefix);
+        if normalized.is_empty() || limit == 0 {
+            return PrefixEvidence::default();
+        }
+
+        let mut evidence = PrefixEvidence::default();
+        if self
+            .snapshot
+            .user_lexicon()
+            .contains_normalized(&normalized)
+            || self
+                .snapshot
+                .languages()
+                .iter()
+                .any(|language| language.contains_normalized(&normalized))
+        {
+            evidence.has_exact_word = true;
+        }
+
+        for word in self
+            .snapshot
+            .user_lexicon()
+            .prefix_matches(&normalized, limit)
+            .into_iter()
+            .take(limit)
+        {
+            evidence.best_user_use_count = evidence.best_user_use_count.max(word.use_count());
+            evidence.candidate_count_capped = evidence.candidate_count_capped.saturating_add(1);
+        }
+
+        for language in self.snapshot.languages() {
+            for entry in language
+                .prefix_matches(&normalized, limit)
+                .into_iter()
+                .take(limit)
+            {
+                evidence.best_system_frequency =
+                    evidence.best_system_frequency.max(entry.frequency());
+                evidence.candidate_count_capped = evidence.candidate_count_capped.saturating_add(1);
+            }
+        }
+
+        evidence.best_sequence_score = self
+            .sequences
+            .complete_for_prefix(context_tokens, &normalized, now_ms, limit)
+            .into_iter()
+            .filter(|candidate| self.sequence_completion_is_lexically_valid(candidate))
+            .map(|candidate| candidate.user_score())
+            .fold(0.0_f64, f64::max);
+        evidence
+    }
+
     pub fn complete(&self, prefix: &str, limit: usize) -> Vec<CompletionCandidate> {
         if limit == 0 {
             return Vec::new();
@@ -282,4 +373,17 @@ struct RankedWordCandidate {
     source_priority: u8,
     recency: i64,
     usage: u32,
+}
+
+fn normalize_completion_prefix(prefix: &str) -> String {
+    let characters = prefix.chars().collect::<Vec<_>>();
+    let mut start = 0;
+    while start < characters.len() && !characters[start].is_alphanumeric() {
+        start += 1;
+    }
+    let mut end = characters.len();
+    while end > start && !characters[end - 1].is_alphanumeric() {
+        end -= 1;
+    }
+    normalize_word(&characters[start..end].iter().collect::<String>())
 }

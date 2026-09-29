@@ -26,6 +26,8 @@ use crate::replacement::{SelectedReplacementAction, SelectedText};
 const COPY_TIMEOUT: Duration = Duration::from_millis(700);
 const CLIPBOARD_OPEN_TIMEOUT: Duration = Duration::from_millis(300);
 const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_OBSERVABLE_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+const MAX_OBSERVABLE_CLIPBOARD_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const VK_C_KEY: u16 = b'C' as u16;
 const VK_V_KEY: u16 = b'V' as u16;
 const VK_INSERT_KEY: u16 = 0x2D;
@@ -830,7 +832,7 @@ pub fn read_observable_clipboard_content()
         file_drop_available,
         image_available,
     ) {
-        ClipboardSnapshotMode::UnicodeText => Ok(read_unicode_clipboard_text()?
+        ClipboardSnapshotMode::UnicodeText => Ok(read_observable_unicode_clipboard_text()?
             .filter(|text| !text.is_empty())
             .map(ObservableClipboardContent::Text)),
         ClipboardSnapshotMode::Image => {
@@ -858,7 +860,7 @@ pub(super) fn read_observable_clipboard_text() -> Result<Option<String>, Selecte
     {
         return Ok(None);
     }
-    read_unicode_clipboard_text()
+    read_observable_unicode_clipboard_text()
 }
 
 fn read_observable_clipboard_image()
@@ -873,11 +875,52 @@ fn read_observable_clipboard_image()
         }
     };
     let _clipboard = ClipboardOpenGuard::open()?;
-    let bytes = read_open_hglobal_bytes(format)?;
+    let Some(bytes) =
+        read_limited_open_hglobal_bytes(format, MAX_OBSERVABLE_CLIPBOARD_IMAGE_BYTES)?
+    else {
+        return Ok(None);
+    };
     if bytes.is_empty() {
         return Ok(None);
     }
     Ok(Some(ClipboardImagePayload::new(name.to_owned(), bytes)))
+}
+
+fn read_observable_unicode_clipboard_text() -> Result<Option<String>, SelectedTextRuntimeError> {
+    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT as u32) } == 0 {
+        return Ok(None);
+    }
+
+    let _clipboard = ClipboardOpenGuard::open()?;
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT as u32) };
+    if handle.is_null() {
+        return Err(SelectedTextRuntimeError::ClipboardReadFailed);
+    }
+
+    let bytes = unsafe { GlobalSize(handle) };
+    if bytes < size_of::<u16>() {
+        return Err(SelectedTextRuntimeError::ClipboardReadFailed);
+    }
+    if !clipboard_payload_size_within_observable_limit(bytes, MAX_OBSERVABLE_CLIPBOARD_TEXT_BYTES) {
+        return Ok(None);
+    }
+    let units_len = bytes / size_of::<u16>();
+    let pointer = unsafe { GlobalLock(handle) } as *const u16;
+    if pointer.is_null() {
+        return Err(SelectedTextRuntimeError::ClipboardReadFailed);
+    }
+
+    let units = unsafe { std::slice::from_raw_parts(pointer, units_len) };
+    let content_len = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units_len);
+    let decoded = String::from_utf16(&units[..content_len])
+        .map_err(|_| SelectedTextRuntimeError::ClipboardTextDecodeFailed);
+    unsafe {
+        GlobalUnlock(handle);
+    }
+    decoded.map(Some)
 }
 
 fn read_unicode_clipboard_text() -> Result<Option<String>, SelectedTextRuntimeError> {
@@ -912,6 +955,36 @@ fn read_unicode_clipboard_text() -> Result<Option<String>, SelectedTextRuntimeEr
         GlobalUnlock(handle);
     }
     decoded.map(Some)
+}
+
+fn clipboard_payload_size_within_observable_limit(size: usize, max_bytes: usize) -> bool {
+    size <= max_bytes
+}
+
+fn read_limited_open_hglobal_bytes(
+    format: u32,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, SelectedTextRuntimeError> {
+    let handle = unsafe { GetClipboardData(format) };
+    if handle.is_null() {
+        return Err(SelectedTextRuntimeError::ClipboardSnapshotFailed);
+    }
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 {
+        return Err(SelectedTextRuntimeError::ClipboardSnapshotFailed);
+    }
+    if !clipboard_payload_size_within_observable_limit(size, max_bytes) {
+        return Ok(None);
+    }
+    let pointer = unsafe { GlobalLock(handle) } as *const u8;
+    if pointer.is_null() {
+        return Err(SelectedTextRuntimeError::ClipboardSnapshotFailed);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pointer, size) }.to_vec();
+    unsafe {
+        GlobalUnlock(handle);
+    }
+    Ok(Some(bytes))
 }
 
 fn read_open_hglobal_bytes(format: u32) -> Result<Vec<u8>, SelectedTextRuntimeError> {
@@ -1113,4 +1186,15 @@ impl Drop for ClipboardOpenGuard {
 
 pub(super) fn unicode_clipboard_units(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observable_clipboard_payload_limit_is_inclusive() {
+        assert!(clipboard_payload_size_within_observable_limit(16, 16));
+        assert!(!clipboard_payload_size_within_observable_limit(17, 16));
+    }
 }
