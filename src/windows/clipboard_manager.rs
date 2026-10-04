@@ -39,7 +39,7 @@ const PREVIEW_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(750);
 const PARKED_POSITION: f32 = -32_000.0;
 const ENTRY_LIMIT: usize = 100;
 const INSERT_FOCUS_DELAY: Duration = Duration::from_millis(45);
-const ENTRY_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+// Clipboard history refresh is event-driven through ClipboardManagerState::serial.
 const ENTRY_ROW_HEIGHT: f32 = 26.0;
 const NUMBER_BUTTON_WIDTH: f32 = 28.0;
 const TAB_BUTTON_WIDTH: f32 = 74.0;
@@ -53,6 +53,7 @@ const TEXT: Color32 = Color32::from_rgb(244, 242, 226);
 const MUTED_TEXT: Color32 = Color32::from_rgb(170, 168, 150);
 const ACCENT: Color32 = Color32::from_rgb(226, 184, 63);
 const ACCENT_DIM: Color32 = Color32::from_rgb(104, 84, 32);
+const SCROLLBAR_IDLE: Color32 = Color32::from_rgb(82, 72, 48);
 const SELECTED_TAB: Color32 = Color32::from_rgb(77, 63, 28);
 const INACTIVE_TAB: Color32 = Color32::from_rgb(42, 43, 40);
 const CLIPBOARD_WINDOW_TITLE: &str = "SunSwitcher Clipboard";
@@ -129,7 +130,7 @@ impl ClipboardManagerHandle {
         };
         let next_serial = next.serial;
         let state_changed = replace_clipboard_manager_state(&self.state, next);
-        eprintln!(
+        crate::runtime_log!(
             "[ui-command] clipboard show requested tab={:?} target_window_id={} previous_visible={} previous_serial={} next_serial={} state_changed={}",
             active_tab,
             target_window_id,
@@ -139,11 +140,13 @@ impl ClipboardManagerHandle {
             state_changed
         );
         self.repaint_ctx
+            .send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        self.repaint_ctx
             .send_viewport_cmd(egui::ViewportCommand::Visible(true));
         self.repaint_ctx
             .send_viewport_cmd(egui::ViewportCommand::Focus);
         self.repaint_ctx.request_repaint();
-        eprintln!("[ui-command] clipboard show viewport commands sent");
+        crate::runtime_log!("[ui-command] clipboard show viewport commands sent");
     }
 
     pub fn notify_history_changed(&self) {
@@ -151,12 +154,16 @@ impl ClipboardManagerHandle {
             Ok(mut state) => {
                 let previous_serial = state.serial;
                 state.serial = state.serial.wrapping_add(1);
-                eprintln!(
+                crate::runtime_log!(
                     "[ui-command] clipboard history changed visible={} serial={} next_serial={}",
-                    state.visible, previous_serial, state.serial
+                    state.visible,
+                    previous_serial,
+                    state.serial
                 );
             }
-            Err(_) => eprintln!("[ui-command] clipboard history changed but state lock failed"),
+            Err(_) => {
+                crate::runtime_log!("[ui-command] clipboard history changed but state lock failed")
+            }
         }
         self.repaint_ctx.request_repaint();
     }
@@ -195,15 +202,19 @@ struct ClipboardPreview {
 struct ClipboardPreviewCandidate {
     entry: ClipboardEntryView,
     requested_at: Instant,
-    last_hovered: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct ClipboardEntriesCache {
     active_tab: ClipboardManagerTab,
     filter: String,
-    refreshed_at: Instant,
     result: Result<Arc<Vec<ClipboardEntryView>>, String>,
+}
+
+impl ClipboardEntriesCache {
+    fn matches(&self, active_tab: ClipboardManagerTab, filter: &str) -> bool {
+        self.active_tab == active_tab && self.filter == filter
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,8 +242,24 @@ impl ClipboardManagerApp {
         }
     }
     pub(crate) fn logic(&mut self, ctx: &egui::Context) -> bool {
-        if self.shown && ctx.input(|input| input.viewport().close_requested()) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            // The root viewport is SunSwitcher's permanent eframe event pump. Native close
+            // requests may be delivered again after the clipboard window was already parked;
+            // accepting any of them would terminate the UI worker and strand both clipboard
+            // and autocomplete state without a renderer.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.shown {
+                self.hide_shared(ctx);
+            } else {
+                crate::runtime_log!(
+                    "[ui-command] root close canceled while clipboard already hidden"
+                );
+            }
+            return false;
+        }
+
+        if self.shown && ctx.input(|input| input.viewport().minimized == Some(true)) {
+            crate::runtime_log!("[ui-command] clipboard minimize requested; parking root viewport");
             self.hide_shared(ctx);
             return false;
         }
@@ -246,7 +273,7 @@ impl ClipboardManagerApp {
             let previous_serial = self.last_serial;
             self.last_serial = state.serial;
             self.invalidate_entries_cache();
-            eprintln!(
+            crate::runtime_log!(
                 "[ui-frame] clipboard state observed previous_serial={} current_serial={} visible={} shown={} tab={:?} target_window_id={}",
                 previous_serial,
                 state.serial,
@@ -258,9 +285,6 @@ impl ClipboardManagerApp {
             ctx.request_repaint();
         }
         self.set_visible(ctx, state.visible);
-        if state.visible {
-            ctx.request_repaint_after(ENTRY_CACHE_REFRESH_INTERVAL);
-        }
         if state.visible {
             if !self.style_applied {
                 self.apply_style(ctx);
@@ -293,8 +317,6 @@ impl ClipboardManagerApp {
         if let Some(tab) = self.consume_tab_switch_shortcuts(ui.ctx()) {
             self.set_active_tab(tab);
         }
-        self.expire_preview(ui.ctx());
-
         let state = self
             .state
             .read()
@@ -323,6 +345,7 @@ impl ClipboardManagerApp {
             return true;
         }
 
+        let mut preview_source_hovered = false;
         egui::Frame::new()
             .fill(WINDOW_BG)
             .stroke(Stroke::new(1.0, ACCENT_DIM))
@@ -357,6 +380,7 @@ impl ClipboardManagerApp {
                                     if !preview_candidate_touched {
                                         self.preview_candidate = None;
                                     }
+                                    preview_source_hovered = preview_candidate_touched;
                                     if ui.input(|input| input.pointer.any_released()) {
                                         self.dragging = None;
                                     }
@@ -392,6 +416,7 @@ impl ClipboardManagerApp {
                     }
                 });
             });
+        self.expire_preview(ui.ctx(), preview_source_hovered);
         self.show_settings(ui.ctx());
         self.show_preview(ui.ctx());
         true
@@ -423,18 +448,8 @@ impl ClipboardManagerApp {
         }
     }
 
-    fn expire_preview(&mut self, ctx: &egui::Context) {
-        if self
-            .preview_candidate
-            .as_ref()
-            .is_some_and(|candidate| candidate.last_hovered.elapsed() > PREVIEW_SHOW_DELAY)
-        {
-            self.preview_candidate = None;
-        }
-        if self
-            .preview_last_activity()
-            .is_some_and(|last_activity| last_activity.elapsed() > PREVIEW_HIDE_DELAY)
-        {
+    fn expire_preview(&mut self, ctx: &egui::Context, source_hovered: bool) {
+        if preview_should_expire(self.preview_last_activity(), source_hovered, Instant::now()) {
             self.clear_preview(ctx);
         }
     }
@@ -444,7 +459,6 @@ impl ClipboardManagerApp {
         let mut promote = None;
         match self.preview_candidate.as_mut() {
             Some(candidate) if candidate.entry.id() == entry.id() => {
-                candidate.last_hovered = now;
                 let elapsed = now.duration_since(candidate.requested_at);
                 if elapsed >= PREVIEW_SHOW_DELAY {
                     promote = Some(candidate.entry.clone());
@@ -467,7 +481,6 @@ impl ClipboardManagerApp {
                 self.preview_candidate = Some(ClipboardPreviewCandidate {
                     entry,
                     requested_at: now,
-                    last_hovered: now,
                 });
                 ctx.request_repaint_after(PREVIEW_SHOW_DELAY);
             }
@@ -682,7 +695,9 @@ impl ClipboardManagerApp {
             style.visuals.selection.bg_fill = SELECTED_TAB;
             style.visuals.selection.stroke.color = TEXT;
             style.visuals.widgets.noninteractive.fg_stroke.color = TEXT;
-            style.visuals.widgets.inactive.bg_fill = ROW_BG;
+            // Solid egui scrollbars take their idle handle color from inactive.bg_fill.
+            // Keep weak widget backgrounds dark while making the idle thumb visible.
+            style.visuals.widgets.inactive.bg_fill = SCROLLBAR_IDLE;
             style.visuals.widgets.inactive.weak_bg_fill = ROW_BG;
             style.visuals.widgets.inactive.fg_stroke.color = TEXT;
             style.visuals.widgets.hovered.bg_fill = ACCENT_DIM;
@@ -700,9 +715,10 @@ impl ClipboardManagerApp {
         if self.shown == visible {
             return;
         }
-        eprintln!(
+        crate::runtime_log!(
             "[ui-viewport] clipboard set_visible requested visible={} previous_shown={}",
-            visible, self.shown
+            visible,
+            self.shown
         );
         if visible {
             self.title_bar_styled = false;
@@ -718,29 +734,30 @@ impl ClipboardManagerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 200.0, 160.0,
             )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            eprintln!("[ui-viewport] clipboard visible/focus commands sent");
+            crate::runtime_log!("[ui-viewport] clipboard visible/focus commands sent");
         } else {
             self.title_bar_styled = false;
             self.entries_cache = None;
             self.dragging = None;
             park_hidden_root_viewport(ctx);
-            eprintln!("[ui-viewport] clipboard parked hidden root viewport");
+            crate::runtime_log!("[ui-viewport] clipboard parked hidden root viewport");
         }
         self.shown = visible;
-        eprintln!(
+        crate::runtime_log!(
             "[ui-viewport] clipboard shown state updated shown={}",
             self.shown
         );
     }
 
     fn hide_shared(&mut self, ctx: &egui::Context) {
-        eprintln!("[ui-command] clipboard hide requested shown={}", self.shown);
+        crate::runtime_log!("[ui-command] clipboard hide requested shown={}", self.shown);
         if let Ok(mut state) = self.state.write() {
             state.visible = false;
             state.serial = state.serial.wrapping_add(1);
-            eprintln!("[ui-command] clipboard hide state serial={}", state.serial);
+            crate::runtime_log!("[ui-command] clipboard hide state serial={}", state.serial);
         }
         if let Ok(mut preview) = self.preview.write() {
             *preview = None;
@@ -754,17 +771,15 @@ impl ClipboardManagerApp {
         &mut self,
         active_tab: ClipboardManagerTab,
     ) -> Result<Arc<Vec<ClipboardEntryView>>, String> {
-        let cache_valid = self.entries_cache.as_ref().is_some_and(|cache| {
-            cache.active_tab == active_tab
-                && cache.filter == self.filter
-                && cache.refreshed_at.elapsed() < ENTRY_CACHE_REFRESH_INTERVAL
-        });
+        let cache_valid = self
+            .entries_cache
+            .as_ref()
+            .is_some_and(|cache| cache.matches(active_tab, &self.filter));
         if !cache_valid {
             let result = self.load_entries(active_tab).map(Arc::new);
             self.entries_cache = Some(ClipboardEntriesCache {
                 active_tab,
                 filter: self.filter.clone(),
-                refreshed_at: Instant::now(),
                 result,
             });
         }
@@ -808,7 +823,7 @@ impl ClipboardManagerApp {
             database.unpin_clipboard_entry(entry_id).map(|_| ())
         };
         if let Err(error) = result {
-            eprintln!("clipboard pin update skipped: {error}");
+            crate::runtime_log!("clipboard pin update skipped: {error}");
         }
     }
 
@@ -829,7 +844,7 @@ impl ClipboardManagerApp {
         if let Err(error) =
             database.reorder_clipboard_entry(list, moved_entry_id, target_entry_id, position)
         {
-            eprintln!("clipboard reorder skipped: {error}");
+            crate::runtime_log!("clipboard reorder skipped: {error}");
         }
         self.invalidate_entries_cache();
     }
@@ -838,7 +853,7 @@ impl ClipboardManagerApp {
         if let Ok(database) = Database::open(&self.database_path)
             && let Err(error) = database.mark_clipboard_entry_used(entry_id, now_ms())
         {
-            eprintln!("clipboard entry usage update skipped: {error}");
+            crate::runtime_log!("clipboard entry usage update skipped: {error}");
         }
     }
 
@@ -852,31 +867,31 @@ impl ClipboardManagerApp {
         match entry.content() {
             ClipboardEntryContent::Text(text) => {
                 if let Err(error) = copy_clipboard_text(text) {
-                    eprintln!("clipboard text copy failed: {error}");
+                    crate::runtime_log!("clipboard text copy failed: {error}");
                     return;
                 }
                 self.hide_shared(ctx);
                 if activation == EntryActivation::InsertIntoTarget {
                     if target_window_id == 0 {
-                        eprintln!("clipboard text insertion skipped: no target window");
+                        crate::runtime_log!("clipboard text insertion skipped: no target window");
                         return;
                     }
                     let focused = unsafe { SetForegroundWindow(target_window_id as HWND) } != 0;
                     if !focused {
-                        eprintln!(
+                        crate::runtime_log!(
                             "clipboard text insertion skipped: target window could not be focused"
                         );
                         return;
                     }
                     thread::sleep(INSERT_FOCUS_DELAY);
                     if let Err(error) = insert_clipboard_text() {
-                        eprintln!("clipboard text insertion failed: {error:?}");
+                        crate::runtime_log!("clipboard text insertion failed: {error:?}");
                     }
                 }
             }
             ClipboardEntryContent::Image { format, data } => {
                 if let Err(error) = copy_clipboard_image(format, data) {
-                    eprintln!("clipboard image copy failed: {error}");
+                    crate::runtime_log!("clipboard image copy failed: {error}");
                     return;
                 }
                 self.mark_entry_used(entry.id());
@@ -1055,6 +1070,7 @@ fn park_hidden_root_viewport(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Title("SunSwitcher UI".to_owned()));
     ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(1.0, 1.0)));
     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(
         PARKED_POSITION,
@@ -1078,6 +1094,17 @@ fn preview_text(text: &str, max_chars: usize) -> (String, bool) {
 fn copy_clipboard_image(format: &str, data: &[u8]) -> Result<(), String> {
     let _guard = InternalClipboardMutationGuard::begin();
     set_image_clipboard_payload(format, data).map_err(|error| format!("{error:?}"))
+}
+
+fn preview_should_expire(
+    last_activity: Option<Instant>,
+    source_hovered: bool,
+    now: Instant,
+) -> bool {
+    !source_hovered
+        && last_activity.is_some_and(|last_activity| {
+            now.saturating_duration_since(last_activity) > PREVIEW_HIDE_DELAY
+        })
 }
 
 fn preview_viewport_id() -> ViewportId {
@@ -1344,6 +1371,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_expiry_respects_live_source_hover() {
+        let now = Instant::now();
+        let stale = now - PREVIEW_HIDE_DELAY - Duration::from_millis(1);
+
+        assert!(!preview_should_expire(Some(stale), true, now));
+        assert!(preview_should_expire(Some(stale), false, now));
+        assert!(!preview_should_expire(None, false, now));
+    }
+
+    #[test]
     fn preview_collapses_and_truncates_text() {
         assert_eq!(
             preview_text("hello\nworld", 72),
@@ -1413,6 +1450,153 @@ mod tests {
     #[test]
     fn timestamp_formats_epoch_minutes() {
         assert_eq!(format_timestamp_ms(0), "1970-01-01 00:00");
+    }
+
+    #[test]
+    fn entry_cache_validity_is_event_driven_by_tab_and_filter() {
+        let cache = ClipboardEntriesCache {
+            active_tab: ClipboardManagerTab::Current,
+            filter: "needle".to_owned(),
+            result: Ok(Arc::new(Vec::new())),
+        };
+        assert!(cache.matches(ClipboardManagerTab::Current, "needle"));
+        assert!(!cache.matches(ClipboardManagerTab::Pinned, "needle"));
+        assert!(!cache.matches(ClipboardManagerTab::Current, "other"));
+    }
+
+    #[test]
+    fn repeated_root_close_is_canceled_after_clipboard_window_is_parked() {
+        let state = Arc::new(RwLock::new(ClipboardManagerState {
+            visible: true,
+            active_tab: ClipboardManagerTab::Current,
+            target_window_id: 42,
+            serial: 1,
+        }));
+        let mut app = ClipboardManagerApp::new(std::path::PathBuf::new(), Arc::clone(&state));
+        app.shown = true;
+        let ctx = egui::Context::default();
+
+        let mut first_input = egui::RawInput::default();
+        first_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .events
+            .push(egui::ViewportEvent::Close);
+        let first_output = ctx.run_logic(&first_input, |ctx| {
+            assert!(!app.logic(ctx));
+        });
+        assert!(
+            first_output
+                .viewport_commands
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|commands| commands.contains(&egui::ViewportCommand::CancelClose))
+        );
+        assert!(!app.shown);
+        assert!(!state.read().expect("clipboard state").visible);
+
+        let mut repeated_input = egui::RawInput::default();
+        repeated_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .events
+            .push(egui::ViewportEvent::Close);
+        let repeated_output = ctx.run_logic(&repeated_input, |ctx| {
+            assert!(!app.logic(ctx));
+        });
+        assert!(
+            repeated_output
+                .viewport_commands
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|commands| commands.contains(&egui::ViewportCommand::CancelClose))
+        );
+    }
+
+    #[test]
+    fn show_command_restores_a_minimized_root() {
+        let state = Arc::new(RwLock::new(ClipboardManagerState::default()));
+        let ctx = egui::Context::default();
+        let output = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            let handle = ClipboardManagerHandle::new(Arc::clone(&state), ctx.clone());
+            handle.show(ClipboardManagerTab::Current, 42);
+        });
+        let commands = output
+            .viewport_commands
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport show commands");
+        assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(commands.contains(&egui::ViewportCommand::Visible(true)));
+        assert!(commands.contains(&egui::ViewportCommand::Focus));
+        let shared = state.read().expect("clipboard state");
+        assert!(shared.visible);
+        assert_eq!(shared.active_tab, ClipboardManagerTab::Current);
+        assert_eq!(shared.target_window_id, 42);
+    }
+
+    #[test]
+    fn minimizing_clipboard_parks_root_and_reopen_unminimizes() {
+        let state = Arc::new(RwLock::new(ClipboardManagerState {
+            visible: true,
+            active_tab: ClipboardManagerTab::Current,
+            target_window_id: 42,
+            serial: 1,
+        }));
+        let mut app = ClipboardManagerApp::new(std::path::PathBuf::new(), Arc::clone(&state));
+        app.shown = true;
+        app.last_serial = 1;
+        let ctx = egui::Context::default();
+
+        let mut minimized_input = egui::RawInput::default();
+        minimized_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .minimized = Some(true);
+        let minimized_output = ctx.run_logic(&minimized_input, |ctx| {
+            assert!(!app.logic(ctx));
+        });
+        let minimized_commands = minimized_output
+            .viewport_commands
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport commands after minimize");
+        assert!(minimized_commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(minimized_commands.contains(&egui::ViewportCommand::Visible(true)));
+        assert!(!app.shown);
+        assert!(!state.read().expect("clipboard state").visible);
+
+        {
+            let mut shared = state.write().expect("clipboard state");
+            shared.visible = true;
+            shared.serial = shared.serial.wrapping_add(1);
+        }
+        let reopened_output = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            assert!(app.logic(ctx));
+        });
+        let reopened_commands = reopened_output
+            .viewport_commands
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport commands after reopen");
+        assert!(reopened_commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(reopened_commands.contains(&egui::ViewportCommand::Visible(true)));
+        assert!(reopened_commands.contains(&egui::ViewportCommand::Focus));
+        assert!(app.shown);
+    }
+
+    #[test]
+    fn clipboard_style_keeps_idle_scrollbar_handle_visible() {
+        let state = Arc::new(RwLock::new(ClipboardManagerState::default()));
+        let app = ClipboardManagerApp::new(std::path::PathBuf::new(), state);
+        let ctx = egui::Context::default();
+        app.apply_style(&ctx);
+
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let style = ctx.style_of(theme);
+            assert!(!style.spacing.scroll.floating);
+            assert!(!style.spacing.scroll.foreground_color);
+            assert_eq!(style.visuals.widgets.inactive.bg_fill, SCROLLBAR_IDLE);
+            assert_ne!(style.visuals.widgets.inactive.bg_fill, ROW_BG);
+        }
     }
 
     #[test]

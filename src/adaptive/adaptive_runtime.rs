@@ -16,7 +16,7 @@ use crate::correction::{
 };
 use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome};
 use crate::language::normalize_word;
-use crate::lexicon::UserLexicon;
+use crate::lexicon::{UserLexicon, UserWord};
 use crate::persistence::{CorrectionEventId, CorrectionUndoPlan, Database, DatabaseError};
 use crate::replacement::{
     LivePrefixReplacementAction, ReplacementAction, ReplacementEngine, ReplacementOutcome,
@@ -1117,10 +1117,13 @@ fn learning_worker(
                 CompletionDeletionTarget::TextHistory(text) => database
                     .delete_text_history(&text)
                     .map_err(AdaptiveRuntimeError::from)
-                    .and_then(|_| {
-                        sequences
-                            .replace(database.load_text_history()?)
-                            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)
+                    .and_then(|deleted| {
+                        if deleted {
+                            sequences
+                                .replace(database.load_text_history()?)
+                                .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
+                        }
+                        Ok(())
                     }),
                 CompletionDeletionTarget::Word(normalized_term) => database
                     .hide_completion_word(&normalized_term)
@@ -1158,9 +1161,10 @@ fn learning_worker(
             } => {
                 let result = database
                     .commit_correction_undo(event_id, undone_at_ms)
-                    .and_then(|_| database.load_user_lexicon())
                     .map_err(AdaptiveRuntimeError::from)
-                    .and_then(|lexicon| snapshots.replace_user_lexicon(lexicon));
+                    .and_then(|updated| {
+                        refresh_user_lexicon_from_updates(&database, &snapshots, vec![updated])
+                    });
                 let response_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
                 let _ = response.send(response_result);
                 result
@@ -1171,9 +1175,10 @@ fn learning_worker(
             } => match receipt.response.recv() {
                 Ok(Ok(event_id)) => database
                     .commit_correction_undo(event_id, undone_at_ms)
-                    .and_then(|_| database.load_user_lexicon())
                     .map_err(AdaptiveRuntimeError::from)
-                    .and_then(|lexicon| snapshots.replace_user_lexicon(lexicon)),
+                    .and_then(|updated| {
+                        refresh_user_lexicon_from_updates(&database, &snapshots, vec![updated])
+                    }),
                 Ok(Err(error)) => Err(AdaptiveRuntimeError::LearningWorkerFailed(error)),
                 Err(_) => Err(AdaptiveRuntimeError::LearningWorkerUnavailable),
             },
@@ -1247,13 +1252,11 @@ fn observe_user_text(
     let canonicalize_ms = elapsed_millis(canonicalize_started_at);
 
     let user_words_db_started_at = Instant::now();
-    let user_words_changed = database.record_user_words_batch(&user_words, used_at_ms)?;
+    let user_word_updates = database.record_user_words_batch(&user_words, used_at_ms)?;
     let user_words_db_ms = elapsed_millis(user_words_db_started_at);
 
     let user_lexicon_reload_started_at = Instant::now();
-    if user_words_changed {
-        snapshots.replace_user_lexicon(database.load_user_lexicon()?)?;
-    }
+    refresh_user_lexicon_from_updates(database, snapshots, user_word_updates)?;
     let user_lexicon_reload_ms = elapsed_millis(user_lexicon_reload_started_at);
 
     let sequence_build_started_at = Instant::now();
@@ -1265,7 +1268,7 @@ fn observe_user_text(
     persist_sequence_observations(database, sequences, observed_sequences, used_at_ms)?;
     let sequence_persist_ms = elapsed_millis(sequence_persist_started_at);
 
-    eprintln!(
+    crate::runtime_log!(
         "[clipboard-learning-profile] original_bytes={} learned_bytes={} truncated={} tokens={} user_words={} ngrams={} tokenize_ms={} canonicalize_ms={} user_words_db_ms={} user_lexicon_reload_ms={} sequence_build_ms={} sequence_persist_ms={} total_ms={}",
         text.len(),
         learning_text.len(),
@@ -1305,7 +1308,19 @@ fn persist_sequence_observations(
     observed_sequences: Vec<String>,
     used_at_ms: i64,
 ) -> Result<(), AdaptiveRuntimeError> {
-    if database.record_text_history_batch(&observed_sequences, used_at_ms)? {
+    let updates = database.record_text_history_batch(&observed_sequences, used_at_ms)?;
+    if updates.is_empty() {
+        return Ok(());
+    }
+    if updates.len() >= SequenceSnapshotStore::REBASE_LIMIT {
+        return sequences
+            .replace(database.load_text_history()?)
+            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable);
+    }
+    let pending = sequences
+        .apply_updates(updates)
+        .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
+    if pending >= SequenceSnapshotStore::REBASE_LIMIT {
         sequences
             .replace(database.load_text_history()?)
             .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
@@ -1414,6 +1429,22 @@ fn elapsed_millis(started_at: Instant) -> u128 {
     started_at.elapsed().as_millis()
 }
 
+fn refresh_user_lexicon_from_updates(
+    database: &Database,
+    snapshots: &LexicalSnapshotStore,
+    updates: Vec<UserWord>,
+) -> Result<(), AdaptiveRuntimeError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let current = snapshots.load()?;
+    if let Some(updated) = current.user_lexicon().with_updated_existing_many(updates) {
+        snapshots.replace_user_lexicon(updated)
+    } else {
+        snapshots.replace_user_lexicon(database.load_user_lexicon()?)
+    }
+}
+
 fn observe_user_word(
     database: &Database,
     snapshots: &LexicalSnapshotStore,
@@ -1424,8 +1455,8 @@ fn observe_user_word(
     if !should_record_user_word(token, &snapshot) {
         return Ok(());
     }
-    database.record_user_word(token, used_at_ms)?;
-    snapshots.replace_user_lexicon(database.load_user_lexicon()?)
+    let updated = database.record_user_word(token, used_at_ms)?;
+    refresh_user_lexicon_from_updates(database, snapshots, vec![updated])
 }
 
 fn should_record_user_word(token: &str, snapshot: &LexicalSnapshot) -> bool {

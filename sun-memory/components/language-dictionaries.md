@@ -17,7 +17,7 @@ Each built-in language has two FSTs with the same stored frequency scale:
 
 Current full counts are 3,022,339 Russian forms and 88,750 English forms. Current correction subsets use score >= 4001 (approximately Zipf >= 4.00) and contain 9,484 Russian and 7,021 English forms. A correction-sidecar entry must exist in the full FST with exactly the same frequency or `LanguagePack` rejects the asset.
 
-`LanguagePack` owns one shared immutable `LanguageDictionaryData`: the full `fst::Map`, the materialized correction entries/delete index, and the correction-set maximum frequency. `LanguagePack` clones are cheap through `Arc`. `contains_normalized` uses the full FST. `candidate_entries` uses only the correction delete index. `prefix_matches` streams the full FST prefix range but retains only the requested bounded top-frequency results, avoiding materializing every match for broad prefixes.
+`LanguagePack` owns one shared immutable `LanguageDictionaryData`: the full `fst::Map`, the materialized correction entries/delete index, and the correction-set maximum frequency. The shared `DeleteIndex` compiles deletion-form keys into an in-memory `fst::Map`; each FST value encodes a single candidate directly or points to a compact boxed `u32` posting list for shared forms, preserving exact candidate semantics without retaining one heap string/hash bucket per deletion form. `LanguagePack` clones are cheap through `Arc`. `contains_normalized` uses the full FST. `candidate_entries` uses only the correction delete index. `prefix_matches` streams the full FST prefix range but retains only the requested bounded top-frequency results, avoiding materializing every match for broad prefixes.
 
 ## Surface forms, not suffix heuristics
 

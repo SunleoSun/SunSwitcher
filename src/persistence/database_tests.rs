@@ -5,6 +5,33 @@ use super::{
 };
 
 #[test]
+fn file_database_uses_wal_normal_and_in_memory_keeps_memory_journal() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let memory = Database::open_in_memory().unwrap();
+    let (memory_journal, _) = memory.storage_pragmas().unwrap();
+    assert_eq!(memory_journal, "memory");
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "sunswitcher-storage-{}-{nonce}.db",
+        std::process::id()
+    ));
+    let database = Database::open(&path).unwrap();
+    let (journal, synchronous) = database.storage_pragmas().unwrap();
+    assert_eq!(journal, "wal");
+    assert_eq!(synchronous, 1);
+    drop(database);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+#[test]
 fn default_settings_use_the_explicit_clipboard_history_limit() {
     let database = Database::open_in_memory().expect("fresh in-memory database should open");
 

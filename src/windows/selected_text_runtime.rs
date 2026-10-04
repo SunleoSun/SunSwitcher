@@ -208,7 +208,7 @@ impl SelectedTextSession {
         intent: SelectionCaptureIntent,
     ) -> Result<Option<Self>, SelectedTextRuntimeError> {
         let ui_selection = CaretLocator::new().selected_text();
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] explicit-selection UIA before copy={:?} intent={intent:?}",
             ui_selection
         );
@@ -217,7 +217,7 @@ impl SelectedTextSession {
             retained_after_copy: true,
         };
         if ui_selection.is_none() && intent != SelectionCaptureIntent::UserSelection {
-            eprintln!(
+            crate::runtime_log!(
                 "[double-shift] explicit-selection skipped clipboard probe without UIA selection or user selection intent"
             );
             return Ok(None);
@@ -234,14 +234,14 @@ impl SelectedTextSession {
         } else if ui_selection.is_some() {
             let Some(session) = Self::capture_current_with_shortcut(origin, CopyShortcut::CtrlC)?
             else {
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] explicit-selection proven by UIA but no copy shortcut produced text"
                 );
                 return Ok(None);
             };
             (session, CopyShortcut::CtrlC)
         } else {
-            eprintln!(
+            crate::runtime_log!(
                 "[double-shift] explicit-selection intended but safe copy shortcuts produced no text"
             );
             return Ok(None);
@@ -250,7 +250,7 @@ impl SelectedTextSession {
         if let Some(ui_selection) = ui_selection.as_deref()
             && session.selected.as_str() != ui_selection
         {
-            eprintln!(
+            crate::runtime_log!(
                 "[double-shift] explicit-selection mismatch UIA={:?} clipboard={:?}",
                 ui_selection,
                 session.selected.as_str()
@@ -269,7 +269,7 @@ impl SelectedTextSession {
         } else {
             false
         };
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] explicit-selection clipboard={:?} shortcut={} UIA after copy={:?} retained_after_copy={retained_after_copy}",
             session.selected.as_str(),
             shortcut.label(),
@@ -283,10 +283,12 @@ impl SelectedTextSession {
 
     pub fn capture_previous_word() -> Result<Option<Self>, SelectedTextRuntimeError> {
         ClipboardSnapshot::verify_preservable()?;
-        eprintln!("[double-shift] previous-text probe: Shift+Left({PREVIOUS_TEXT_LOOKBACK})");
+        crate::runtime_log!(
+            "[double-shift] previous-text probe: Shift+Left({PREVIOUS_TEXT_LOOKBACK})"
+        );
         inject_backward_selection(PREVIOUS_TEXT_LOOKBACK)?;
         let ui_after_selection = CaretLocator::new().selected_text();
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] previous-text UIA after backward selection={:?}; diagnostic only",
             ui_after_selection
         );
@@ -329,7 +331,7 @@ impl SelectedTextSession {
                     CopyShortcut::CtrlShiftC.label(),
                 )
             } else {
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] previous-text backward selection produced no copyable text; collapsing any synthetic selection to its right edge"
                 );
                 inject_key_press(VK_RIGHT_KEY)?;
@@ -339,7 +341,7 @@ impl SelectedTextSession {
         if !retained_after_copy {
             inject_key_presses(VK_RIGHT_KEY, copied_caret_steps)?;
         }
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] previous-text copied chunk={:?} chars={} caret_steps={} source={} retained_after_copy={} caret_restored={} restore_path={}",
             copied,
             copied.chars().count(),
@@ -355,7 +357,9 @@ impl SelectedTextSession {
         );
 
         let Some(range) = trailing_non_whitespace_range(&copied) else {
-            eprintln!("[double-shift] previous-text copied chunk contains only whitespace");
+            crate::runtime_log!(
+                "[double-shift] previous-text copied chunk contains only whitespace"
+            );
             if retained_after_copy {
                 inject_key_press(VK_RIGHT_KEY)?;
             }
@@ -364,9 +368,12 @@ impl SelectedTextSession {
         let chars = copied.chars().collect::<Vec<_>>();
         let end = range.leading_chars + range.selected_chars;
         let target = chars[range.leading_chars..end].iter().collect::<String>();
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] previous-text range leading={} selected={} trailing={} target={:?}",
-            range.leading_chars, range.selected_chars, range.trailing_chars, target
+            range.leading_chars,
+            range.selected_chars,
+            range.trailing_chars,
+            target
         );
         let selected = SelectedText::try_new(target)
             .map_err(|_| SelectedTextRuntimeError::SelectionChangedDuringCapture)?;
@@ -410,14 +417,14 @@ impl SelectedTextSession {
         let mut snapshot = ClipboardSnapshot::capture()?;
         let _observation_guard = super::clipboard_listener::InternalClipboardMutationGuard::begin();
         let sequence_before_copy = unsafe { GetClipboardSequenceNumber() };
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] clipboard capture start origin={origin:?} sequence_before={sequence_before_copy} shortcut={}",
             shortcut.label()
         );
 
         shortcut.copy_to_clipboard()?;
         if !wait_for_clipboard_change(sequence_before_copy, COPY_TIMEOUT) {
-            eprintln!(
+            crate::runtime_log!(
                 "[double-shift] clipboard capture timeout/no change origin={origin:?} shortcut={}",
                 shortcut.label()
             );
@@ -429,20 +436,22 @@ impl SelectedTextSession {
         snapshot.restore()?;
 
         let Some(text) = copied_text? else {
-            eprintln!(
+            crate::runtime_log!(
                 "[double-shift] clipboard changed but contained no Unicode text origin={origin:?} shortcut={}",
                 shortcut.label()
             );
             return Ok(None);
         };
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] clipboard capture origin={origin:?} shortcut={} text={:?} chars={}",
             shortcut.label(),
             text,
             text.chars().count()
         );
         let Ok(selected) = SelectedText::try_new(text) else {
-            eprintln!("[double-shift] clipboard text rejected by SelectedText origin={origin:?}");
+            crate::runtime_log!(
+                "[double-shift] clipboard text rejected by SelectedText origin={origin:?}"
+            );
             return Ok(None);
         };
 
@@ -465,7 +474,7 @@ impl SelectedTextSession {
         match probe {
             Some(probe) if probe.selected.as_str() == expected => Ok(true),
             Some(probe) => {
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] retained-selection probe changed text expected={expected:?} actual={:?}",
                     probe.selected.as_str()
                 );
@@ -496,7 +505,7 @@ impl SelectedTextSession {
             return Err(SelectedTextRuntimeError::ActionDoesNotMatchSelection);
         }
 
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] apply origin={:?} source={:?} replacement={:?}",
             self.origin,
             self.selected.as_str(),
@@ -506,13 +515,15 @@ impl SelectedTextSession {
             SelectedTextOrigin::ExistingSelection {
                 retained_after_copy: true,
             } => {
-                eprintln!("[double-shift] apply path=selection-still-active Ctrl+V paste");
+                crate::runtime_log!(
+                    "[double-shift] apply path=selection-still-active Ctrl+V paste"
+                );
                 paste_selected_replacement_preserving_clipboard(action.replacement().as_str())?;
             }
             SelectedTextOrigin::ExistingSelection {
                 retained_after_copy: false,
             } => {
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] apply path=selection-collapsed-at-start Shift+Right({})+Delete+Unicode",
                     self.selected.as_str().chars().count()
                 );
@@ -531,7 +542,7 @@ impl SelectedTextSession {
                     .ok_or(SelectedTextRuntimeError::SelectionChangedDuringCapture)?;
                 let replacement =
                     replace_copied_chunk_range(copied, range, action.replacement().as_str());
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] apply path=retained-previous-caret-chunk PasteFullSelection chars={}",
                     replacement.chars().count()
                 );
@@ -541,9 +552,11 @@ impl SelectedTextSession {
                 range,
                 retained_after_copy: false,
             } => {
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] apply path=restored-caret Left({})+ShiftLeft({})+replace+Right({})",
-                    range.trailing_chars, range.selected_chars, range.trailing_chars
+                    range.trailing_chars,
+                    range.selected_chars,
+                    range.trailing_chars
                 );
                 inject_previous_caret_range_replacement(
                     range.selected_chars,

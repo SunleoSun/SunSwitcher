@@ -2,14 +2,14 @@ pub mod sequence;
 mod session;
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::correction::LexicalSnapshot;
 use crate::language::normalize_word;
 use crate::lexicon::UserWord;
 
-use self::sequence::{SequenceCompletion, SequenceHistory};
+use self::sequence::{SequenceCandidate, SequenceCompletion, SequenceHistory};
 
 pub use session::{
     CompletionApplyOutcome, CompletionCommand, CompletionCommandResult, CompletionDeletionTarget,
@@ -73,22 +73,144 @@ pub enum CompletionSnapshotError {
 }
 
 #[derive(Debug, Clone)]
-pub struct SequenceSnapshotStore {
-    current: Arc<RwLock<Arc<SequenceHistory>>>,
+pub struct SequenceSnapshot {
+    base: Arc<SequenceHistory>,
+    overlay_entries: Arc<BTreeMap<String, SequenceCandidate>>,
+    overlay: Arc<SequenceHistory>,
 }
 
-impl SequenceSnapshotStore {
-    pub fn new(history: SequenceHistory) -> Self {
+impl SequenceSnapshot {
+    fn from_history(history: Arc<SequenceHistory>) -> Self {
         Self {
-            current: Arc::new(RwLock::new(Arc::new(history))),
+            base: history,
+            overlay_entries: Arc::new(BTreeMap::new()),
+            overlay: Arc::new(SequenceHistory::default()),
         }
     }
 
-    pub fn load(&self) -> Result<Arc<SequenceHistory>, CompletionSnapshotError> {
+    fn with_updates(&self, updates: Vec<SequenceCandidate>) -> Self {
+        let mut entries = (*self.overlay_entries).clone();
+        for update in updates {
+            entries.insert(update.text().to_owned(), update);
+        }
+        let overlay = SequenceHistory::new(entries.values().cloned().collect());
+        Self {
+            base: Arc::clone(&self.base),
+            overlay_entries: Arc::new(entries),
+            overlay: Arc::new(overlay),
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.overlay_entries.len()
+    }
+
+    fn complete(&self, context: &[&str], now_ms: i64, limit: usize) -> Vec<SequenceCompletion> {
+        self.complete_for_prefix(context, "", now_ms, limit)
+    }
+
+    fn complete_for_prefix(
+        &self,
+        context: &[&str],
+        prefix: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> Vec<SequenceCompletion> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut completions = self
+            .base
+            .complete_for_prefix(context, prefix, now_ms, usize::MAX)
+            .into_iter()
+            .filter(|candidate| !self.overlay_entries.contains_key(candidate.source_text()))
+            .collect::<Vec<_>>();
+        completions.extend(
+            self.overlay
+                .complete_for_prefix(context, prefix, now_ms, usize::MAX),
+        );
+        completions.sort_by(sequence_completion_rank);
+        let mut seen = HashSet::new();
+        completions.retain(|item| seen.insert(normalize_word(item.text())));
+        completions.truncate(limit);
+        completions
+    }
+}
+
+impl From<Arc<SequenceHistory>> for SequenceSnapshot {
+    fn from(history: Arc<SequenceHistory>) -> Self {
+        Self::from_history(history)
+    }
+}
+
+impl From<Arc<SequenceSnapshot>> for SequenceSnapshot {
+    fn from(snapshot: Arc<SequenceSnapshot>) -> Self {
+        (*snapshot).clone()
+    }
+}
+
+fn sequence_completion_rank(left: &SequenceCompletion, right: &SequenceCompletion) -> Ordering {
+    right
+        .matched_context_words()
+        .cmp(&left.matched_context_words())
+        .then_with(|| {
+            right
+                .user_score()
+                .partial_cmp(&left.user_score())
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| {
+            right
+                .text()
+                .split_whitespace()
+                .count()
+                .cmp(&left.text().split_whitespace().count())
+        })
+        .then_with(|| left.text().cmp(right.text()))
+}
+
+#[derive(Debug, Clone)]
+pub struct SequenceSnapshotStore {
+    current: Arc<RwLock<Arc<SequenceSnapshot>>>,
+}
+
+impl SequenceSnapshotStore {
+    pub const REBASE_LIMIT: usize = 1024;
+
+    pub fn new(history: SequenceHistory) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(SequenceSnapshot::from_history(
+                Arc::new(history),
+            )))),
+        }
+    }
+
+    pub fn load(&self) -> Result<Arc<SequenceSnapshot>, CompletionSnapshotError> {
         self.current
             .read()
-            .map(|history| Arc::clone(&history))
+            .map(|snapshot| Arc::clone(&snapshot))
             .map_err(|_| CompletionSnapshotError::Unavailable)
+    }
+
+    pub fn apply_updates(
+        &self,
+        updates: Vec<SequenceCandidate>,
+    ) -> Result<usize, CompletionSnapshotError> {
+        if updates.is_empty() {
+            return self.pending_len();
+        }
+        let replacement = Arc::new(self.load()?.with_updates(updates));
+        let pending = replacement.pending_len();
+        let mut slot = self
+            .current
+            .write()
+            .map_err(|_| CompletionSnapshotError::Unavailable)?;
+        *slot = replacement;
+        Ok(pending)
+    }
+
+    pub fn pending_len(&self) -> Result<usize, CompletionSnapshotError> {
+        self.load().map(|snapshot| snapshot.pending_len())
     }
 
     pub fn replace(&self, history: SequenceHistory) -> Result<(), CompletionSnapshotError> {
@@ -96,7 +218,7 @@ impl SequenceSnapshotStore {
             .current
             .write()
             .map_err(|_| CompletionSnapshotError::Unavailable)?;
-        *slot = Arc::new(history);
+        *slot = Arc::new(SequenceSnapshot::from_history(Arc::new(history)));
         Ok(())
     }
 }
@@ -165,12 +287,15 @@ impl CompletionSuppressionSnapshotStore {
 #[derive(Debug, Clone)]
 pub struct CompletionProvider {
     snapshot: Arc<LexicalSnapshot>,
-    sequences: Arc<SequenceHistory>,
+    sequences: Arc<SequenceSnapshot>,
     word_suppressions: Arc<CompletionWordSuppressions>,
 }
 
 impl CompletionProvider {
-    pub fn new(snapshot: Arc<LexicalSnapshot>, sequences: Arc<SequenceHistory>) -> Self {
+    pub fn new<S>(snapshot: Arc<LexicalSnapshot>, sequences: S) -> Self
+    where
+        S: Into<SequenceSnapshot>,
+    {
         Self::with_word_suppressions(
             snapshot,
             sequences,
@@ -178,14 +303,17 @@ impl CompletionProvider {
         )
     }
 
-    pub fn with_word_suppressions(
+    pub fn with_word_suppressions<S>(
         snapshot: Arc<LexicalSnapshot>,
-        sequences: Arc<SequenceHistory>,
+        sequences: S,
         word_suppressions: Arc<CompletionWordSuppressions>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Into<SequenceSnapshot>,
+    {
         Self {
             snapshot,
-            sequences,
+            sequences: Arc::new(sequences.into()),
             word_suppressions,
         }
     }
@@ -386,4 +514,43 @@ fn normalize_completion_prefix(prefix: &str) -> String {
         end -= 1;
     }
     normalize_word(&characters[start..end].iter().collect::<String>())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{SequenceCandidate, SequenceHistory, SequenceSnapshotStore};
+
+    #[test]
+    fn overlay_updates_shadow_stale_base_rows_and_reorder_immediately() {
+        let alpha = SequenceCandidate::try_new("hello alpha", 1, 100).unwrap();
+        let beta = SequenceCandidate::try_new("hello beta", 10, 100).unwrap();
+        let store = SequenceSnapshotStore::new(SequenceHistory::new(vec![alpha, beta]));
+
+        let updated_alpha = SequenceCandidate::try_new("hello alpha", 20, 200).unwrap();
+        assert_eq!(store.apply_updates(vec![updated_alpha]).unwrap(), 1);
+
+        let snapshot = store.load().unwrap();
+        let completions = snapshot.complete_for_prefix(&[], "hel", 300, 10);
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].source_text(), "hello alpha");
+        assert_eq!(
+            completions
+                .iter()
+                .filter(|item| item.source_text() == "hello alpha")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replacing_base_clears_overlay_after_rebase() {
+        let base = SequenceCandidate::try_new("hello world", 1, 100).unwrap();
+        let store = SequenceSnapshotStore::new(SequenceHistory::new(vec![base]));
+        let update = SequenceCandidate::try_new("hello world", 2, 200).unwrap();
+        store.apply_updates(vec![update.clone()]).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 1);
+
+        store.replace(SequenceHistory::new(vec![update])).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 0);
+    }
 }

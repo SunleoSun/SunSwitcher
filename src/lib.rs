@@ -1,6 +1,7 @@
 pub mod adaptive;
 pub mod completion;
 pub mod correction;
+pub mod diagnostics;
 pub mod input;
 pub mod language;
 pub mod lexicon;

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
@@ -626,14 +627,39 @@ impl Database {
     }
 
     fn from_connection(mut connection: Connection) -> Result<Self, DatabaseError> {
+        connection.busy_timeout(Duration::from_secs(2))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        let main_path: String = connection.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !main_path.is_empty() {
+            let journal_mode: String =
+                connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+            if !journal_mode.eq_ignore_ascii_case("wal") {
+                return Err(DatabaseError::Sqlite(rusqlite::Error::InvalidQuery));
+            }
+        }
         migrate(&mut connection)?;
+        connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
         Ok(Self { connection })
     }
 
     #[cfg(test)]
     pub(super) fn schema_version(&self) -> Result<i64, DatabaseError> {
         schema_version(&self.connection)
+    }
+
+    #[cfg(test)]
+    pub(super) fn storage_pragmas(&self) -> Result<(String, i64), DatabaseError> {
+        let journal_mode = self
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        let synchronous = self
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))?;
+        Ok((journal_mode, synchronous))
     }
 
     pub fn settings(&self) -> Result<AppSettings, DatabaseError> {
@@ -698,19 +724,20 @@ impl Database {
         &mut self,
         terms: &[String],
         used_at_ms: i64,
-    ) -> Result<bool, DatabaseError> {
+    ) -> Result<Vec<UserWord>, DatabaseError> {
         if terms.is_empty() {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut updated = Vec::with_capacity(terms.len());
         for term in terms {
             let input = UserWord::try_new(term.as_str(), 1, used_at_ms)?;
-            upsert_user_word(&transaction, &input)?;
+            updated.push(upsert_user_word(&transaction, &input)?);
         }
         transaction.commit()?;
-        Ok(true)
+        Ok(updated)
     }
 
     pub fn delete_user_word(&self, term: &str) -> Result<bool, DatabaseError> {
@@ -821,19 +848,20 @@ impl Database {
         &mut self,
         texts: &[String],
         used_at_ms: i64,
-    ) -> Result<bool, DatabaseError> {
+    ) -> Result<Vec<SequenceCandidate>, DatabaseError> {
         if texts.is_empty() {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut updated = Vec::with_capacity(texts.len());
         for text in texts {
             let input = SequenceCandidate::try_new(text.as_str(), 1, used_at_ms)?;
-            upsert_text_history(&transaction, &input)?;
+            updated.push(upsert_text_history(&transaction, &input)?);
         }
         transaction.commit()?;
-        Ok(true)
+        Ok(updated)
     }
 
     pub fn delete_text_history(&self, text: &str) -> Result<bool, DatabaseError> {

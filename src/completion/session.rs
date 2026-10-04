@@ -120,6 +120,10 @@ impl CompletionSession {
             InputOutcome::Invalidated => self.dismiss_and_clear_context(),
         }
 
+        if matches!(event, InputEvent::Boundary(Boundary::Enter | Boundary::Tab)) {
+            self.dismiss_and_clear_context();
+        }
+
         if matches!(event, InputEvent::Backspace)
             && self.input.current_token().chars().count() < self.minimum_prefix_chars
             && !self.continuation_mode
@@ -162,8 +166,6 @@ impl CompletionSession {
             return;
         }
 
-        let mut suggestions = Vec::new();
-        let mut seen = HashSet::new();
         // While a previously visible continuation is protected, do not let the normal UI limit
         // hide a valid extension behind higher-ranked incompatible branches. SequenceHistory
         // already scans/sorts all matching rows before truncation, so this only defers truncation.
@@ -184,26 +186,26 @@ impl CompletionSession {
         } else {
             prefix
         };
-        let sequence_candidates = provider.complete_sequence_for_prefix(
+        let mut sequence_suggestions = Vec::new();
+        for candidate in provider.complete_sequence_for_prefix(
             &context_refs,
             lookup_prefix,
             now_ms,
             sequence_limit,
-        );
-        for candidate in sequence_candidates {
+        ) {
             let target = CompletionDeletionTarget::TextHistory(candidate.source_text().to_owned());
             if self.deleted_predictions.contains(&target) {
                 continue;
             }
             if let Some(suggestion) =
                 suggestion_for_prefix_with_target(candidate.text(), prefix, Some(target))
-                && seen.insert(normalize_word(suggestion.text()))
             {
-                suggestions.push(suggestion);
+                sequence_suggestions.push(suggestion);
             }
         }
 
-        if prefix_chars >= self.minimum_prefix_chars && suggestions.len() < self.limit {
+        let mut word_suggestions = Vec::new();
+        if prefix_chars >= self.minimum_prefix_chars {
             for candidate in provider.complete(prefix, self.limit) {
                 let target = Some(CompletionDeletionTarget::Word(normalize_word(
                     candidate.text(),
@@ -216,11 +218,42 @@ impl CompletionSession {
                 }
                 if let Some(suggestion) =
                     suggestion_for_prefix_with_target(candidate.text(), prefix, target)
-                    && seen.insert(normalize_word(suggestion.text()))
                 {
+                    word_suggestions.push(suggestion);
+                }
+            }
+        }
+
+        // Sequence history remains the stronger prediction source, including first-word phrase
+        // completion. At a fresh boundary, reserve up to half of the popup for lexical word
+        // matches so a dense phrase history cannot hide every learned word sharing the prefix.
+        // This is the only cross-source presentation policy; each provider keeps its own ranking.
+        let fresh_prefix =
+            !has_context && !self.continuation_mode && self.protected_continuation.is_none();
+        let word_reserve = if fresh_prefix
+            && self.limit > 1
+            && !sequence_suggestions.is_empty()
+            && !word_suggestions.is_empty()
+        {
+            word_suggestions.len().min(self.limit / 2)
+        } else {
+            0
+        };
+        let sequence_capacity = self.limit.saturating_sub(word_reserve);
+        let deferred_sequence = if sequence_suggestions.len() > sequence_capacity {
+            sequence_suggestions.split_off(sequence_capacity)
+        } else {
+            Vec::new()
+        };
+        let ordered_groups = [sequence_suggestions, word_suggestions, deferred_sequence];
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+        'groups: for group in ordered_groups {
+            for suggestion in group {
+                if seen.insert(normalize_word(suggestion.text())) {
                     suggestions.push(suggestion);
                     if suggestions.len() == self.limit {
-                        break;
+                        break 'groups;
                     }
                 }
             }
@@ -554,7 +587,15 @@ mod tests {
         for character in "hello".chars() {
             session.process_event(InputEvent::character(character));
         }
+        session.process_event(InputEvent::character(' '));
+        session
+            .suggestions
+            .push(suggestion_for_prefix("world", "").unwrap());
+        assert!(session.is_active());
+        assert_eq!(session.context_tokens(), ["hello"]);
         session.process_event(InputEvent::Boundary(Boundary::Enter));
+        assert!(!session.is_active());
+        assert!(session.context_tokens().is_empty());
         for character in "wor".chars() {
             session.process_event(InputEvent::character(character));
         }

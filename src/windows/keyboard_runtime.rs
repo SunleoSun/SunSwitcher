@@ -615,11 +615,11 @@ pub fn run_global_keyboard_hook(
                 }
                 if message.message == WM_SUNSWITCHER_DOUBLE_SHIFT {
                     let shift_still_down = GetAsyncKeyState(VK_SHIFT as i32) < 0;
-                    eprintln!(
+                    crate::runtime_log!(
                         "[double-shift] deferred dispatch after hook shift_still_down={shift_still_down}"
                     );
                     if shift_still_down {
-                        eprintln!(
+                        crate::runtime_log!(
                             "[double-shift] deferred dispatch aborted because a physical Shift is still down"
                         );
                         invalidate_runtime_tracking();
@@ -767,7 +767,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         } else {
             if is_key_down && is_state_invalidating_key(event.vkCode) {
                 let had_tracked_span = runtime.processor.tracked_layout_switch_text().is_some();
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] keyboard navigation/edit vk=0x{:02X} invalidates tracked_span={had_tracked_span}",
                     event.vkCode
                 );
@@ -813,11 +813,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             let shift_down_in_hook = unsafe { GetAsyncKeyState(VK_SHIFT as i32) } < 0;
             let queued = thread_id != 0
                 && unsafe { PostThreadMessageW(thread_id, WM_SUNSWITCHER_DOUBLE_SHIFT, 0, 0) != 0 };
-            eprintln!(
+            crate::runtime_log!(
                 "[double-shift] trigger queued={queued} shift_down_in_hook={shift_down_in_hook}"
             );
             if !queued {
-                eprintln!("[double-shift] failed to queue deferred gesture effect; invalidating");
+                crate::runtime_log!(
+                    "[double-shift] failed to queue deferred gesture effect; invalidating"
+                );
                 invalidate_runtime_tracking();
             }
             1
@@ -899,9 +901,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                     }
                     invalidate_runtime_tracking();
                     if let Err(error) = injection_result {
-                        eprintln!("SunSwitcher completion injection failed: {error:?}");
+                        crate::runtime_log!("SunSwitcher completion injection failed: {error:?}");
                     } else if !ownership_unchanged {
-                        eprintln!("SunSwitcher completion ownership changed during injection");
+                        crate::runtime_log!(
+                            "SunSwitcher completion ownership changed during injection"
+                        );
                     }
                     1
                 }
@@ -923,7 +927,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                         invalidate_runtime_tracking();
                     }
                     if let Err(error) = injection_result {
-                        eprintln!("SunSwitcher completion word injection failed: {error:?}");
+                        crate::runtime_log!(
+                            "SunSwitcher completion word injection failed: {error:?}"
+                        );
                     }
                     1
                 }
@@ -978,7 +984,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                             invalidate_runtime_tracking();
                         }
                         if let Err(error) = injection_result {
-                            eprintln!("SunSwitcher undo injection failed: {error:?}");
+                            crate::runtime_log!("SunSwitcher undo injection failed: {error:?}");
                         }
                     }
                 }
@@ -1023,7 +1029,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 && let Some(target_language) = action.target_language()
                 && !request_foreground_keyboard_layout(target_language)
             {
-                eprintln!(
+                crate::runtime_log!(
                     "SunSwitcher could not switch the foreground keyboard layout after automatic correction to {:?}",
                     target_language.as_str()
                 );
@@ -1048,7 +1054,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 invalidate_runtime_tracking();
             }
             if let Err(error) = injection_result {
-                eprintln!("SunSwitcher replacement injection failed: {error:?}");
+                crate::runtime_log!("SunSwitcher replacement injection failed: {error:?}");
             }
             next_result
         }
@@ -1076,7 +1082,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 && let Some(target_language) = action.target_language()
                 && !request_foreground_keyboard_layout(target_language)
             {
-                eprintln!(
+                crate::runtime_log!(
                     "SunSwitcher could not switch the foreground keyboard layout after live-prefix correction to {:?}",
                     target_language.as_str()
                 );
@@ -1103,7 +1109,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 invalidate_runtime_tracking();
             }
             if let Err(error) = injection_result {
-                eprintln!("SunSwitcher live-prefix replacement injection failed: {error:?}");
+                crate::runtime_log!(
+                    "SunSwitcher live-prefix replacement injection failed: {error:?}"
+                );
             }
             next_result
         }
@@ -1141,7 +1149,7 @@ enum HookEventState {
 
 fn switch_captured_text(session: SelectedTextSession) {
     let source = session.selected_text().clone();
-    eprintln!(
+    crate::runtime_log!(
         "[double-shift] captured source={:?} chars={}",
         source.as_str(),
         source.as_str().chars().count()
@@ -1152,16 +1160,16 @@ fn switch_captured_text(session: SelectedTextSession) {
             .and_then(|runtime| runtime.processor.switch_layout_text(source.as_str()))
     });
     let Some(switch) = switch else {
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] no layout transform for captured source; restoring capture state"
         );
         if let Err(error) = session.finish_without_replacement() {
-            eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
+            crate::runtime_log!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
         }
         return;
     };
 
-    eprintln!(
+    crate::runtime_log!(
         "[double-shift] transform source={:?} replacement={:?} target_language={}",
         source.as_str(),
         switch.text(),
@@ -1170,9 +1178,13 @@ fn switch_captured_text(session: SelectedTextSession) {
     let replacement = match SelectedReplacementText::try_new(switch.text().to_owned()) {
         Ok(replacement) => replacement,
         Err(_) => {
-            eprintln!("[double-shift] transformed text failed SelectedReplacementText validation");
+            crate::runtime_log!(
+                "[double-shift] transformed text failed SelectedReplacementText validation"
+            );
             if let Err(error) = session.finish_without_replacement() {
-                eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
+                crate::runtime_log!(
+                    "SunSwitcher layout-switch selection cleanup failed: {error:?}"
+                );
             }
             return;
         }
@@ -1180,29 +1192,29 @@ fn switch_captured_text(session: SelectedTextSession) {
     let Some(action) =
         SelectedReplacementEngine::new().plan(source, SelectedTextDecision::Replace(replacement))
     else {
-        eprintln!("[double-shift] replacement engine produced no action");
+        crate::runtime_log!("[double-shift] replacement engine produced no action");
         if let Err(error) = session.finish_without_replacement() {
-            eprintln!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
+            crate::runtime_log!("SunSwitcher layout-switch selection cleanup failed: {error:?}");
         }
         return;
     };
 
     match session.apply_layout_switch(&action) {
         Ok(()) => {
-            eprintln!("[double-shift] replacement input applied");
+            crate::runtime_log!("[double-shift] replacement input applied");
             if !request_foreground_keyboard_layout(switch.target_language()) {
-                eprintln!(
+                crate::runtime_log!(
                     "SunSwitcher could not switch the foreground keyboard layout to {:?}",
                     switch.target_language().as_str()
                 );
             }
         }
-        Err(error) => eprintln!("SunSwitcher layout switch failed: {error:?}"),
+        Err(error) => crate::runtime_log!("SunSwitcher layout switch failed: {error:?}"),
     }
 }
 
 fn switch_selected_or_previous_text() {
-    eprintln!("[double-shift] trigger");
+    crate::runtime_log!("[double-shift] trigger");
     let selection_capture_intent = RUNTIME
         .lock()
         .ok()
@@ -1220,7 +1232,7 @@ fn switch_selected_or_previous_text() {
         Some((source, switch))
     });
     if let Some((source, switch)) = tracked_attempt {
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] path=tracked-span source={:?} chars={}",
             source,
             source.chars().count()
@@ -1228,13 +1240,13 @@ fn switch_selected_or_previous_text() {
         if let Some(switch) = switch {
             match inject_tracked_text_replacement(source.chars().count(), switch.text()) {
                 Ok(()) => {
-                    eprintln!(
+                    crate::runtime_log!(
                         "[double-shift] tracked replacement={:?} target_language={}",
                         switch.text(),
                         switch.target_language().as_str()
                     );
                     if !request_foreground_keyboard_layout(switch.target_language()) {
-                        eprintln!(
+                        crate::runtime_log!(
                             "SunSwitcher could not switch the foreground keyboard layout to {:?}",
                             switch.target_language().as_str()
                         );
@@ -1248,35 +1260,37 @@ fn switch_selected_or_previous_text() {
                     }
                 }
                 Err(error) => {
-                    eprintln!("SunSwitcher tracked layout switch failed: {error:?}");
+                    crate::runtime_log!("SunSwitcher tracked layout switch failed: {error:?}");
                     invalidate_runtime_tracking();
                 }
             }
             return;
         }
 
-        eprintln!(
+        crate::runtime_log!(
             "[double-shift] tracked span has no layout transform; dropping ownership and continuing with capture fallback"
         );
         invalidate_runtime_tracking();
     }
 
-    eprintln!(
+    crate::runtime_log!(
         "[double-shift] no transformable tracked span; probing explicit selection intent={selection_capture_intent:?}"
     );
     match SelectedTextSession::capture_existing_selection_for_replacement(selection_capture_intent)
     {
         Ok(Some(session)) => {
-            eprintln!("[double-shift] path=explicit-selection");
+            crate::runtime_log!("[double-shift] path=explicit-selection");
             switch_captured_text(session);
             invalidate_runtime_tracking();
             return;
         }
         Ok(None) => {
-            eprintln!("[double-shift] no copyable explicit selection; probing previous text chunk");
+            crate::runtime_log!(
+                "[double-shift] no copyable explicit selection; probing previous text chunk"
+            );
         }
         Err(error) => {
-            eprintln!("SunSwitcher selected-text capture failed closed: {error:?}");
+            crate::runtime_log!("SunSwitcher selected-text capture failed closed: {error:?}");
             invalidate_runtime_tracking();
             return;
         }
@@ -1285,15 +1299,15 @@ fn switch_selected_or_previous_text() {
     let session = match SelectedTextSession::capture_previous_word() {
         Ok(session) => session,
         Err(error) => {
-            eprintln!("SunSwitcher previous-word capture failed: {error:?}");
+            crate::runtime_log!("SunSwitcher previous-word capture failed: {error:?}");
             None
         }
     };
     if let Some(session) = session {
-        eprintln!("[double-shift] path=previous-caret-chunk");
+        crate::runtime_log!("[double-shift] path=previous-caret-chunk");
         switch_captured_text(session);
     } else {
-        eprintln!("[double-shift] previous-caret-chunk produced no replaceable text");
+        crate::runtime_log!("[double-shift] previous-caret-chunk produced no replaceable text");
     }
     invalidate_runtime_tracking();
 }
@@ -1439,7 +1453,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: L
         match runtime.mouse_selection.observe(message, point.x, point.y) {
             MouseSelectionEffect::InvalidateOnly => {
                 let had_tracked_span = runtime.processor.tracked_layout_switch_text().is_some();
-                eprintln!(
+                crate::runtime_log!(
                     "[double-shift] mouse/navigation click message=0x{message:04X} invalidates tracked_span={had_tracked_span}"
                 );
                 runtime.note_external_input();
@@ -1447,7 +1461,9 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: L
                 let _ = runtime.processor.process(InputEvent::Invalidate);
             }
             MouseSelectionEffect::UserSelectionIntent => {
-                eprintln!("[double-shift] mouse selection intent message=0x{message:04X}");
+                crate::runtime_log!(
+                    "[double-shift] mouse selection intent message=0x{message:04X}"
+                );
                 runtime.note_external_input();
                 runtime.selection_capture_intent = SelectionCaptureIntent::UserSelection;
             }

@@ -232,7 +232,7 @@ impl AutocompletePopupHandle {
 
         match ready_receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(repaint_ctx)) => {
-                eprintln!("[ui-start] SunSwitcher UI runtime initialized");
+                crate::runtime_log!("[ui-start] SunSwitcher UI runtime initialized");
                 let clipboard = ClipboardManagerHandle::new(clipboard_state, repaint_ctx.clone());
                 let tray = TrayIcon::start(
                     clipboard.clone(),
@@ -254,7 +254,7 @@ impl AutocompletePopupHandle {
             }
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
-                eprintln!("[ui-start] SunSwitcher UI did not initialize: {error}");
+                crate::runtime_log!("[ui-start] SunSwitcher UI did not initialize: {error}");
                 Err(format!("SunSwitcher UI did not initialize: {error}"))
             }
         }
@@ -288,9 +288,10 @@ impl AutocompletePopupHandle {
     }
 
     pub fn show_clipboard(&self, active_tab: ClipboardManagerTab, target_window_id: usize) {
-        eprintln!(
+        crate::runtime_log!(
             "[ui-command] show_clipboard dispatch tab={:?} target_window_id={}",
-            active_tab, target_window_id
+            active_tab,
+            target_window_id
         );
         self.clipboard.show(active_tab, target_window_id);
     }

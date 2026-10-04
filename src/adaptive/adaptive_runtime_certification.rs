@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
 use crate::correction::Confidence;
-use crate::input::{InputEvent, PhysicalKey};
+use crate::input::{Boundary, InputEvent, PhysicalKey};
 use crate::persistence::Database;
 use crate::replacement::{ReplacementOutcome, UndoOutcome};
 
@@ -275,7 +275,7 @@ fn certification_typed_technical_term_refreshes_live_snapshot_and_corrects_later
     let mut session = runtime.session();
 
     assert_eq!(
-        type_token(&mut session, "QuantileEntryStrategy", 100),
+        type_token(&mut session, "QuantileEntryStrategy1", 100),
         AdaptiveCorrectionDirective::Pass
     );
     runtime.flush().unwrap();
@@ -285,14 +285,14 @@ fn certification_typed_technical_term_refreshes_live_snapshot_and_corrects_later
             .load()
             .unwrap()
             .user_lexicon()
-            .contains_normalized("quantileentrystrategy")
+            .contains_normalized("quantileentrystrategy1")
     );
 
-    let correction = type_token(&mut session, "QuanntileEntrySrtategy", 200);
+    let correction = type_token(&mut session, "QuanntileEntrySrtategy1", 200);
     let AdaptiveCorrectionDirective::Replace(action) = correction else {
         panic!("learned technical term must become a typo-correction candidate");
     };
-    assert_eq!(action.replacement().as_str(), "QuantileEntryStrategy");
+    assert_eq!(action.replacement().as_str(), "QuantileEntryStrategy1");
 }
 
 #[test]
@@ -494,71 +494,319 @@ fn certification_applied_completion_acceptance_increments_user_word_usage() {
 }
 
 #[test]
-fn certification_applied_next_word_completion_increments_user_word_usage() {
-    let database = Database::open_in_memory().unwrap();
-    database.record_user_word("PrototypeThing", 100).unwrap();
+fn certification_applied_next_word_completion_persists_sequence_and_rehydrates_completion() {
+    let path = TempDatabasePath::new("accepted-next-word-restart");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        database.record_user_word("WordPrediction902", 10).unwrap();
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut correction = runtime.session();
+        let mut completion = runtime.completion_session();
+
+        for (index, character) in "WordContext901 ".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 100 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 100 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        for (index, character) in "WordPred".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 200 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 200 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        assert_eq!(completion.suggestions()[0].text(), "WordPrediction902");
+        assert_eq!(
+            completion
+                .command(CompletionCommand::AcceptNextWord)
+                .unwrap(),
+            CompletionCommandResult::AcceptWord("iction902 ".to_owned())
+        );
+        completion
+            .word_acceptance_outcome(CompletionApplyOutcome::Applied, 300)
+            .unwrap();
+        runtime.flush().unwrap();
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    let accepted_use_count: i64 = raw
+        .query_row(
+            "SELECT use_count FROM user_words WHERE normalized_term = 'wordprediction902'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted_use_count, 2);
+    let accepted_sequence: (i64, i64) = raw
+        .query_row(
+            "SELECT count(*), COALESCE(MAX(use_count), 0) FROM text_history WHERE text = 'WordContext901 WordPrediction902'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(accepted_sequence, (1, 1));
+    drop(raw);
+
+    let database = Database::open(path.as_path()).unwrap();
     let runtime =
         AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
     let mut completion = runtime.completion_session();
-
-    for (index, character) in "Pro".chars().enumerate() {
+    for (index, character) in "WordContext901 ".chars().enumerate() {
         completion
-            .process_event(InputEvent::character(character), 110 + index as i64)
+            .process_event(InputEvent::character(character), 400 + index as i64)
             .unwrap();
     }
-    assert_eq!(completion.suggestions()[0].text(), "PrototypeThing");
     assert_eq!(
-        completion
-            .command(CompletionCommand::AcceptNextWord)
-            .unwrap(),
-        CompletionCommandResult::AcceptWord("totypeThing ".to_owned())
-    );
-    completion
-        .word_acceptance_outcome(CompletionApplyOutcome::Applied, 200)
-        .unwrap();
-    runtime.flush().unwrap();
-
-    let snapshot = runtime.snapshots().load().unwrap();
-    assert_eq!(
-        snapshot
-            .user_lexicon()
-            .exact("prototypething")
-            .unwrap()
-            .use_count(),
-        2
+        completion.suggestions()[0].text(),
+        "WordPrediction902",
+        "accepted next-word completion must survive SQLite reopen and drive completion"
     );
 }
 
 #[test]
-fn certification_uncertain_completion_acceptance_does_not_increment_usage() {
-    let database = Database::open_in_memory().unwrap();
-    database.record_user_word("PrototypeThing", 100).unwrap();
+fn certification_applied_completion_acceptance_persists_sequence_and_rehydrates_completion() {
+    let path = TempDatabasePath::new("accepted-completion-restart");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        database
+            .record_user_word("AcceptPrediction902", 10)
+            .unwrap();
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut correction = runtime.session();
+        let mut completion = runtime.completion_session();
+
+        for (index, character) in "AcceptContext901 ".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 100 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 100 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        for (index, character) in "AcceptPred".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 200 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 200 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        assert_eq!(completion.suggestions()[0].text(), "AcceptPrediction902");
+        assert_eq!(
+            completion.command(CompletionCommand::Accept).unwrap(),
+            CompletionCommandResult::AcceptSuffix("iction902".to_owned())
+        );
+        completion
+            .suffix_acceptance_outcome(CompletionApplyOutcome::Applied, 300)
+            .unwrap();
+        runtime.flush().unwrap();
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    let accepted_use_count: i64 = raw
+        .query_row(
+            "SELECT use_count FROM user_words WHERE normalized_term = 'acceptprediction902'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted_use_count, 2);
+    let accepted_sequence: (i64, i64) = raw
+        .query_row(
+            "SELECT count(*), COALESCE(MAX(use_count), 0) FROM text_history WHERE text = 'AcceptContext901 AcceptPrediction902'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(accepted_sequence, (1, 1));
+    drop(raw);
+
+    let database = Database::open(path.as_path()).unwrap();
     let runtime =
         AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
     let mut completion = runtime.completion_session();
-
-    for (index, character) in "Pro".chars().enumerate() {
+    for (index, character) in "AcceptContext901 ".chars().enumerate() {
         completion
-            .process_event(InputEvent::character(character), 110 + index as i64)
+            .process_event(InputEvent::character(character), 400 + index as i64)
             .unwrap();
     }
-    assert!(matches!(
-        completion.command(CompletionCommand::Accept).unwrap(),
-        CompletionCommandResult::AcceptSuffix(_)
-    ));
-    completion
-        .suffix_acceptance_outcome(CompletionApplyOutcome::Uncertain, 200)
-        .unwrap();
-    runtime.flush().unwrap();
-
-    let snapshot = runtime.snapshots().load().unwrap();
     assert_eq!(
-        snapshot
-            .user_lexicon()
-            .exact("prototypething")
-            .unwrap()
-            .use_count(),
-        1
+        completion.suggestions()[0].text(),
+        "AcceptPrediction902",
+        "accepted completion must survive SQLite reopen as the top context prediction"
+    );
+}
+
+#[test]
+fn certification_system_completion_acceptance_trains_sequence_without_duplicating_dictionary_word()
+{
+    let path = TempDatabasePath::new("system-completion-learning");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut correction = runtime.session();
+        let mut completion = runtime.completion_session();
+
+        for (index, character) in "SystemContext901 ".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 100 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 100 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        for (index, character) in "progr".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 200 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 200 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        let program_index = completion
+            .suggestions()
+            .iter()
+            .position(|candidate| candidate.text() == "program")
+            .expect("built-in English completion must expose program for progr");
+        for _ in 0..program_index {
+            assert_eq!(
+                completion.command(CompletionCommand::Next).unwrap(),
+                CompletionCommandResult::Consumed
+            );
+        }
+        assert_eq!(
+            completion.suggestions()[completion.selected_index()].text(),
+            "program"
+        );
+        assert_eq!(
+            completion.command(CompletionCommand::Accept).unwrap(),
+            CompletionCommandResult::AcceptSuffix("am".to_owned())
+        );
+        completion
+            .suffix_acceptance_outcome(CompletionApplyOutcome::Applied, 300)
+            .unwrap();
+        runtime.flush().unwrap();
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    let user_word_count: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM user_words WHERE normalized_term = 'program'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        user_word_count, 0,
+        "accepting a system dictionary completion must not duplicate it into user_words"
+    );
+    let sequence_count: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM text_history WHERE text = 'SystemContext901 program'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_count, 1);
+    drop(raw);
+
+    let database = Database::open(path.as_path()).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut completion = runtime.completion_session();
+    for (index, character) in "SystemContext901 ".chars().enumerate() {
+        completion
+            .process_event(InputEvent::character(character), 400 + index as i64)
+            .unwrap();
+    }
+    assert_eq!(
+        completion.suggestions()[0].text(),
+        "program",
+        "accepted system completion must rehydrate as the learned top context prediction"
+    );
+}
+
+#[test]
+fn certification_uncertain_completion_acceptance_persists_neither_usage_nor_sequence() {
+    let path = TempDatabasePath::new("uncertain-completion-learning");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        database
+            .record_user_word("RejectPrediction902", 10)
+            .unwrap();
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut correction = runtime.session();
+        let mut completion = runtime.completion_session();
+
+        for (index, character) in "RejectContext901 ".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 100 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 100 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        for (index, character) in "RejectPred".chars().enumerate() {
+            let event = InputEvent::character(character);
+            completion.process_event(event, 200 + index as i64).unwrap();
+            assert_eq!(
+                correction.process(event, 200 + index as i64).unwrap(),
+                AdaptiveCorrectionDirective::Pass
+            );
+        }
+        assert_eq!(completion.suggestions()[0].text(), "RejectPrediction902");
+        assert!(matches!(
+            completion.command(CompletionCommand::Accept).unwrap(),
+            CompletionCommandResult::AcceptSuffix(_)
+        ));
+        completion
+            .suffix_acceptance_outcome(CompletionApplyOutcome::Uncertain, 300)
+            .unwrap();
+        runtime.flush().unwrap();
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    let use_count: i64 = raw
+        .query_row(
+            "SELECT use_count FROM user_words WHERE normalized_term = 'rejectprediction902'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(use_count, 1);
+    let sequence_count: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM text_history WHERE text = 'RejectContext901 RejectPrediction902'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sequence_count, 0);
+    drop(raw);
+
+    let database = Database::open(path.as_path()).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut completion = runtime.completion_session();
+    for (index, character) in "RejectContext901 ".chars().enumerate() {
+        completion
+            .process_event(InputEvent::character(character), 400 + index as i64)
+            .unwrap();
+    }
+    assert!(
+        completion
+            .suggestions()
+            .iter()
+            .all(|candidate| candidate.text() != "RejectPrediction902"),
+        "uncertain completion insertion must not create persisted sequence evidence"
     );
 }
 
@@ -1111,6 +1359,128 @@ fn certification_typed_words_feed_rolling_sequence_history() {
         completions
             .iter()
             .any(|candidate| candidate.text() == "world again")
+    );
+}
+
+#[test]
+fn certification_alphanumeric_user_words_complete_from_alpha_prefix() {
+    let runtime = AdaptiveLexicalRuntime::start(
+        Database::open_in_memory().unwrap(),
+        Confidence::try_new(0.80).unwrap(),
+    )
+    .unwrap();
+    let mut session = runtime.session();
+    for (index, token) in ["sun1", "sun2", "sun1", "sun2", "sun3", "sun4"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            type_token(&mut session, token, 100 + index as i64),
+            AdaptiveCorrectionDirective::Pass,
+            "unexpected correction for {token}"
+        );
+    }
+    runtime.flush().unwrap();
+
+    let words = runtime
+        .completion_provider()
+        .unwrap()
+        .complete("sun", 10)
+        .into_iter()
+        .map(|candidate| candidate.text().to_owned())
+        .collect::<Vec<_>>();
+    for expected in ["sun1", "sun2", "sun3", "sun4"] {
+        assert!(
+            words.iter().any(|candidate| candidate == expected),
+            "missing {expected}: {words:?}"
+        );
+    }
+
+    let mut completion = runtime.completion_session();
+    for character in "sun1 ".chars() {
+        completion
+            .process_event(InputEvent::character(character), 300)
+            .unwrap();
+    }
+    completion
+        .process_event(InputEvent::Boundary(Boundary::Enter), 301)
+        .unwrap();
+    assert!(!completion.is_active());
+    for character in "sun".chars() {
+        completion
+            .process_event(InputEvent::character(character), 302)
+            .unwrap();
+    }
+    let suggestions = completion
+        .suggestions()
+        .iter()
+        .map(|candidate| candidate.text().to_owned())
+        .collect::<Vec<_>>();
+    for expected in ["sun1", "sun2", "sun3", "sun4"] {
+        assert!(
+            suggestions.iter().any(|candidate| candidate == expected),
+            "new-line prefix must offer {expected}: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn certification_typed_learning_persists_words_and_sequence_and_rehydrates_completion() {
+    let path = TempDatabasePath::new("typed-learning-restart");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        let runtime =
+            AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+        let mut session = runtime.session();
+
+        assert_eq!(
+            type_token(&mut session, "TypedContext901", 100),
+            AdaptiveCorrectionDirective::Pass
+        );
+        assert_eq!(
+            type_token(&mut session, "TypedPrediction902", 200),
+            AdaptiveCorrectionDirective::Pass
+        );
+        runtime.flush().unwrap();
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    for normalized in ["typedcontext901", "typedprediction902"] {
+        let use_count: i64 = raw
+            .query_row(
+                "SELECT use_count FROM user_words WHERE normalized_term = ?1",
+                [normalized],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            use_count, 1,
+            "typed word {normalized} must persist exactly once"
+        );
+    }
+    let typed_sequence: (i64, i64) = raw
+        .query_row(
+            "SELECT count(*), COALESCE(MAX(use_count), 0) FROM text_history WHERE text = 'TypedContext901 TypedPrediction902'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(typed_sequence, (1, 1));
+    drop(raw);
+
+    let database = Database::open(path.as_path()).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut completion = runtime.completion_session();
+    for (index, character) in "TypedContext901 ".chars().enumerate() {
+        completion
+            .process_event(InputEvent::character(character), 300 + index as i64)
+            .unwrap();
+    }
+    assert_eq!(
+        completion.suggestions()[0].text(),
+        "TypedPrediction902",
+        "physically typed sequence must survive SQLite reopen as the top context prediction"
     );
 }
 

@@ -4,10 +4,10 @@ Windows keyboard correction experiment implemented in Rust.
 
 The current focus is reliable Windows text replacement plus adaptive local vocabulary: kept typed words and newly copied Unicode text feed the same SQLite-backed user lexicon, while clipboard/history and future completion remain derived from the same local persistence foundation.
 
-## Typed-word replacement probe
+## SunSwitcher production app
 
 ```powershell
-cargo run --bin replacement_probe
+cargo run --bin sunswitcher
 ```
 
 Keep the probe running and focus any Windows text field. Focusing/clicking invalidates any previously tracked token, but the first newly typed character immediately starts a fresh owned token, so no leading Space is required. Type an example followed by Space, Enter, or Tab:

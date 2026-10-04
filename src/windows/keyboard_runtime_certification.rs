@@ -160,6 +160,16 @@ fn certification_only_unhandled_completion_hotkeys_reach_the_foreground_applicat
 }
 
 #[test]
+fn certification_plain_or_shift_enter_reaches_enter_boundary() {
+    // `command_modifier_active` intentionally excludes Shift, so both plain Enter and
+    // Shift+Enter reach this same classification path.
+    assert_eq!(
+        preclassify_key_down(VK_RETURN as u32, false),
+        KeyDownDisposition::Event(InputEvent::Boundary(Boundary::Enter))
+    );
+}
+
+#[test]
 fn certification_command_modified_editing_keys_fail_closed() {
     for vk_code in [VK_BACK, VK_RETURN, VK_TAB] {
         assert_eq!(

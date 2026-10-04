@@ -204,6 +204,9 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                 .user_lexicon()
                 .candidate_entries(&variant.text, MAX_INDEX_DELETIONS)
             {
+                if !digit_signature_matches(&variant.text, entry.normalized_term()) {
+                    continue;
+                }
                 let edit_cost = weighted_damerau_cost(&variant.text, entry.normalized_term());
                 if edit_cost > max_edit_cost + f32::EPSILON {
                     continue;
@@ -473,6 +476,9 @@ fn consider_language_entry(
     variant: &ObservedVariant,
     entry: &crate::language::DictionaryEntry,
 ) {
+    if !digit_signature_matches(&variant.text, entry.word()) {
+        return;
+    }
     let edit_cost = weighted_damerau_cost(&variant.text, entry.word());
     if edit_cost > max_edit_cost(variant.text.chars().count()) + f32::EPSILON
         || (edit_cost == 0.0 && variant.layout_penalty == 0.0)
@@ -507,6 +513,15 @@ fn consider_language_entry(
             target_language: variant.target_language.clone(),
         },
     );
+}
+
+fn digit_signature_matches(observed: &str, target: &str) -> bool {
+    observed
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .eq(target
+            .chars()
+            .filter(|character| character.is_ascii_digit()))
 }
 
 #[derive(Debug, Clone)]
