@@ -1,15 +1,18 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-use std::{env, path::PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2};
+
+use crate::settings::SettingsStore;
 
 use super::caret_locator::{CaretAnchor, CaretLocator, CaretSource, popup_placement};
 use super::clipboard_manager::{
     ClipboardManagerApp, ClipboardManagerHandle, ClipboardManagerState, ClipboardManagerTab,
 };
+use super::hotkey_capture::HotkeyCaptureHandle;
 use super::tray_icon::TrayIcon;
 
 const POPUP_WIDTH: f32 = 360.0;
@@ -17,12 +20,15 @@ const MAX_POPUP_SUGGESTIONS: usize = 8;
 const ROW_HEIGHT: f32 = 24.0;
 const POPUP_PADDING: f32 = 12.0;
 const CARET_GAP: f32 = 6.0;
+const NOTIFICATION_WIDTH: f32 = 360.0;
+const NOTIFICATION_HEIGHT: f32 = 48.0;
+const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
 const PARKED_POSITION: f32 = -32_000.0;
 const SUGGESTION_BG: egui::Color32 = egui::Color32::from_rgb(30, 32, 38);
 const SUGGESTION_SELECTED: egui::Color32 = egui::Color32::from_rgb(77, 63, 28);
 const SUGGESTION_TEXT: egui::Color32 = egui::Color32::from_rgb(244, 242, 226);
 const SUGGESTION_BORDER: egui::Color32 = egui::Color32::from_rgb(104, 84, 32);
-const CLIPBOARD_ICON_PATH: &str = "assets/icon.png";
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
 
 fn install_system_font(ctx: &egui::Context) -> std::io::Result<()> {
     let windows_dir = std::env::var_os("WINDIR")
@@ -55,41 +61,24 @@ fn install_system_font(ctx: &egui::Context) -> std::io::Result<()> {
     ))
 }
 
-fn window_icon_candidates() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(current_dir) = env::current_dir() {
-        paths.push(current_dir.join(CLIPBOARD_ICON_PATH));
-    }
-    if let Ok(executable) = env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        paths.push(directory.join(CLIPBOARD_ICON_PATH));
-    }
-    paths
-}
-
 fn load_window_icon() -> Option<Arc<egui::IconData>> {
-    for path in window_icon_candidates() {
-        let Ok(reader) = image::ImageReader::open(path) else {
-            continue;
-        };
-        let Ok(decoded) = reader.decode() else {
-            continue;
-        };
-        let rgba = decoded.to_rgba8();
-        let width = rgba.width();
-        let height = rgba.height();
-        return Some(Arc::new(egui::IconData {
-            rgba: rgba.into_raw(),
-            width,
-            height,
-        }));
-    }
-    None
+    let decoded = image::load_from_memory(WINDOW_ICON_PNG).ok()?;
+    let rgba = decoded.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    Some(Arc::new(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    }))
 }
 
 fn suggestion_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("sunswitcher_suggestions_child")
+}
+
+fn notification_viewport_id() -> ViewportId {
+    ViewportId::from_hash_of("sunswitcher_notification_child")
 }
 
 fn render_suggestion_rows(ui: &mut egui::Ui, state: &PopupState) {
@@ -152,8 +141,69 @@ struct SuggestionViewportCache {
     spec: Option<SuggestionViewportSpec>,
 }
 
+#[derive(Debug, Clone)]
+struct NotificationState {
+    message: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationViewportSpec {
+    message: String,
+    x: i32,
+    y: i32,
+}
+
+#[derive(Debug, Default)]
+struct NotificationViewportCache {
+    visible: bool,
+    spec: Option<NotificationViewportSpec>,
+}
+
+fn suggestion_notification_anchor(spec: &SuggestionViewportSpec) -> CaretAnchor {
+    CaretAnchor::new(
+        spec.x as f32,
+        spec.y as f32,
+        spec.height as f32,
+        CaretSource::ForegroundWindowFallback,
+    )
+}
+
+#[derive(Clone)]
+pub struct TransientNotificationHandle {
+    state: Arc<RwLock<Option<NotificationState>>>,
+    repaint_ctx: egui::Context,
+    settings: SettingsStore,
+}
+
+impl TransientNotificationHandle {
+    pub fn show(&self, message: impl Into<String>) {
+        let message = message.into();
+        if message.is_empty() {
+            return;
+        }
+        crate::runtime_log!("[notification] show message={message:?}");
+        if let Ok(mut state) = self.state.write() {
+            let timeout = self
+                .settings
+                .load()
+                .map(|settings| settings.notification_timeout_seconds().duration())
+                .unwrap_or(NOTIFICATION_TIMEOUT);
+            *state = Some(NotificationState {
+                message,
+                expires_at: Instant::now() + timeout,
+            });
+        }
+        self.repaint_ctx.request_repaint();
+        self.repaint_ctx
+            .request_repaint_of(notification_viewport_id());
+    }
+}
+
 pub struct AutocompletePopupHandle {
     state: Arc<RwLock<PopupState>>,
+    notification: TransientNotificationHandle,
+    hotkey_capture: HotkeyCaptureHandle,
     clipboard: ClipboardManagerHandle,
     repaint_ctx: egui::Context,
     shutdown: Arc<AtomicBool>,
@@ -173,13 +223,18 @@ fn replace_popup_state(state: &RwLock<PopupState>, next: PopupState) -> bool {
 }
 
 impl AutocompletePopupHandle {
-    pub fn start(database_path: PathBuf) -> Result<Self, String> {
+    pub fn start(database_path: PathBuf, settings: SettingsStore) -> Result<Self, String> {
         let state = Arc::new(RwLock::new(PopupState::default()));
+        let notification_state = Arc::new(RwLock::new(None));
+        let hotkey_capture_state = HotkeyCaptureHandle::shared_state();
         let clipboard_state = Arc::new(RwLock::new(ClipboardManagerState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
+        let worker_notification_state = Arc::clone(&notification_state);
+        let worker_hotkey_capture_state = Arc::clone(&hotkey_capture_state);
         let worker_clipboard_state = Arc::clone(&clipboard_state);
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_settings = settings.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             let mut viewport = ViewportBuilder::default()
@@ -212,16 +267,34 @@ impl AutocompletePopupHandle {
                 options,
                 Box::new(move |creation_context| {
                     install_system_font(&creation_context.egui_ctx)?;
+                    creation_context
+                        .egui_ctx
+                        .options_mut(|options| options.zoom_with_keyboard = false);
                     let repaint_ctx = creation_context.egui_ctx.clone();
+                    let notification = TransientNotificationHandle {
+                        state: worker_notification_state,
+                        repaint_ctx: repaint_ctx.clone(),
+                        settings: worker_settings.clone(),
+                    };
+                    let hotkey_capture =
+                        HotkeyCaptureHandle::new(worker_hotkey_capture_state, repaint_ctx.clone());
                     let _ = startup_sender.send(Ok(repaint_ctx));
                     Ok(Box::new(AutocompletePopupApp {
                         state: worker_state,
-                        clipboard: ClipboardManagerApp::new(database_path, worker_clipboard_state),
+                        notification,
+                        settings: worker_settings.clone(),
+                        clipboard: ClipboardManagerApp::new(
+                            database_path,
+                            worker_clipboard_state,
+                            worker_settings,
+                            hotkey_capture,
+                        ),
                         shutdown: worker_shutdown,
                         locator: CaretLocator::new(),
                         fallback_anchor: None,
                         shown: false,
                         suggestion_viewport: SuggestionViewportCache::default(),
+                        notification_viewport: NotificationViewportCache::default(),
                     }))
                 }),
             );
@@ -233,6 +306,13 @@ impl AutocompletePopupHandle {
         match ready_receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(repaint_ctx)) => {
                 crate::runtime_log!("[ui-start] SunSwitcher UI runtime initialized");
+                let notification = TransientNotificationHandle {
+                    state: notification_state,
+                    repaint_ctx: repaint_ctx.clone(),
+                    settings: settings.clone(),
+                };
+                let hotkey_capture =
+                    HotkeyCaptureHandle::new(hotkey_capture_state, repaint_ctx.clone());
                 let clipboard = ClipboardManagerHandle::new(clipboard_state, repaint_ctx.clone());
                 let tray = TrayIcon::start(
                     clipboard.clone(),
@@ -241,6 +321,8 @@ impl AutocompletePopupHandle {
                 );
                 Ok(Self {
                     state,
+                    notification,
+                    hotkey_capture,
                     clipboard,
                     repaint_ctx,
                     shutdown,
@@ -299,6 +381,14 @@ impl AutocompletePopupHandle {
     pub fn clipboard_handle(&self) -> ClipboardManagerHandle {
         self.clipboard.clone()
     }
+
+    pub fn notification_handle(&self) -> TransientNotificationHandle {
+        self.notification.clone()
+    }
+
+    pub fn hotkey_capture_handle(&self) -> HotkeyCaptureHandle {
+        self.hotkey_capture.clone()
+    }
 }
 
 impl Drop for AutocompletePopupHandle {
@@ -313,12 +403,15 @@ impl Drop for AutocompletePopupHandle {
 
 struct AutocompletePopupApp {
     state: Arc<RwLock<PopupState>>,
+    notification: TransientNotificationHandle,
+    settings: SettingsStore,
     clipboard: ClipboardManagerApp,
     shutdown: Arc<AtomicBool>,
     locator: CaretLocator,
     fallback_anchor: Option<CaretAnchor>,
     shown: bool,
     suggestion_viewport: SuggestionViewportCache,
+    notification_viewport: NotificationViewportCache,
 }
 
 fn park_root_viewport(ctx: &egui::Context) {
@@ -357,6 +450,14 @@ impl AutocompletePopupApp {
     }
 
     fn show_suggestion_viewport(&mut self, ctx: &egui::Context, prefer_root_anchor: bool) {
+        if !self
+            .settings
+            .load()
+            .is_ok_and(|settings| settings.enable_autocomplete())
+        {
+            self.hide_suggestion_viewport(ctx);
+            return;
+        }
         let state = self
             .state
             .read()
@@ -436,6 +537,112 @@ impl AutocompletePopupApp {
             }
         });
     }
+
+    fn hide_notification_viewport(&mut self, ctx: &egui::Context) {
+        if self.notification_viewport.visible {
+            ctx.send_viewport_cmd_to(notification_viewport_id(), ViewportCommand::Visible(false));
+        }
+        self.notification_viewport.visible = false;
+        self.notification_viewport.spec = None;
+    }
+
+    fn active_notification(&self) -> Option<NotificationState> {
+        let now = Instant::now();
+        let mut state = self.notification.state.write().ok()?;
+        if state
+            .as_ref()
+            .is_some_and(|notification| notification.expires_at <= now)
+        {
+            *state = None;
+            return None;
+        }
+        state.clone()
+    }
+
+    fn notification_anchor(
+        &mut self,
+        ctx: &egui::Context,
+        prefer_root_anchor: bool,
+    ) -> Option<CaretAnchor> {
+        if prefer_root_anchor {
+            return root_viewport_anchor(ctx).or_else(|| self.locator.fallback_anchor());
+        }
+        if self.suggestion_viewport.visible
+            && let Some(spec) = self.suggestion_viewport.spec.as_ref()
+        {
+            return Some(suggestion_notification_anchor(spec));
+        }
+        if let Some(anchor) = self.locator.locate() {
+            self.fallback_anchor = None;
+            Some(anchor)
+        } else {
+            if self.fallback_anchor.is_none() {
+                self.fallback_anchor = self.locator.fallback_anchor();
+            }
+            self.fallback_anchor
+        }
+    }
+
+    fn show_notification_viewport(&mut self, ctx: &egui::Context, prefer_root_anchor: bool) {
+        let Some(notification) = self.active_notification() else {
+            self.hide_notification_viewport(ctx);
+            return;
+        };
+        let remaining = notification
+            .expires_at
+            .saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.hide_notification_viewport(ctx);
+            return;
+        }
+        ctx.request_repaint_after(remaining);
+
+        let Some(anchor) = self.notification_anchor(ctx, prefer_root_anchor) else {
+            self.hide_notification_viewport(ctx);
+            return;
+        };
+        let placement = popup_placement(anchor, NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT, CARET_GAP);
+        let spec = NotificationViewportSpec {
+            message: notification.message,
+            x: placement.x.round() as i32,
+            y: placement.y.round() as i32,
+        };
+        self.render_notification_viewport(ctx, &spec);
+        self.notification_viewport.visible = true;
+        self.notification_viewport.spec = Some(spec);
+    }
+
+    fn render_notification_viewport(&self, ctx: &egui::Context, spec: &NotificationViewportSpec) {
+        let message = spec.message.clone();
+        let viewport = ViewportBuilder::default()
+            .with_title("SunSwitcher notification")
+            .with_inner_size(vec2(NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT))
+            .with_position(pos2(spec.x as f32, spec.y as f32))
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(false)
+            .with_visible(true)
+            .with_transparent(false);
+        ctx.show_viewport_deferred(notification_viewport_id(), viewport, move |ui, _class| {
+            let bounds = ui.max_rect();
+            ui.painter().rect_filled(bounds, 6.0, SUGGESTION_BG);
+            ui.painter().rect_stroke(
+                bounds.shrink(0.5),
+                6.0,
+                egui::Stroke::new(1.0, SUGGESTION_BORDER),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                bounds.left_center() + vec2(POPUP_PADDING, 0.0),
+                egui::Align2::LEFT_CENTER,
+                message.as_str(),
+                egui::FontId::proportional(15.0),
+                SUGGESTION_TEXT,
+            );
+        });
+    }
 }
 
 impl eframe::App for AutocompletePopupApp {
@@ -449,6 +656,7 @@ impl eframe::App for AutocompletePopupApp {
             self.fallback_anchor = None;
             self.shown = false;
             self.show_suggestion_viewport(ctx, true);
+            self.show_notification_viewport(ctx, true);
             return;
         }
 
@@ -456,17 +664,17 @@ impl eframe::App for AutocompletePopupApp {
             .state
             .read()
             .is_ok_and(|state| !state.suggestions.is_empty());
-        if !has_suggestions {
+        if has_suggestions {
+            if !self.shown {
+                park_root_viewport(ctx);
+                self.shown = true;
+            }
+            self.show_suggestion_viewport(ctx, false);
+        } else {
             self.fallback_anchor = None;
             self.hide_suggestion_viewport(ctx);
-            return;
         }
-
-        if !self.shown {
-            park_root_viewport(ctx);
-            self.shown = true;
-        }
-        self.show_suggestion_viewport(ctx, false);
+        self.show_notification_viewport(ctx, false);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -491,6 +699,67 @@ impl eframe::App for AutocompletePopupApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_updates_replace_the_message_and_restart_the_deadline() {
+        let state = Arc::new(RwLock::new(None));
+        let handle = TransientNotificationHandle {
+            state: Arc::clone(&state),
+            repaint_ctx: egui::Context::default(),
+            settings: SettingsStore::new(crate::persistence::AppSettings::default()),
+        };
+
+        handle.show("first");
+        let first = state
+            .read()
+            .expect("notification state lock")
+            .clone()
+            .expect("first notification");
+        handle.show("second");
+        let second = state
+            .read()
+            .expect("notification state lock")
+            .clone()
+            .expect("second notification");
+
+        assert_eq!(second.message, "second");
+        assert!(second.expires_at >= first.expires_at);
+        assert!(second.expires_at > Instant::now() + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn notification_anchor_tracks_current_suggestion_geometry() {
+        let base = SuggestionViewportSpec {
+            state: PopupState::default(),
+            prefer_root_anchor: false,
+            x: 120,
+            y: 240,
+            height: 72,
+        };
+        let base_anchor = suggestion_notification_anchor(&base);
+        assert_eq!(base_anchor.x(), 120.0);
+        assert_eq!(base_anchor.y(), 240.0);
+        assert_eq!(base_anchor.height(), 72.0);
+
+        let resized = SuggestionViewportSpec {
+            x: 180,
+            y: 210,
+            height: 144,
+            ..base
+        };
+        let resized_anchor = suggestion_notification_anchor(&resized);
+        assert_eq!(resized_anchor.x(), 180.0);
+        assert_eq!(resized_anchor.y(), 210.0);
+        assert_eq!(resized_anchor.height(), 144.0);
+    }
+
+    #[test]
+    fn embedded_window_icon_decodes_without_runtime_assets() {
+        let icon = load_window_icon().expect("embedded window icon must decode");
+        assert!(icon.width > 0);
+        assert!(icon.height > 0);
+        assert!(!icon.rgba.is_empty());
+    }
 
     #[test]
     fn popup_state_change_detection_ignores_identical_updates() {

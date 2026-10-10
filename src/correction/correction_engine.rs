@@ -84,10 +84,60 @@ impl From<ReplacementText> for CorrectionReplacement {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorrectionFeatures {
+    typo: bool,
+    layout_switch: bool,
+}
+
+impl CorrectionFeatures {
+    pub const fn new(typo: bool, layout_switch: bool) -> Self {
+        Self {
+            typo,
+            layout_switch,
+        }
+    }
+
+    pub const fn typo(self) -> bool {
+        self.typo
+    }
+
+    pub const fn layout_switch(self) -> bool {
+        self.layout_switch
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorrectionFeaturePolicy {
+    autocorrections: bool,
+    auto_keyboard_switches: bool,
+}
+
+impl CorrectionFeaturePolicy {
+    pub const ALL: Self = Self::new(true, true);
+
+    pub const fn new(autocorrections: bool, auto_keyboard_switches: bool) -> Self {
+        Self {
+            autocorrections,
+            auto_keyboard_switches,
+        }
+    }
+
+    pub const fn auto_keyboard_switches(self) -> bool {
+        self.auto_keyboard_switches
+    }
+
+    pub const fn allows(self, features: CorrectionFeatures) -> bool {
+        (!features.typo() || self.autocorrections)
+            && (!features.layout_switch() || self.auto_keyboard_switches)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorrectionCandidate {
     replacement: CorrectionReplacement,
     confidence: Confidence,
+    features: CorrectionFeatures,
 }
 
 impl CorrectionCandidate {
@@ -95,6 +145,7 @@ impl CorrectionCandidate {
         Self {
             replacement: replacement.into(),
             confidence,
+            features: CorrectionFeatures::new(true, false),
         }
     }
 
@@ -106,6 +157,24 @@ impl CorrectionCandidate {
         Self {
             replacement: CorrectionReplacement::for_language(replacement, target_language),
             confidence,
+            features: CorrectionFeatures::new(false, true),
+        }
+    }
+
+    pub fn classified(
+        replacement: ReplacementText,
+        confidence: Confidence,
+        target_language: Option<LanguageId>,
+        features: CorrectionFeatures,
+    ) -> Self {
+        let replacement = match target_language {
+            Some(language) => CorrectionReplacement::for_language(replacement, language),
+            None => CorrectionReplacement::new(replacement),
+        };
+        Self {
+            replacement,
+            confidence,
+            features,
         }
     }
 
@@ -119,6 +188,10 @@ impl CorrectionCandidate {
 
     pub fn confidence(&self) -> Confidence {
         self.confidence
+    }
+
+    pub fn features(&self) -> CorrectionFeatures {
+        self.features
     }
 }
 
@@ -146,10 +219,19 @@ impl<P: CorrectionCandidateProvider> CorrectionEngine<P> {
     }
 
     pub fn decide(&self, token: &CompletedToken) -> CorrectionDecision {
+        self.decide_with_policy(token, CorrectionFeaturePolicy::ALL)
+    }
+
+    pub fn decide_with_policy(
+        &self,
+        token: &CompletedToken,
+        policy: CorrectionFeaturePolicy,
+    ) -> CorrectionDecision {
         let best = self
             .provider
             .candidates(token)
             .into_iter()
+            .filter(|candidate| policy.allows(candidate.features()))
             .filter(|candidate| candidate.replacement().as_str() != token.text())
             .filter(|candidate| candidate.confidence().value() >= self.minimum_confidence.value())
             .max_by(|left, right| {

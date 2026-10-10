@@ -1,6 +1,6 @@
 use super::{
     Confidence, CorrectionCandidate, CorrectionCandidateProvider, CorrectionDecision,
-    CorrectionEngine, ReplacementText,
+    CorrectionEngine, CorrectionFeaturePolicy, CorrectionFeatures, ReplacementText,
 };
 use crate::input::{Boundary, CompletedToken};
 
@@ -42,6 +42,23 @@ fn keeps_token_when_no_candidate_reaches_threshold() {
     let token = CompletedToken::new("дял", Boundary::Character(' '));
 
     assert_eq!(engine.decide(&token), CorrectionDecision::Keep);
+}
+
+#[test]
+fn feature_policy_treats_cross_layout_typo_repair_as_keyboard_switching() {
+    let same_layout_typo = CorrectionFeatures::new(true, false);
+    let cross_layout_typo = CorrectionFeatures::new(true, true);
+
+    let autocorrections_only = CorrectionFeaturePolicy::new(true, false);
+    assert!(autocorrections_only.allows(same_layout_typo));
+    assert!(!autocorrections_only.allows(cross_layout_typo));
+
+    let keyboard_switches_only = CorrectionFeaturePolicy::new(false, true);
+    assert!(!keyboard_switches_only.allows(same_layout_typo));
+    assert!(!keyboard_switches_only.allows(cross_layout_typo));
+
+    let both_enabled = CorrectionFeaturePolicy::new(true, true);
+    assert!(both_enabled.allows(cross_layout_typo));
 }
 
 #[test]

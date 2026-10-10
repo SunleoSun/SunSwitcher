@@ -55,3 +55,31 @@ fn prefix_matches_rank_recency_before_frequency() {
     assert_eq!(matches[0].term(), "QuantileEntryStrategy1");
     assert_eq!(matches[1].term(), "QuantileEntryStrategy");
 }
+
+#[test]
+fn long_words_keep_exact_and_prefix_completion_while_fuzzy_search_is_bounded() {
+    let medium = format!("{}b", "a".repeat(64));
+    let long = format!("{}b", "x".repeat(779));
+    let lexicon = UserLexicon::try_new(vec![word(&medium, 1, 100), word(&long, 1, 200)]).unwrap();
+
+    assert_eq!(lexicon.exact(&long).unwrap().term(), long);
+    assert_eq!(
+        lexicon
+            .prefix_matches(&"x".repeat(120), 1)
+            .first()
+            .unwrap()
+            .term(),
+        long
+    );
+
+    let medium_typo = "a".repeat(64);
+    assert!(
+        lexicon
+            .candidate_entries(&medium_typo, 2)
+            .iter()
+            .any(|entry| entry.term() == medium)
+    );
+
+    let long_typo = "x".repeat(779);
+    assert!(lexicon.candidate_entries(&long_typo, 2).is_empty());
+}

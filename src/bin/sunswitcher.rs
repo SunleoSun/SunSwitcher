@@ -20,17 +20,20 @@ mod windows_app {
     use sunswitcher::completion::{
         CompletionApplyOutcome, CompletionCommand, CompletionCommandResult,
     };
-    use sunswitcher::correction::Confidence;
+    use sunswitcher::correction::{Confidence, CorrectionFeaturePolicy};
     use sunswitcher::input::InputEvent;
     use sunswitcher::language::{KeyboardLayoutSwitch, switch_keyboard_layout_text};
-    use sunswitcher::persistence::{Database, UndoHotkey};
+    use sunswitcher::persistence::{Database, ForgetWordOutcome, IgnoreWordOutcome};
     use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome, UndoReplacementAction};
+    use sunswitcher::settings::SettingsStore;
     #[cfg(debug_assertions)]
     use sunswitcher::windows::request_global_keyboard_hook_stop;
-    use sunswitcher::windows::{AutocompletePopupHandle, ClipboardTextListener};
+    use sunswitcher::windows::{
+        AutocompletePopupHandle, ClipboardTextListener, HotkeyCaptureHandle,
+    };
     use sunswitcher::windows::{ClipboardCommand, ClipboardManagerTab, ObservableClipboardContent};
     use sunswitcher::windows::{
-        InputProcessor, RuntimeDirective, UndoDirective, run_global_keyboard_hook,
+        IgnoreWordStatus, InputProcessor, RuntimeDirective, UndoDirective, run_global_keyboard_hook,
     };
     #[cfg(debug_assertions)]
     use windows_sys::Win32::System::Console::{
@@ -66,7 +69,7 @@ mod windows_app {
                 "The hook is global. Focusing/clicking discards stale tracked text; the first newly typed character starts a fresh token immediately. Type an example followed by Space/Enter/Tab."
             );
             app_log!(
-                "Pause: without a selection, undo the previous correction; with a selected word, remove it from learned user_words."
+                "Pause: without a selection, undo the previous correction; with a selected word, forget its personal vocabulary state. Ctrl+Pause adds the selected word to ignored_words."
             );
             app_log!(
                 "Autocomplete: after 3 typed letters; Up/Down selects, Tab accepts all, Alt+Right accepts one word, Del removes the selected prediction, Esc closes. Double Shift switches the selected text or previous word between keyboard layouts."
@@ -81,14 +84,14 @@ mod windows_app {
             }
         };
 
-        let (processor, undo_hotkey) = match SunSwitcherProcessor::new() {
+        let (processor, settings, hotkey_capture) = match SunSwitcherProcessor::new() {
             Ok(processor) => processor,
             Err(error) => {
                 app_error!("Could not load the SunSwitcher language snapshot from SQLite: {error}");
                 return;
             }
         };
-        if let Err(error) = run_global_keyboard_hook(processor, undo_hotkey) {
+        if let Err(error) = run_global_keyboard_hook(processor, settings, hotkey_capture) {
             app_error!("SunSwitcher stopped with an error: {error:?}");
             return;
         }
@@ -131,11 +134,12 @@ mod windows_app {
         session: AdaptiveCorrectionSession,
         completion: AdaptiveCompletionSession,
         popup: AutocompletePopupHandle,
+        settings: SettingsStore,
         // Clipboard manager state lives in the shared UI runtime.
     }
 
     impl SunSwitcherProcessor {
-        fn new() -> Result<(Self, UndoHotkey), String> {
+        fn new() -> Result<(Self, SettingsStore, HotkeyCaptureHandle), String> {
             let local_app_data = std::env::var_os("LOCALAPPDATA")
                 .ok_or_else(|| "LOCALAPPDATA is not available".to_owned())?;
             let app_data_dir = PathBuf::from(local_app_data).join("SunSwitcher");
@@ -143,18 +147,18 @@ mod windows_app {
                 .map_err(|error| format!("could not create app-data directory: {error}"))?;
             let database_path = app_data_dir.join("sunswitcher.db");
             let database = Database::open(&database_path).map_err(|error| error.to_string())?;
-            let undo_hotkey = database
-                .settings()
-                .map_err(|error| error.to_string())?
-                .undo_hotkey();
+            let initial_settings = database.settings().map_err(|error| error.to_string())?;
+            let settings = SettingsStore::new(initial_settings);
             let minimum_confidence = Confidence::try_new(0.80).expect("valid production threshold");
             let runtime = AdaptiveLexicalRuntime::start(database, minimum_confidence)
                 .map_err(|error| error.to_string())?;
             let learning = runtime.learning();
-            let popup = AutocompletePopupHandle::start(database_path.clone())
+            let popup = AutocompletePopupHandle::start(database_path.clone(), settings.clone())
                 .map_err(|error| format!("SunSwitcher UI failed: {error}"))?;
+            let hotkey_capture = popup.hotkey_capture_handle();
             let clipboard_updates = popup.clipboard_handle();
             let clipboard_database_path = database_path.clone();
+            let clipboard_settings = settings.clone();
             let clipboard_listener = ClipboardTextListener::start(move |content| {
 let started_at = Instant::now();
 let observed_at_ms = now_ms();
@@ -188,7 +192,7 @@ Err(error) => app_error!("clipboard image history skipped: {error}"),
 }
 history_ms = elapsed_ms(history_started_at);
 let prune_started_at = Instant::now();
-if let Ok(settings) = database.settings()
+if let Ok(settings) = clipboard_settings.load()
 && let Err(error) = database.prune_clipboard_history(settings.clipboard_history_limit())
 {
 app_error!("clipboard history prune skipped: {error}");
@@ -235,22 +239,44 @@ adaptive_learning
                     session,
                     completion,
                     popup,
+                    settings: settings.clone(),
                     // Clipboard manager is owned by popup,
                 },
-                undo_hotkey,
+                settings,
+                hotkey_capture,
             ))
         }
     }
 
     impl SunSwitcherProcessor {
         fn sync_popup(&self) {
-            self.popup.update(
-                self.completion
-                    .suggestions()
-                    .iter()
-                    .map(|suggestion| suggestion.text()),
-                self.completion.selected_index(),
-            );
+            if self
+                .settings
+                .load()
+                .is_ok_and(|settings| settings.enable_autocomplete())
+            {
+                self.popup.update(
+                    self.completion
+                        .suggestions()
+                        .iter()
+                        .map(|suggestion| suggestion.text()),
+                    self.completion.selected_index(),
+                );
+            } else {
+                self.popup.hide();
+            }
+        }
+
+        fn correction_policy(&self) -> CorrectionFeaturePolicy {
+            self.settings
+                .load()
+                .map(|settings| {
+                    CorrectionFeaturePolicy::new(
+                        settings.enable_autocorrections(),
+                        settings.enable_auto_keyboard_switches(),
+                    )
+                })
+                .unwrap_or_else(|_| CorrectionFeaturePolicy::new(false, false))
         }
     }
 
@@ -300,7 +326,10 @@ adaptive_learning
 
     impl InputProcessor for SunSwitcherProcessor {
         fn completion_active(&self) -> bool {
-            self.completion.is_active()
+            self.settings
+                .load()
+                .is_ok_and(|settings| settings.enable_autocomplete())
+                && self.completion.is_active()
         }
 
         fn switch_layout_text(&self, text: &str) -> Option<KeyboardLayoutSwitch> {
@@ -326,7 +355,11 @@ adaptive_learning
             if let Err(error) = self.completion.process_event(event, observed_at_ms) {
                 app_error!("adaptive completion skipped: {error}");
             }
-            let directive = match self.session.process(event, observed_at_ms) {
+            let directive = match self.session.process_with_policy(
+                event,
+                observed_at_ms,
+                self.correction_policy(),
+            ) {
                 Ok(AdaptiveCorrectionDirective::Pass) => RuntimeDirective::Pass,
                 Ok(AdaptiveCorrectionDirective::Replace(action)) => {
                     app_log!("[REPLACE] -> {:?}", action.replacement().as_str());
@@ -383,24 +416,147 @@ adaptive_learning
             }
             self.sync_popup();
         }
-        fn delete_user_word(&mut self, text: &str) {
-            if let Err(error) = self.runtime.learning().delete_user_word(text.to_owned()) {
-                app_error!("user-word deletion skipped: {error}");
-                return;
+        fn ignore_word(&mut self, text: &str) -> IgnoreWordStatus {
+            let word = text.trim().to_owned();
+            if word.is_empty() {
+                return IgnoreWordStatus::Failed;
             }
+            let receipt = match self.runtime.learning().ignore_word(word.clone()) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    app_error!("ignored-word mutation skipped: {error}");
+                    return IgnoreWordStatus::Failed;
+                }
+            };
+            let outcome = match receipt.wait() {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    app_error!("ignored-word mutation failed: {error}");
+                    return IgnoreWordStatus::Failed;
+                }
+            };
+            let notification = self.popup.notification_handle();
+            match outcome {
+                IgnoreWordOutcome::AddedToIgnoreList => {
+                    notification.show(format!("\"{word}\" added to ignore list"));
+                }
+                IgnoreWordOutcome::AlreadyInIgnoreList => {
+                    notification.show(format!("\"{word}\" already in ignore list"));
+                }
+            }
+            app_log!("[WORD IGNORE] {:?}", text);
+            IgnoreWordStatus::Confirmed
+        }
+
+        fn ignored_word_layout_switch(&self, text: &str) -> Option<KeyboardLayoutSwitch> {
+            let word = text.trim();
+            let correction = self
+                .session
+                .recheck_text_layout_after_lexical_override(word, self.correction_policy())
+                .ok()??;
+            let target_language = correction.target_language()?;
+            let snapshot = self.runtime.snapshots().load().ok()?;
+            let switched = switch_keyboard_layout_text(snapshot.languages(), word)?;
+            (switched.text() == correction.as_str()
+                && switched.target_language() == target_language)
+                .then_some(switched)
+        }
+
+        fn tracked_word_for_ignore(&self) -> Option<String> {
+            self.session
+                .current_lexical_term_for_hotkey()
+                .ok()
+                .flatten()
+        }
+
+        fn recheck_ignored_tracked_word(&mut self) -> RuntimeDirective {
+            let observed_at_ms = now_ms();
+            let policy = self.correction_policy();
+            match self
+                .session
+                .recheck_current_layout_after_lexical_override(observed_at_ms, policy)
+            {
+                Ok(AdaptiveCorrectionDirective::ReplaceLivePrefix(action)) => {
+                    app_log!(
+                        "[IGNORE REPLACE] {:?} -> {:?}",
+                        action.original_visible(),
+                        action.replacement().as_str()
+                    );
+                    RuntimeDirective::ReplaceLivePrefix(action)
+                }
+                Ok(AdaptiveCorrectionDirective::Pass) => {
+                    if let Err(error) = self.session.process(InputEvent::Invalidate, observed_at_ms)
+                    {
+                        app_error!(
+                            "adaptive correction reset after ignored-word mutation skipped: {error}"
+                        );
+                    }
+                    if let Err(error) = self
+                        .completion
+                        .process_event(InputEvent::Invalidate, observed_at_ms)
+                    {
+                        app_error!(
+                            "adaptive completion reset after ignored-word mutation skipped: {error}"
+                        );
+                    }
+                    self.sync_popup();
+                    RuntimeDirective::Pass
+                }
+                Ok(AdaptiveCorrectionDirective::Replace(_)) => {
+                    app_error!(
+                        "ignored-word recheck unexpectedly produced a completed replacement"
+                    );
+                    RuntimeDirective::Pass
+                }
+                Err(error) => {
+                    app_error!("ignored-word recheck skipped: {error}");
+                    RuntimeDirective::Pass
+                }
+            }
+        }
+
+        fn forget_word(&mut self, text: &str) {
+            let word = text.trim().to_owned();
+            let receipt = match self.runtime.learning().forget_word(word.clone()) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    app_error!("word forget mutation skipped: {error}");
+                    return;
+                }
+            };
+            let notification = self.popup.notification_handle();
+            std::thread::spawn(move || match receipt.wait() {
+                Ok(ForgetWordOutcome::RemovedFromIgnoreList) => {
+                    notification.show(format!("\"{word}\" removed from ignore list"));
+                }
+                Ok(ForgetWordOutcome::RemovedFromUserWords) => {
+                    notification.show(format!("\"{word}\" removed from user words"));
+                }
+                Ok(ForgetWordOutcome::RemovedFromBoth) => {
+                    notification.show(format!(
+                        "\"{word}\" removed from ignore list and user words"
+                    ));
+                }
+                Ok(ForgetWordOutcome::NotFound) => {
+                    notification.show(format!("\"{word}\" not in ignore list or user words"));
+                }
+                Err(error) => {
+                    sunswitcher::runtime_log!("word forget mutation failed: {error}");
+                }
+            });
 
             let observed_at_ms = now_ms();
             if let Err(error) = self.session.process(InputEvent::Invalidate, observed_at_ms) {
-                app_error!("adaptive correction reset after user-word deletion skipped: {error}");
+                app_error!("adaptive correction reset after word forget skipped: {error}");
             }
             if let Err(error) = self
                 .completion
                 .process_event(InputEvent::Invalidate, observed_at_ms)
             {
-                app_error!("adaptive completion reset after user-word deletion skipped: {error}");
+                app_error!("adaptive completion reset after word forget skipped: {error}");
             }
             self.sync_popup();
-            app_log!("[USER WORD DELETE] {:?}", text);
+            app_log!("[WORD FORGET] {:?}", text);
         }
 
         fn undo(&mut self) -> UndoDirective {

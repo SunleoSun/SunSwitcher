@@ -1,6 +1,6 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_MENU, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6,
-    VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_TAB,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_CONTROL, VK_MENU, VK_OEM_1, VK_OEM_2, VK_OEM_3,
+    VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_TAB,
 };
 
 use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
@@ -8,10 +8,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
 use super::keyboard_runtime::{
     InputOwnershipStamp, KeyDownDisposition, RuntimeError, SuppressedKeyUpRoute,
     build_replacement_inputs, completion_modifier_is_sunswitcher_only,
-    completion_result_passes_through, foreground_change_requires_invalidation, injected_marker,
-    input_ownership_matches, is_foreign_injected_keyboard_event, keyup_suppression_after_injection,
-    physical_key_from_vk, preclassify_key_down, replacement_outcome_after_injection,
-    suppressed_keyup_calls_downstream, undo_hotkey_matches, undo_outcome_after_injection,
+    completion_result_passes_through, foreground_change_requires_invalidation,
+    ignore_hotkey_matches, injected_marker, input_ownership_matches,
+    is_foreign_injected_keyboard_event, keyup_suppression_after_injection, physical_key_from_vk,
+    preclassify_key_down, replacement_outcome_after_injection, suppressed_keyup_calls_downstream,
+    undo_hotkey_matches, undo_outcome_after_injection,
 };
 use crate::completion::CompletionCommandResult;
 use crate::correction::{CorrectionDecision, ReplacementText};
@@ -100,6 +101,7 @@ fn certification_windows_runtime_preserves_layout_ambiguous_physical_keys() {
         (VK_OEM_7, PhysicalKey::Quote),
         (VK_OEM_COMMA, PhysicalKey::Comma),
         (VK_OEM_PERIOD, PhysicalKey::Period),
+        (VK_OEM_2, PhysicalKey::Slash),
     ] {
         assert_eq!(physical_key_from_vk(vk_code as u32), expected);
     }
@@ -110,6 +112,23 @@ fn certification_pause_is_the_default_unmodified_undo_binding() {
     let state = [0u8; 256];
     assert_eq!(UndoHotkey::DEFAULT, UndoHotkey::Pause);
     assert!(undo_hotkey_matches(
+        UndoHotkey::DEFAULT,
+        VK_PAUSE as u32,
+        &state
+    ));
+}
+
+#[test]
+fn certification_ctrl_pause_is_the_default_ignore_binding() {
+    let mut state = [0u8; 256];
+    state[VK_CONTROL as usize] = 0x80;
+    assert!(ignore_hotkey_matches(
+        UndoHotkey::DEFAULT,
+        VK_PAUSE as u32,
+        &state
+    ));
+    assert!(ignore_hotkey_matches(UndoHotkey::DEFAULT, 0x03, &state));
+    assert!(!undo_hotkey_matches(
         UndoHotkey::DEFAULT,
         VK_PAUSE as u32,
         &state

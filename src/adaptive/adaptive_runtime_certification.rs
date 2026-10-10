@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
 use crate::correction::Confidence;
 use crate::input::{Boundary, InputEvent, PhysicalKey};
-use crate::persistence::Database;
+use crate::persistence::{Database, ForgetWordOutcome, IgnoreWordOutcome};
 use crate::replacement::{ReplacementOutcome, UndoOutcome};
 
 use super::{AdaptiveCorrectionDirective, AdaptiveLexicalRuntime};
@@ -215,7 +215,12 @@ fn certification_explicit_user_word_deletion_refreshes_live_snapshot() {
             .any(|candidate| candidate.text() == "руддщ")
     );
 
-    runtime.learning().delete_user_word("РУДДЩ").unwrap();
+    runtime
+        .learning()
+        .forget_word("РУДДЩ")
+        .unwrap()
+        .wait()
+        .unwrap();
     runtime.flush().unwrap();
     assert!(
         !runtime
@@ -242,6 +247,239 @@ fn certification_explicit_user_word_deletion_refreshes_live_snapshot() {
             .complete_sequence(&["hello"], 40, 10)
             .iter()
             .all(|candidate| candidate.text() != "руддщ")
+    );
+}
+
+#[test]
+fn certification_ignored_system_word_yields_to_wrong_layout_with_physical_punctuation() {
+    let mut database = Database::open_in_memory().unwrap();
+    assert_eq!(
+        database.ignore_word("jr").unwrap(),
+        IgnoreWordOutcome::AddedToIgnoreList
+    );
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert!(snapshot.ignored_words().contains_normalized("jr"));
+    assert!(!snapshot.contains_normalized("jr"));
+
+    let mut plain = runtime.session();
+    let AdaptiveCorrectionDirective::Replace(action) = type_token(&mut plain, "jr", 50) else {
+        panic!("ignored English exact word must allow its Russian wrong-layout interpretation");
+    };
+    assert_eq!(action.replacement().as_str(), "ок");
+    assert_eq!(action.target_language().unwrap().as_str(), "ru");
+
+    let mut punctuated = runtime.session();
+    assert_eq!(
+        punctuated.process(InputEvent::character('j'), 60).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        punctuated.process(InputEvent::character('r'), 60).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        punctuated
+            .process(InputEvent::typed_character('?', PhysicalKey::Slash), 60)
+            .unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    let AdaptiveCorrectionDirective::Replace(action) =
+        punctuated.process(InputEvent::character(' '), 60).unwrap()
+    else {
+        panic!("physical Shift+/ must remain in the wrong-layout span until boundary");
+    };
+    assert_eq!(action.replacement().as_str(), "ок,");
+    assert_eq!(action.target_language().unwrap().as_str(), "ru");
+
+    assert!(
+        runtime
+            .completion_provider()
+            .unwrap()
+            .complete("j", 20)
+            .iter()
+            .all(|candidate| candidate.text() != "jr")
+    );
+}
+
+#[test]
+fn certification_tracked_ignore_uses_the_lexical_core_before_deferred_punctuation() {
+    let database = Database::open_in_memory().unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        session.process(InputEvent::character('j'), 80).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        session.process(InputEvent::character('r'), 81).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    let punctuation = char::from_u32(63).unwrap();
+    assert_eq!(
+        session
+            .process(
+                InputEvent::typed_character(punctuation, PhysicalKey::Slash),
+                82
+            )
+            .unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+
+    let term = session
+        .current_lexical_term_for_hotkey()
+        .unwrap()
+        .expect("tracked lexical term");
+    assert_eq!(term, "jr");
+    assert_eq!(
+        runtime
+            .learning()
+            .ignore_word(term)
+            .unwrap()
+            .wait()
+            .unwrap(),
+        IgnoreWordOutcome::AddedToIgnoreList
+    );
+
+    let AdaptiveCorrectionDirective::ReplaceLivePrefix(action) = session
+        .recheck_current_layout_after_lexical_override(
+            83,
+            crate::correction::CorrectionFeaturePolicy::ALL,
+        )
+        .unwrap()
+    else {
+        panic!("tracked ignore must expose the physical-layout replacement");
+    };
+    assert_eq!(action.delete_previous_chars(), 3);
+    assert_eq!(action.replacement().as_str(), "ок,");
+}
+
+#[test]
+fn certification_live_ignore_rechecks_the_current_word_and_selected_spelling() {
+    let database = Database::open_in_memory().unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+
+    let mut jr = runtime.session();
+    assert_eq!(
+        jr.process(InputEvent::character('j'), 100).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        jr.process(InputEvent::character('r'), 101).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        runtime
+            .learning()
+            .ignore_word("jr")
+            .unwrap()
+            .wait()
+            .unwrap(),
+        IgnoreWordOutcome::AddedToIgnoreList
+    );
+    let AdaptiveCorrectionDirective::ReplaceLivePrefix(action) = jr
+        .recheck_current_layout_after_lexical_override(
+            102,
+            crate::correction::CorrectionFeaturePolicy::ALL,
+        )
+        .unwrap()
+    else {
+        panic!("confirmed ignore must immediately expose jr -> ок");
+    };
+    assert_eq!(action.delete_previous_chars(), 2);
+    assert_eq!(action.replacement().as_str(), "ок");
+    assert_eq!(action.target_language().unwrap().as_str(), "ru");
+
+    let selected = runtime.session();
+    let correction = selected
+        .recheck_text_layout_after_lexical_override(
+            "jr",
+            crate::correction::CorrectionFeaturePolicy::ALL,
+        )
+        .unwrap()
+        .expect("selected ignored spelling must expose a cross-layout correction");
+    assert_eq!(correction.as_str(), "ок");
+    assert_eq!(correction.target_language().unwrap().as_str(), "ru");
+
+    let mut yt = runtime.session();
+    assert_eq!(
+        yt.process(InputEvent::character('y'), 110).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        yt.process(InputEvent::character('t'), 111).unwrap(),
+        AdaptiveCorrectionDirective::Pass
+    );
+    assert_eq!(
+        runtime
+            .learning()
+            .ignore_word("yt")
+            .unwrap()
+            .wait()
+            .unwrap(),
+        IgnoreWordOutcome::AddedToIgnoreList
+    );
+    let AdaptiveCorrectionDirective::ReplaceLivePrefix(action) = yt
+        .recheck_current_layout_after_lexical_override(
+            112,
+            crate::correction::CorrectionFeaturePolicy::ALL,
+        )
+        .unwrap()
+    else {
+        panic!("confirmed ignore must immediately expose yt -> не");
+    };
+    assert_eq!(action.replacement().as_str(), "не");
+    assert_eq!(action.target_language().unwrap().as_str(), "ru");
+}
+
+#[test]
+fn certification_ignored_word_blocks_learning_until_pause_style_forget() {
+    let mut database = Database::open_in_memory().unwrap();
+    database.ignore_word("мурзаплекс").unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        type_token(&mut session, "мурзаплекс", 100),
+        AdaptiveCorrectionDirective::Pass
+    );
+    runtime.flush().unwrap();
+    assert!(
+        !runtime
+            .snapshots()
+            .load()
+            .unwrap()
+            .user_lexicon()
+            .contains_normalized("мурзаплекс")
+    );
+
+    assert_eq!(
+        runtime
+            .learning()
+            .forget_word("МУРЗАПЛЕКС")
+            .unwrap()
+            .wait()
+            .unwrap(),
+        ForgetWordOutcome::RemovedFromIgnoreList
+    );
+    assert_eq!(
+        type_token(&mut session, "мурзаплекс", 200),
+        AdaptiveCorrectionDirective::Pass
+    );
+    runtime.flush().unwrap();
+    assert!(
+        runtime
+            .snapshots()
+            .load()
+            .unwrap()
+            .user_lexicon()
+            .contains_normalized("мурзаплекс")
     );
 }
 

@@ -4,7 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
-use super::{AppSettings, ClipboardHistoryLimit, Database, DatabaseError, UndoHotkey};
+use super::{
+    AppSettings, ClipboardHistoryLimit, Database, DatabaseError, HotkeyAction, HotkeyBinding,
+    NotificationTimeoutSeconds, UndoHotkey,
+};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -38,7 +41,7 @@ impl Drop for TempDatabasePath {
 fn certification_fresh_database_has_only_the_required_application_tables() {
     let path = TempDatabasePath::new("schema");
     let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 6);
+    assert_eq!(database.schema_version().unwrap(), 8);
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -63,6 +66,7 @@ fn certification_fresh_database_has_only_the_required_application_tables() {
             "clipboard_text",
             "completion_hidden_words",
             "correction_events",
+            "ignored_words",
             "languages",
             "text_history",
             "user_words",
@@ -155,7 +159,7 @@ fn certification_builtin_vocabulary_is_not_duplicated_in_sqlite() {
     let path = TempDatabasePath::new("builtin-dictionary-authority");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 6);
+        assert_eq!(database.schema_version().unwrap(), 8);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -174,7 +178,7 @@ fn certification_unknown_enabled_language_fails_closed() {
     let path = TempDatabasePath::new("unknown-language");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 6);
+        assert_eq!(database.schema_version().unwrap(), 8);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -268,7 +272,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     let path = TempDatabasePath::new("schema-v1-to-v2");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 6);
+        assert_eq!(database.schema_version().unwrap(), 8);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -278,7 +282,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 6);
+    assert_eq!(migrated.schema_version().unwrap(), 8);
     migrated.hide_completion_word("hello").unwrap();
     assert!(
         migrated
@@ -293,7 +297,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     let path = TempDatabasePath::new("schema-v2-grave-cleanup");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 6);
+        assert_eq!(database.schema_version().unwrap(), 8);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -311,7 +315,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 6);
+    assert_eq!(migrated.schema_version().unwrap(), 8);
     assert!(
         migrated
             .load_user_lexicon()
@@ -334,7 +338,7 @@ fn certification_schema_v4_drops_obsolete_dictionary_table() {
     let path = TempDatabasePath::new("schema-v4-dictionary-drop");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 6);
+        assert_eq!(database.schema_version().unwrap(), 8);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -352,7 +356,7 @@ fn certification_schema_v4_drops_obsolete_dictionary_table() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 6);
+    assert_eq!(migrated.schema_version().unwrap(), 8);
     drop(migrated);
     let raw = Connection::open(path.as_path()).unwrap();
     let exists: i64 = raw
@@ -363,6 +367,34 @@ fn certification_schema_v4_drops_obsolete_dictionary_table() {
         )
         .unwrap();
     assert_eq!(exists, 0);
+}
+
+#[test]
+fn certification_schema_v7_adds_persistent_ignored_words() {
+    let path = TempDatabasePath::new("schema-v6-ignored-words");
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        assert_eq!(database.schema_version().unwrap(), 8);
+    }
+
+    let raw = Connection::open(path.as_path()).unwrap();
+    raw.execute("DROP TABLE ignored_words", []).unwrap();
+    raw.pragma_update(None, "user_version", 6).unwrap();
+    drop(raw);
+
+    let mut migrated = Database::open(path.as_path()).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert!(migrated.load_ignored_words().unwrap().is_empty());
+    migrated.ignore_word("jr").unwrap();
+    drop(migrated);
+
+    let reopened = Database::open(path.as_path()).unwrap();
+    assert!(
+        reopened
+            .load_ignored_words()
+            .unwrap()
+            .contains_normalized("jr")
+    );
 }
 
 #[test]
@@ -396,18 +428,25 @@ fn certification_correction_undo_persists_original_as_user_word_across_reopen() 
 #[test]
 fn certification_settings_are_canonical_and_survive_reopen() {
     let path = TempDatabasePath::new("settings");
+    let expected = AppSettings::new(
+        ClipboardHistoryLimit::try_new(777).unwrap(),
+        UndoHotkey::Pause,
+    )
+    .with_hotkey(
+        HotkeyAction::IgnoreWord,
+        HotkeyBinding::try_new(b'I' as u16, true, true, false, false).unwrap(),
+    )
+    .with_enable_autocomplete(false)
+    .with_enable_autocorrections(false)
+    .with_enable_auto_keyboard_switches(true)
+    .with_notification_timeout_seconds(NotificationTimeoutSeconds::try_new(7).unwrap());
     {
         let database = Database::open(path.as_path()).unwrap();
-        let limit = ClipboardHistoryLimit::try_new(777).unwrap();
-        database
-            .save_settings(AppSettings::new(limit, UndoHotkey::Pause))
-            .unwrap();
+        database.save_settings(expected).unwrap();
     }
 
     let reopened = Database::open(path.as_path()).unwrap();
-    let settings = reopened.settings().unwrap();
-    assert_eq!(settings.clipboard_history_limit().get(), 777);
-    assert_eq!(settings.undo_hotkey(), UndoHotkey::Pause);
+    assert_eq!(reopened.settings().unwrap(), expected);
 }
 
 #[test]
@@ -453,7 +492,7 @@ fn certification_newer_database_schema_fails_closed() {
         error,
         DatabaseError::SchemaTooNew {
             found: 999,
-            supported: 6
+            supported: 8
         }
     ));
 }

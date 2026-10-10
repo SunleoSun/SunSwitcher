@@ -9,11 +9,11 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, INPUT, INPUT_KEYBOARD,
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, ToUnicodeEx,
-    VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-    VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK,
-    VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
-    VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
-    VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SUBTRACT, VK_TAB, VK_UP,
+    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT,
+    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_OEM_1,
+    VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PRIOR,
+    VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_TAB,
+    VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
@@ -27,7 +27,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
 use crate::input::{Boundary, InputEvent, PhysicalKey, TypedCharacter};
 use crate::language::{KeyboardLayoutSwitch, LanguageId};
+use crate::persistence::{AppSettings, HotkeyAction, HotkeyBinding};
+use crate::settings::SettingsStore;
+
+#[cfg(test)]
 use crate::persistence::UndoHotkey;
+#[cfg(test)]
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_PAUSE;
+
+use super::hotkey_capture::{HotkeyCaptureEffect, HotkeyCaptureHandle};
 use crate::replacement::{
     LivePrefixReplacementAction, ReplacementAction, ReplacementOutcome, SelectedReplacementEngine,
     SelectedReplacementText, SelectedTextDecision, UndoOutcome, UndoReplacementAction,
@@ -56,7 +64,23 @@ pub trait InputProcessor: Send + 'static {
         UndoDirective::Pass
     }
 
-    fn delete_user_word(&mut self, _text: &str) {}
+    fn ignore_word(&mut self, _text: &str) -> IgnoreWordStatus {
+        IgnoreWordStatus::Failed
+    }
+
+    fn ignored_word_layout_switch(&self, _text: &str) -> Option<KeyboardLayoutSwitch> {
+        None
+    }
+
+    fn tracked_word_for_ignore(&self) -> Option<String> {
+        None
+    }
+
+    fn recheck_ignored_tracked_word(&mut self) -> RuntimeDirective {
+        RuntimeDirective::Pass
+    }
+
+    fn forget_word(&mut self, _text: &str) {}
 
     fn undo_outcome(&mut self, _outcome: UndoOutcome) {}
 
@@ -98,15 +122,23 @@ pub enum UndoDirective {
     Restore(UndoReplacementAction),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoreWordStatus {
+    Confirmed,
+    Failed,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PauseHotkeyAction {
-    DeleteSelectedUserWord(String),
+    ForgetSelectedWord(String),
     UndoPreviousCorrection,
 }
 
+#[cfg(test)]
 pub(super) fn pause_hotkey_action(selected_text: Option<&str>) -> PauseHotkeyAction {
     match selected_text {
-        Some(text) => PauseHotkeyAction::DeleteSelectedUserWord(text.to_owned()),
+        Some(text) => PauseHotkeyAction::ForgetSelectedWord(text.to_owned()),
         None => PauseHotkeyAction::UndoPreviousCorrection,
     }
 }
@@ -297,23 +329,33 @@ struct RuntimeState {
     keyboard_state: [u8; 256],
     suppressed_keyups: Vec<SuppressedKeyUp>,
     foreground_window_id: usize,
-    undo_hotkey: UndoHotkey,
+    settings: SettingsStore,
+    hotkey_capture: HotkeyCaptureHandle,
     input_revision: u64,
+    pending_ignore_word_dispatch: bool,
+    pending_undo_word_dispatch: bool,
     double_shift: DoubleShiftTracker,
     selection_capture_intent: SelectionCaptureIntent,
     mouse_selection: MouseSelectionTracker,
 }
 
 impl RuntimeState {
-    fn new(mut processor: Box<dyn InputProcessor>, undo_hotkey: UndoHotkey) -> Self {
+    fn new(
+        mut processor: Box<dyn InputProcessor>,
+        settings: SettingsStore,
+        hotkey_capture: HotkeyCaptureHandle,
+    ) -> Self {
         let _ = processor.process(InputEvent::Invalidate);
         Self {
             processor,
             keyboard_state: initial_keyboard_state(),
             suppressed_keyups: Vec::with_capacity(2),
             foreground_window_id: current_foreground_window_id(),
-            undo_hotkey,
+            settings,
+            hotkey_capture,
             input_revision: 0,
+            pending_ignore_word_dispatch: false,
+            pending_undo_word_dispatch: false,
             double_shift: DoubleShiftTracker::default(),
             selection_capture_intent: SelectionCaptureIntent::Unknown,
             mouse_selection: MouseSelectionTracker::default(),
@@ -344,11 +386,59 @@ impl RuntimeState {
     }
 
     fn completion_hotkey_command(&self, vk_code: u32) -> Option<CompletionCommand> {
-        completion_hotkey_command(vk_code, &self.keyboard_state)
+        let settings = self.settings.load().ok()?;
+        if !settings.enable_autocomplete() {
+            return None;
+        }
+        configured_completion_hotkey_command(vk_code, &self.keyboard_state, settings)
     }
 
     fn clipboard_hotkey_command(&self, vk_code: u32) -> Option<ClipboardCommand> {
-        clipboard_hotkey_command(vk_code, &self.keyboard_state)
+        let settings = self.settings.load().ok()?;
+        configured_clipboard_hotkey_command(vk_code, &self.keyboard_state, settings)
+    }
+
+    fn undo_hotkey_matches(&self, vk_code: u32) -> bool {
+        self.settings.load().is_ok_and(|settings| {
+            hotkey_binding_matches(
+                settings.hotkey(HotkeyAction::UndoOrForgetWord),
+                vk_code,
+                &self.keyboard_state,
+            )
+        })
+    }
+
+    fn ignore_hotkey_matches(&self, vk_code: u32) -> bool {
+        self.settings.load().is_ok_and(|settings| {
+            hotkey_binding_matches(
+                settings.hotkey(HotkeyAction::IgnoreWord),
+                vk_code,
+                &self.keyboard_state,
+            )
+        })
+    }
+
+    fn completion_modifier_is_sunswitcher_only(&self, vk_code: u32) -> bool {
+        if !self.processor.completion_active() || !is_alt_modifier_key(vk_code) {
+            return false;
+        }
+        self.settings.load().is_ok_and(|settings| {
+            settings.enable_autocomplete()
+                && settings
+                    .hotkey(HotkeyAction::CompletionNextWord)
+                    .modifiers()
+                    .alt()
+        })
+    }
+
+    fn observe_hotkey_capture(&self, vk_code: u32) -> HotkeyCaptureEffect {
+        let control = self.keyboard_state[VK_CONTROL as usize] & 0x80 != 0;
+        let shift = self.keyboard_state[VK_SHIFT as usize] & 0x80 != 0;
+        let alt = self.keyboard_state[VK_MENU as usize] & 0x80 != 0;
+        let win = self.keyboard_state[VK_LWIN as usize] & 0x80 != 0
+            || self.keyboard_state[VK_RWIN as usize] & 0x80 != 0;
+        self.hotkey_capture
+            .observe_key_down(vk_code, control, shift, alt, win)
     }
 
     fn suppress_keyup(&mut self, vk_code: u32, route: SuppressedKeyUpRoute) {
@@ -372,12 +462,40 @@ impl RuntimeState {
         Some(self.suppressed_keyups.swap_remove(index).route)
     }
 
-    fn undo_hotkey_matches(&self, vk_code: u32) -> bool {
-        undo_hotkey_matches(self.undo_hotkey, vk_code, &self.keyboard_state)
-    }
-
     fn note_external_input(&mut self) {
         self.input_revision = self.input_revision.wrapping_add(1);
+    }
+
+    fn arm_ignore_word_dispatch(&mut self) {
+        self.pending_ignore_word_dispatch = true;
+    }
+
+    fn clear_ignore_word_dispatch(&mut self) {
+        self.pending_ignore_word_dispatch = false;
+    }
+
+    fn take_ignore_word_dispatch_when_modifiers_released(&mut self) -> bool {
+        if !word_hotkey_dispatch_ready(self.pending_ignore_word_dispatch, &self.keyboard_state) {
+            return false;
+        }
+        self.pending_ignore_word_dispatch = false;
+        true
+    }
+
+    fn arm_undo_word_dispatch(&mut self) {
+        self.pending_undo_word_dispatch = true;
+    }
+
+    fn clear_undo_word_dispatch(&mut self) {
+        self.pending_undo_word_dispatch = false;
+    }
+
+    fn take_undo_word_dispatch_when_modifiers_released(&mut self) -> bool {
+        if !word_hotkey_dispatch_ready(self.pending_undo_word_dispatch, &self.keyboard_state) {
+            return false;
+        }
+        self.pending_undo_word_dispatch = false;
+        true
     }
 
     const fn ownership_stamp(&self) -> InputOwnershipStamp {
@@ -393,7 +511,10 @@ impl RuntimeState {
             self.keyboard_state[VK_SHIFT as usize] & 0x80 != 0,
         ) {
             self.selection_capture_intent = intent;
-        } else if !is_modifier_key(vk_code) {
+        } else if !is_modifier_key(vk_code)
+            && !self.undo_hotkey_matches(vk_code)
+            && !self.ignore_hotkey_matches(vk_code)
+        {
             self.selection_capture_intent = SelectionCaptureIntent::Unknown;
         }
     }
@@ -408,13 +529,16 @@ static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 const WM_SUNSWITCHER_STOP: u32 = WM_USER + 0x535;
 const WM_SUNSWITCHER_DOUBLE_SHIFT: u32 = WM_USER + 0x536;
+const WM_SUNSWITCHER_IGNORE_WORD: u32 = WM_USER + 0x537;
+const WM_SUNSWITCHER_UNDO_WORD: u32 = WM_USER + 0x538;
 
 struct RuntimeRegistration;
 
 impl RuntimeRegistration {
     fn install(
         processor: impl InputProcessor,
-        undo_hotkey: UndoHotkey,
+        settings: SettingsStore,
+        hotkey_capture: HotkeyCaptureHandle,
     ) -> Result<Self, RuntimeError> {
         let mut runtime = RUNTIME
             .lock()
@@ -422,7 +546,11 @@ impl RuntimeRegistration {
         if runtime.is_some() {
             return Err(RuntimeError::AlreadyRunning);
         }
-        *runtime = Some(RuntimeState::new(Box::new(processor), undo_hotkey));
+        *runtime = Some(RuntimeState::new(
+            Box::new(processor),
+            settings,
+            hotkey_capture,
+        ));
         Ok(Self)
     }
 }
@@ -577,9 +705,10 @@ fn set_virtual_key_down(state: &mut [u8; 256], vk_code: u16, is_down: bool) {
 
 pub fn run_global_keyboard_hook(
     processor: impl InputProcessor,
-    undo_hotkey: UndoHotkey,
+    settings: SettingsStore,
+    hotkey_capture: HotkeyCaptureHandle,
 ) -> Result<(), RuntimeError> {
-    let _runtime_registration = RuntimeRegistration::install(processor, undo_hotkey)?;
+    let _runtime_registration = RuntimeRegistration::install(processor, settings, hotkey_capture)?;
 
     unsafe {
         let keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), null_mut(), 0);
@@ -626,6 +755,14 @@ pub fn run_global_keyboard_hook(
                         continue;
                     }
                     switch_selected_or_previous_text();
+                    continue;
+                }
+                if message.message == WM_SUNSWITCHER_IGNORE_WORD {
+                    ignore_selected_or_tracked_word();
+                    continue;
+                }
+                if message.message == WM_SUNSWITCHER_UNDO_WORD {
+                    undo_or_forget_selected_word();
                     continue;
                 }
                 TranslateMessage(&message);
@@ -693,6 +830,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 runtime.update_key_state(event.vkCode, is_key_down);
                 runtime.observe_selection_capture_intent(event.vkCode, is_key_down);
             }
+            runtime.clear_ignore_word_dispatch();
+            runtime.clear_undo_word_dispatch();
             runtime.clear_selection_capture_intent();
             let _ = runtime.processor.process(InputEvent::Invalidate);
         }
@@ -711,6 +850,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         if is_key_down {
             let foreground_window_id = current_foreground_window_id();
             if runtime.sync_foreground_window(foreground_window_id) {
+                runtime.clear_ignore_word_dispatch();
+                runtime.clear_undo_word_dispatch();
                 runtime.clear_selection_capture_intent();
                 let _ = runtime.processor.process(InputEvent::Invalidate);
             }
@@ -718,7 +859,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
 
         let was_key_down = (event.vkCode as usize) < runtime.keyboard_state.len()
             && runtime.keyboard_state[event.vkCode as usize] & 0x80 != 0;
-        let double_shift = if is_physical_keyboard_event(event.flags) {
+        let double_shift = if !runtime.hotkey_capture.is_active()
+            && is_physical_keyboard_event(event.flags)
+        {
             runtime
                 .double_shift
                 .observe(event.vkCode, is_key_down, was_key_down, Instant::now())
@@ -726,40 +869,111 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             DoubleShiftEvent::None
         };
         runtime.update_key_state(event.vkCode, is_key_down);
+        let hotkey_capture_effect = if is_key_down && is_physical_keyboard_event(event.flags) {
+            runtime.observe_hotkey_capture(event.vkCode)
+        } else {
+            HotkeyCaptureEffect::Inactive
+        };
+        let hotkey_capture_active = hotkey_capture_effect != HotkeyCaptureEffect::Inactive;
+        let mut clipboard_hotkey = None;
+        let mut ignore_hotkey = false;
+        let mut undo_hotkey = false;
+        let mut completion_hotkey = None;
+        if is_key_down && !hotkey_capture_active {
+            clipboard_hotkey = runtime.clipboard_hotkey_command(event.vkCode);
+            ignore_hotkey = runtime.ignore_hotkey_matches(event.vkCode);
+            undo_hotkey = runtime.undo_hotkey_matches(event.vkCode);
+            completion_hotkey = runtime.completion_hotkey_command(event.vkCode);
+        }
+        let mut sun_switcher_hotkey_active = clipboard_hotkey.is_some()
+            || ignore_hotkey
+            || undo_hotkey
+            || completion_hotkey.is_some();
+        let mut modifier_state_reconciled = false;
         if is_key_down
+            && !hotkey_capture_active
+            && !sun_switcher_hotkey_active
+            && !is_modifier_key(event.vkCode)
+        {
+            runtime.refresh_modifier_state_from_async();
+            modifier_state_reconciled = true;
+            clipboard_hotkey = runtime.clipboard_hotkey_command(event.vkCode);
+            ignore_hotkey = runtime.ignore_hotkey_matches(event.vkCode);
+            undo_hotkey = runtime.undo_hotkey_matches(event.vkCode);
+            completion_hotkey = runtime.completion_hotkey_command(event.vkCode);
+            sun_switcher_hotkey_active = clipboard_hotkey.is_some()
+                || ignore_hotkey
+                || undo_hotkey
+                || completion_hotkey.is_some();
+        }
+        if is_key_down
+            && runtime.pending_ignore_word_dispatch
+            && !ignore_hotkey
+            && !is_modifier_key(event.vkCode)
+        {
+            crate::runtime_log!(
+                "[ignore-word] pending dispatch canceled by intervening vk=0x{:02X}",
+                event.vkCode
+            );
+            runtime.clear_ignore_word_dispatch();
+        }
+        if is_key_down
+            && runtime.pending_undo_word_dispatch
+            && !undo_hotkey
+            && !is_modifier_key(event.vkCode)
+        {
+            crate::runtime_log!(
+                "[undo-word] pending dispatch canceled by intervening vk=0x{:02X}",
+                event.vkCode
+            );
+            runtime.clear_undo_word_dispatch();
+        }
+        let dispatch_ignore_after_keyup =
+            is_key_up && runtime.take_ignore_word_dispatch_when_modifiers_released();
+        let dispatch_undo_after_keyup =
+            is_key_up && runtime.take_undo_word_dispatch_when_modifiers_released();
+        if is_key_down
+            && !modifier_state_reconciled
             && should_refresh_modifier_state_before_key_classification(
                 event.vkCode,
-                &runtime.keyboard_state,
+                sun_switcher_hotkey_active,
+                hotkey_capture_active,
             )
         {
             runtime.refresh_modifier_state_from_async();
         }
-        runtime.observe_selection_capture_intent(event.vkCode, is_key_down);
+        if !hotkey_capture_active {
+            runtime.observe_selection_capture_intent(event.vkCode, is_key_down);
+        }
         let ownership_stamp = runtime.ownership_stamp();
 
-        if double_shift == DoubleShiftEvent::Trigger {
+        if hotkey_capture_effect != HotkeyCaptureEffect::Inactive {
+            runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
+            HookEventState::SunSwitcherOnlyKeyDown
+        } else if double_shift == DoubleShiftEvent::Trigger {
             let _ = runtime.take_suppressed_keyup(event.vkCode);
             HookEventState::DoubleShift
         } else if is_key_up {
             HookEventState::KeyUp {
                 suppression: runtime.take_suppressed_keyup(event.vkCode),
+                dispatch_ignore: dispatch_ignore_after_keyup,
+                dispatch_undo: dispatch_undo_after_keyup,
             }
         } else if double_shift == DoubleShiftEvent::Consume
-            || completion_modifier_is_sunswitcher_only(
-                runtime.processor.completion_active(),
-                event.vkCode,
-            )
+            || runtime.completion_modifier_is_sunswitcher_only(event.vkCode)
         {
             runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
             HookEventState::SunSwitcherOnlyKeyDown
-        } else if let Some(command) = runtime.clipboard_hotkey_command(event.vkCode) {
+        } else if let Some(command) = clipboard_hotkey {
             HookEventState::ClipboardHotkey {
                 command,
                 target_window_id: runtime.foreground_window_id,
             }
-        } else if runtime.undo_hotkey_matches(event.vkCode) {
+        } else if ignore_hotkey {
+            HookEventState::IgnoreWordHotkey { ownership_stamp }
+        } else if undo_hotkey {
             HookEventState::UndoHotkey { ownership_stamp }
-        } else if let Some(command) = runtime.completion_hotkey_command(event.vkCode) {
+        } else if let Some(command) = completion_hotkey {
             HookEventState::CompletionHotkey {
                 command,
                 ownership_stamp,
@@ -792,11 +1006,34 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
     };
 
     match state {
-        HookEventState::KeyUp { suppression } => {
+        HookEventState::KeyUp {
+            suppression,
+            dispatch_ignore,
+            dispatch_undo,
+        } => {
             if !suppressed_keyup_calls_downstream(suppression) {
+                let ignore_queued = !dispatch_ignore || queue_ignore_word_dispatch();
+                let undo_queued = !dispatch_undo || queue_undo_word_dispatch();
+                if !ignore_queued || !undo_queued {
+                    invalidate_runtime_tracking();
+                }
                 return 1;
             }
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+            if dispatch_ignore || dispatch_undo {
+                if next_result == 0 {
+                    let ignore_queued = !dispatch_ignore || queue_ignore_word_dispatch();
+                    let undo_queued = !dispatch_undo || queue_undo_word_dispatch();
+                    if !ignore_queued || !undo_queued {
+                        invalidate_runtime_tracking();
+                    }
+                } else {
+                    crate::runtime_log!(
+                        "[word-hotkey] deferred trigger canceled because downstream suppressed final keyup"
+                    );
+                    invalidate_runtime_tracking();
+                }
+            }
             if suppression.is_some() {
                 1
             } else {
@@ -935,6 +1172,34 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 }
             }
         }
+        HookEventState::IgnoreWordHotkey { ownership_stamp } => {
+            let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+            if next_result != 0 {
+                invalidate_runtime_tracking();
+                return next_result;
+            }
+            if !runtime_input_ownership_unchanged(ownership_stamp) {
+                invalidate_runtime_tracking();
+                return 1;
+            }
+            let dispatch_now = if let Ok(mut runtime_slot) = RUNTIME.lock()
+                && let Some(runtime) = runtime_slot.as_mut()
+            {
+                runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::DownstreamThenSuppress);
+                if word_hotkey_dispatch_ready(true, &runtime.keyboard_state) {
+                    true
+                } else {
+                    runtime.arm_ignore_word_dispatch();
+                    false
+                }
+            } else {
+                false
+            };
+            if dispatch_now && !queue_ignore_word_dispatch() {
+                invalidate_runtime_tracking();
+            }
+            1
+        }
         HookEventState::UndoHotkey { ownership_stamp } => {
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
             if next_result != 0 {
@@ -945,54 +1210,21 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 invalidate_runtime_tracking();
                 return 1;
             }
-
-            let selected_text = SelectedTextSession::capture_existing_selection()
-                .map(|session| session.selected_text().as_str().to_owned());
-            match pause_hotkey_action(selected_text.as_deref()) {
-                PauseHotkeyAction::DeleteSelectedUserWord(text) => {
-                    if let Ok(mut runtime_slot) = RUNTIME.lock()
-                        && let Some(runtime) = runtime_slot.as_mut()
-                    {
-                        runtime.processor.delete_user_word(&text);
-                    }
-                }
-                PauseHotkeyAction::UndoPreviousCorrection => {
-                    // Resolve Undo only after downstream hooks return. A downstream hook may inject
-                    // input re-entrantly or change the foreground window while handling Pause.
-                    let directive = RUNTIME
-                        .lock()
-                        .ok()
-                        .and_then(|mut runtime_slot| {
-                            runtime_slot
-                                .as_mut()
-                                .map(|runtime| runtime.processor.undo())
-                        })
-                        .unwrap_or(UndoDirective::Pass);
-                    if let UndoDirective::Restore(action) = directive {
-                        let injection_result = match &action {
-                            UndoReplacementAction::Completed(action) => inject_replacement(action),
-                            UndoReplacementAction::LivePrefix(action) => {
-                                inject_live_prefix_replacement(action)
-                            }
-                        };
-                        let ownership_unchanged =
-                            runtime_input_ownership_unchanged(ownership_stamp);
-                        let outcome =
-                            undo_outcome_after_injection(&injection_result, ownership_unchanged);
-                        notify_runtime_undo_outcome(outcome);
-                        if outcome == UndoOutcome::Uncertain {
-                            invalidate_runtime_tracking();
-                        }
-                        if let Err(error) = injection_result {
-                            crate::runtime_log!("SunSwitcher undo injection failed: {error:?}");
-                        }
-                    }
-                }
-            }
-            if let Ok(mut runtime_slot) = RUNTIME.lock()
+            let dispatch_now = if let Ok(mut runtime_slot) = RUNTIME.lock()
                 && let Some(runtime) = runtime_slot.as_mut()
             {
                 runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::DownstreamThenSuppress);
+                if word_hotkey_dispatch_ready(true, &runtime.keyboard_state) {
+                    true
+                } else {
+                    runtime.arm_undo_word_dispatch();
+                    false
+                }
+            } else {
+                false
+            };
+            if dispatch_now && !queue_undo_word_dispatch() {
+                invalidate_runtime_tracking();
             }
             1
         }
@@ -1131,6 +1363,9 @@ enum HookEventState {
         action: LivePrefixReplacementAction,
         ownership_stamp: InputOwnershipStamp,
     },
+    IgnoreWordHotkey {
+        ownership_stamp: InputOwnershipStamp,
+    },
     UndoHotkey {
         ownership_stamp: InputOwnershipStamp,
     },
@@ -1144,7 +1379,287 @@ enum HookEventState {
     },
     KeyUp {
         suppression: Option<SuppressedKeyUpRoute>,
+        dispatch_ignore: bool,
+        dispatch_undo: bool,
     },
+}
+
+fn queue_ignore_word_dispatch() -> bool {
+    let thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
+    let queued = thread_id != 0
+        && unsafe { PostThreadMessageW(thread_id, WM_SUNSWITCHER_IGNORE_WORD, 0, 0) != 0 };
+    crate::runtime_log!("[ignore-word] release-safe deferred trigger queued={queued}");
+    queued
+}
+
+fn queue_undo_word_dispatch() -> bool {
+    let thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
+    let queued = thread_id != 0
+        && unsafe { PostThreadMessageW(thread_id, WM_SUNSWITCHER_UNDO_WORD, 0, 0) != 0 };
+    crate::runtime_log!("[undo-word] release-safe deferred trigger queued={queued}");
+    queued
+}
+
+fn ignore_selected_or_tracked_word() {
+    let selection_capture_intent = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|runtime_slot| {
+            runtime_slot
+                .as_ref()
+                .map(|runtime| runtime.selection_capture_intent)
+        })
+        .unwrap_or_default();
+    let selected_session = match SelectedTextSession::capture_existing_selection_for_replacement(
+        selection_capture_intent,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            crate::runtime_log!("[ignore-word] selected-text capture failed: {error:?}");
+            invalidate_runtime_tracking();
+            return;
+        }
+    };
+    let tracked_word = RUNTIME.lock().ok().and_then(|runtime_slot| {
+        runtime_slot
+            .as_ref()
+            .and_then(|runtime| runtime.processor.tracked_word_for_ignore())
+    });
+    let source = selected_session
+        .as_ref()
+        .map(|session| session.selected_text().as_str().trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            if selection_capture_intent == SelectionCaptureIntent::UserSelection {
+                None
+            } else {
+                tracked_word
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty())
+            }
+        });
+    let Some(source) = source else {
+        crate::runtime_log!("[ignore-word] no selected or tracked word");
+        return;
+    };
+    let ownership_stamp = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|runtime_slot| runtime_slot.as_ref().map(RuntimeState::ownership_stamp));
+    let Some(ownership_stamp) = ownership_stamp else {
+        return;
+    };
+    if !runtime_input_ownership_unchanged(ownership_stamp) {
+        invalidate_runtime_tracking();
+        return;
+    }
+
+    let status = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|mut runtime_slot| {
+            runtime_slot
+                .as_mut()
+                .map(|runtime| runtime.processor.ignore_word(&source))
+        })
+        .unwrap_or(IgnoreWordStatus::Failed);
+    if status != IgnoreWordStatus::Confirmed {
+        crate::runtime_log!("[ignore-word] mutation was not confirmed source={source:?}");
+        return;
+    }
+
+    if let Some(session) = selected_session {
+        if session.selected_text().as_str() != source {
+            crate::runtime_log!(
+                "[ignore-word] selected source has surrounding whitespace; keeping selection unchanged"
+            );
+            if let Err(error) = session.finish_without_replacement() {
+                crate::runtime_log!("ignore-word selection cleanup failed: {error:?}");
+            }
+            invalidate_runtime_tracking();
+            return;
+        }
+        let switch = RUNTIME.lock().ok().and_then(|runtime_slot| {
+            runtime_slot
+                .as_ref()
+                .and_then(|runtime| runtime.processor.ignored_word_layout_switch(&source))
+        });
+        let Some(switch) = switch else {
+            crate::runtime_log!(
+                "[ignore-word] confirmed selected source has no cross-layout replacement source={source:?}"
+            );
+            if let Err(error) = session.finish_without_replacement() {
+                crate::runtime_log!("ignore-word selection cleanup failed: {error:?}");
+            }
+            invalidate_runtime_tracking();
+            return;
+        };
+        if !runtime_input_ownership_unchanged(ownership_stamp) {
+            if let Err(error) = session.finish_without_replacement() {
+                crate::runtime_log!("ignore-word selection cleanup failed: {error:?}");
+            }
+            invalidate_runtime_tracking();
+            return;
+        }
+        let selected = session.selected_text().clone();
+        let replacement = match SelectedReplacementText::try_new(switch.text().to_owned()) {
+            Ok(replacement) => replacement,
+            Err(_) => {
+                let _ = session.finish_without_replacement();
+                invalidate_runtime_tracking();
+                return;
+            }
+        };
+        let Some(action) = SelectedReplacementEngine::new()
+            .plan(selected, SelectedTextDecision::Replace(replacement))
+        else {
+            let _ = session.finish_without_replacement();
+            invalidate_runtime_tracking();
+            return;
+        };
+        match session.apply_layout_switch(&action) {
+            Ok(()) => {
+                crate::runtime_log!(
+                    "[ignore-word] selected replacement source={source:?} replacement={:?}",
+                    switch.text()
+                );
+                if !request_foreground_keyboard_layout(switch.target_language()) {
+                    crate::runtime_log!(
+                        "SunSwitcher could not switch foreground layout after ignore-word replacement to {:?}",
+                        switch.target_language().as_str()
+                    );
+                }
+            }
+            Err(error) => {
+                crate::runtime_log!("ignore-word selected replacement failed: {error:?}");
+            }
+        }
+        invalidate_runtime_tracking();
+        return;
+    }
+
+    let directive = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|mut runtime_slot| {
+            runtime_slot
+                .as_mut()
+                .map(|runtime| runtime.processor.recheck_ignored_tracked_word())
+        })
+        .unwrap_or(RuntimeDirective::Pass);
+    let RuntimeDirective::ReplaceLivePrefix(action) = directive else {
+        if matches!(directive, RuntimeDirective::Replace(_)) {
+            crate::runtime_log!("[ignore-word] unexpected completed replacement directive");
+            invalidate_runtime_tracking();
+        }
+        return;
+    };
+    if !runtime_input_ownership_unchanged(ownership_stamp) {
+        notify_runtime_live_prefix_replacement_outcome(ReplacementOutcome::Aborted);
+        invalidate_runtime_tracking();
+        return;
+    }
+    let injection_result = inject_live_prefix_replacement(&action);
+    let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
+    let outcome = replacement_outcome_after_injection(&injection_result, ownership_unchanged);
+    if outcome == ReplacementOutcome::Applied
+        && let Some(target_language) = action.target_language()
+        && !request_foreground_keyboard_layout(target_language)
+    {
+        crate::runtime_log!(
+            "SunSwitcher could not switch foreground layout after tracked ignore-word replacement to {:?}",
+            target_language.as_str()
+        );
+    }
+    notify_runtime_live_prefix_replacement_outcome(outcome);
+    if outcome == ReplacementOutcome::Aborted {
+        invalidate_runtime_tracking();
+    }
+    if let Err(error) = injection_result {
+        crate::runtime_log!("ignore-word tracked replacement failed: {error:?}");
+    }
+}
+
+fn undo_or_forget_selected_word() {
+    let selection_capture_intent = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|runtime_slot| {
+            runtime_slot
+                .as_ref()
+                .map(|runtime| runtime.selection_capture_intent)
+        })
+        .unwrap_or_default();
+
+    let selected_session = match SelectedTextSession::capture_existing_selection_for_replacement(
+        selection_capture_intent,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            crate::runtime_log!("[undo-word] selected-text capture failed: {error:?}");
+            invalidate_runtime_tracking();
+            return;
+        }
+    };
+
+    if let Some(session) = selected_session {
+        let source = session.selected_text().as_str().trim().to_owned();
+        if source.is_empty() {
+            let _ = session.finish_without_replacement();
+            invalidate_runtime_tracking();
+            return;
+        }
+        if let Ok(mut runtime_slot) = RUNTIME.lock()
+            && let Some(runtime) = runtime_slot.as_mut()
+        {
+            runtime.processor.forget_word(&source);
+        }
+        if let Err(error) = session.finish_without_replacement() {
+            crate::runtime_log!("[undo-word] selection cleanup failed: {error:?}");
+        }
+        invalidate_runtime_tracking();
+        return;
+    }
+
+    if selection_capture_intent == SelectionCaptureIntent::UserSelection {
+        crate::runtime_log!(
+            "[undo-word] explicit selection could not be captured; skipping undo fail-closed"
+        );
+        invalidate_runtime_tracking();
+        return;
+    }
+
+    let ownership_stamp = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|runtime_slot| runtime_slot.as_ref().map(RuntimeState::ownership_stamp));
+    let Some(ownership_stamp) = ownership_stamp else {
+        return;
+    };
+    let directive = RUNTIME
+        .lock()
+        .ok()
+        .and_then(|mut runtime_slot| {
+            runtime_slot
+                .as_mut()
+                .map(|runtime| runtime.processor.undo())
+        })
+        .unwrap_or(UndoDirective::Pass);
+    if let UndoDirective::Restore(action) = directive {
+        let injection_result = match &action {
+            UndoReplacementAction::Completed(action) => inject_replacement(action),
+            UndoReplacementAction::LivePrefix(action) => inject_live_prefix_replacement(action),
+        };
+        let ownership_unchanged = runtime_input_ownership_unchanged(ownership_stamp);
+        let outcome = undo_outcome_after_injection(&injection_result, ownership_unchanged);
+        notify_runtime_undo_outcome(outcome);
+        if outcome == UndoOutcome::Uncertain {
+            invalidate_runtime_tracking();
+        }
+        if let Err(error) = injection_result {
+            crate::runtime_log!("SunSwitcher undo injection failed: {error:?}");
+        }
+    }
 }
 
 fn switch_captured_text(session: SelectedTextSession) {
@@ -1388,6 +1903,8 @@ fn invalidate_runtime_tracking() {
     if let Ok(mut runtime_slot) = RUNTIME.lock()
         && let Some(runtime) = runtime_slot.as_mut()
     {
+        runtime.clear_ignore_word_dispatch();
+        runtime.clear_undo_word_dispatch();
         runtime.clear_selection_capture_intent();
         let _ = runtime.processor.process(InputEvent::Invalidate);
     }
@@ -1422,6 +1939,7 @@ pub(super) fn input_ownership_matches(
         && current_foreground_window_id == expected.foreground_window_id
 }
 
+#[cfg(test)]
 pub(super) fn undo_hotkey_matches(
     hotkey: UndoHotkey,
     vk_code: u32,
@@ -1432,7 +1950,27 @@ pub(super) fn undo_hotkey_matches(
         .all(|key| keyboard_state[key as usize] & 0x80 == 0);
     match hotkey {
         UndoHotkey::Pause => vk_code == VK_PAUSE as u32 && no_modifiers,
+        UndoHotkey::Binding(binding) => binding.key_code() == vk_code as u16 && no_modifiers,
     }
+}
+
+#[cfg(test)]
+pub(super) fn ignore_hotkey_matches(
+    hotkey: UndoHotkey,
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> bool {
+    let binding = match hotkey {
+        UndoHotkey::Pause => HotkeyBinding::IGNORE_WORD_DEFAULT,
+        UndoHotkey::Binding(binding) => {
+            let Ok(binding) = HotkeyBinding::try_new(binding.key_code(), true, false, false, false)
+            else {
+                return false;
+            };
+            binding
+        }
+    };
+    hotkey_binding_matches(binding, vk_code, keyboard_state)
 }
 
 pub(super) fn is_physical_keyboard_event(flags: u32) -> bool {
@@ -1457,6 +1995,8 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, w_param: WPARAM, l_param: L
                     "[double-shift] mouse/navigation click message=0x{message:04X} invalidates tracked_span={had_tracked_span}"
                 );
                 runtime.note_external_input();
+                runtime.clear_ignore_word_dispatch();
+                runtime.clear_undo_word_dispatch();
                 runtime.clear_selection_capture_intent();
                 let _ = runtime.processor.process(InputEvent::Invalidate);
             }
@@ -1551,6 +2091,7 @@ fn is_alt_modifier_key(vk_code: u32) -> bool {
         .any(|key| vk_code == key as u32)
 }
 
+#[cfg(test)]
 pub(super) fn completion_modifier_is_sunswitcher_only(
     completion_active: bool,
     vk_code: u32,
@@ -1570,11 +2111,20 @@ pub(super) fn completion_result_passes_through(result: &CompletionCommandResult)
     matches!(result, CompletionCommandResult::Pass)
 }
 
+pub(super) fn word_hotkey_dispatch_ready(pending: bool, keyboard_state: &[u8; 256]) -> bool {
+    if !pending {
+        return false;
+    }
+    let (alt, ctrl, shift, win) = modifier_state(keyboard_state);
+    !alt && !ctrl && !shift && !win
+}
+
 pub(super) fn should_refresh_modifier_state_before_key_classification(
     vk_code: u32,
-    keyboard_state: &[u8; 256],
+    sun_switcher_hotkey_active: bool,
+    hotkey_capture_active: bool,
 ) -> bool {
-    !is_modifier_key(vk_code) && completion_hotkey_command(vk_code, keyboard_state).is_none()
+    !hotkey_capture_active && !is_modifier_key(vk_code) && !sun_switcher_hotkey_active
 }
 
 pub(super) const fn suppressed_keyup_calls_downstream(
@@ -1583,51 +2133,123 @@ pub(super) const fn suppressed_keyup_calls_downstream(
     !matches!(suppression, Some(SuppressedKeyUpRoute::SunSwitcherOnly))
 }
 
-pub(super) fn clipboard_hotkey_command(
-    vk_code: u32,
-    keyboard_state: &[u8; 256],
-) -> Option<ClipboardCommand> {
+fn modifier_state(keyboard_state: &[u8; 256]) -> (bool, bool, bool, bool) {
     let alt = keyboard_state[VK_MENU as usize] & 0x80 != 0;
     let ctrl = keyboard_state[VK_CONTROL as usize] & 0x80 != 0;
     let shift = keyboard_state[VK_SHIFT as usize] & 0x80 != 0;
     let win = keyboard_state[VK_LWIN as usize] & 0x80 != 0
         || keyboard_state[VK_RWIN as usize] & 0x80 != 0;
-    let plus = vk_code == VK_ADD as u32 || vk_code == VK_OEM_PLUS as u32;
-    let minus = vk_code == VK_SUBTRACT as u32 || vk_code == VK_OEM_MINUS as u32;
-    if ctrl && shift && !alt && !win && plus {
+    (ctrl, shift, alt, win)
+}
+
+pub(super) fn hotkey_binding_matches(
+    binding: HotkeyBinding,
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> bool {
+    let Ok(vk_code) = u16::try_from(vk_code) else {
+        return false;
+    };
+    let (ctrl, shift, alt, win) = modifier_state(keyboard_state);
+    HotkeyBinding::try_new(vk_code, ctrl, shift, alt, win).is_ok_and(|observed| observed == binding)
+}
+
+fn clipboard_binding_matches(
+    binding: HotkeyBinding,
+    action: HotkeyAction,
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> bool {
+    if hotkey_binding_matches(binding, vk_code, keyboard_state) {
+        return true;
+    }
+    binding.alternate_key_code(action).is_some_and(|alternate| {
+        let alternate = u32::from(alternate);
+        hotkey_binding_matches(
+            HotkeyBinding::try_new(
+                alternate as u16,
+                binding.modifiers().control(),
+                binding.modifiers().shift(),
+                binding.modifiers().alt(),
+                binding.modifiers().win(),
+            )
+            .expect("Windows virtual key fits the hotkey contract"),
+            vk_code,
+            keyboard_state,
+        )
+    })
+}
+
+pub(super) fn configured_clipboard_hotkey_command(
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+    settings: AppSettings,
+) -> Option<ClipboardCommand> {
+    if clipboard_binding_matches(
+        settings.hotkey(HotkeyAction::ClipboardPinned),
+        HotkeyAction::ClipboardPinned,
+        vk_code,
+        keyboard_state,
+    ) {
         return Some(ClipboardCommand::OpenPinned);
     }
-    if ctrl && shift && !alt && !win && minus {
+    if clipboard_binding_matches(
+        settings.hotkey(HotkeyAction::ClipboardCurrent),
+        HotkeyAction::ClipboardCurrent,
+        vk_code,
+        keyboard_state,
+    ) {
         return Some(ClipboardCommand::OpenCurrent);
     }
     None
 }
 
-pub(super) fn completion_hotkey_command(
+#[cfg(test)]
+pub(super) fn clipboard_hotkey_command(
     vk_code: u32,
     keyboard_state: &[u8; 256],
-) -> Option<CompletionCommand> {
-    let alt = keyboard_state[VK_MENU as usize] & 0x80 != 0;
-    let ctrl = keyboard_state[VK_CONTROL as usize] & 0x80 != 0;
-    let shift = keyboard_state[VK_SHIFT as usize] & 0x80 != 0;
-    let win = keyboard_state[VK_LWIN as usize] & 0x80 != 0
-        || keyboard_state[VK_RWIN as usize] & 0x80 != 0;
+) -> Option<ClipboardCommand> {
+    configured_clipboard_hotkey_command(vk_code, keyboard_state, AppSettings::default())
+}
 
-    if alt && !ctrl && !shift && !win && vk_code == VK_RIGHT as u32 {
+pub(super) fn configured_completion_hotkey_command(
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+    settings: AppSettings,
+) -> Option<CompletionCommand> {
+    if hotkey_binding_matches(
+        settings.hotkey(HotkeyAction::CompletionNextWord),
+        vk_code,
+        keyboard_state,
+    ) {
         return Some(CompletionCommand::AcceptNextWord);
     }
+    if hotkey_binding_matches(
+        settings.hotkey(HotkeyAction::CompletionAccept),
+        vk_code,
+        keyboard_state,
+    ) {
+        return Some(CompletionCommand::Accept);
+    }
+    let (ctrl, shift, alt, win) = modifier_state(keyboard_state);
     if alt || ctrl || shift || win {
         return None;
     }
-
     match vk_code as u16 {
         VK_ESCAPE => Some(CompletionCommand::Dismiss),
         VK_UP => Some(CompletionCommand::Previous),
         VK_DOWN => Some(CompletionCommand::Next),
-        VK_TAB => Some(CompletionCommand::Accept),
         VK_DELETE => Some(CompletionCommand::DeleteSelected),
         _ => None,
     }
+}
+
+#[cfg(test)]
+pub(super) fn completion_hotkey_command(
+    vk_code: u32,
+    keyboard_state: &[u8; 256],
+) -> Option<CompletionCommand> {
+    configured_completion_hotkey_command(vk_code, keyboard_state, AppSettings::default())
 }
 
 fn is_selection_navigation_key(vk_code: u32) -> bool {
@@ -1699,6 +2321,7 @@ pub(super) fn physical_key_from_vk(vk_code: u32) -> PhysicalKey {
         VK_OEM_7 => PhysicalKey::Quote,
         VK_OEM_COMMA => PhysicalKey::Comma,
         VK_OEM_PERIOD => PhysicalKey::Period,
+        VK_OEM_2 => PhysicalKey::Slash,
         _ => PhysicalKey::Other,
     }
 }

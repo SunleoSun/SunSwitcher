@@ -1,7 +1,7 @@
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::ptr::null_mut;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,22 +14,33 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_CANCEL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+    VK_PAUSE, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     SetForegroundWindow,
 };
 
 use crate::persistence::{
-    ClipboardEntryContent, ClipboardEntryId, ClipboardEntryList, ClipboardEntryView,
-    ClipboardReorderPosition, Database,
+    AppSettings, ClipboardEntryContent, ClipboardEntryId, ClipboardEntryList, ClipboardEntryView,
+    ClipboardReorderPosition, Database, HotkeyAction, HotkeyConflict, NotificationTimeoutSeconds,
 };
+use crate::settings::SettingsStore;
 
 use super::clipboard_listener::InternalClipboardMutationGuard;
+use super::hotkey_capture::{
+    HotkeyCaptureEffect, HotkeyCaptureHandle, HotkeyCaptureState, format_hotkey,
+};
 use super::keyboard_runtime::{RuntimeError, inject_ctrl_chord};
 use super::selected_text_runtime::{set_image_clipboard_payload, set_unicode_clipboard};
 
 const WINDOW_WIDTH: f32 = 520.0;
 const WINDOW_HEIGHT: f32 = 420.0;
+const SETTINGS_WIDTH: f32 = 540.0;
+const SETTINGS_HEIGHT: f32 = 500.0;
+const HOTKEY_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const PREVIEW_WIDTH: f32 = WINDOW_WIDTH;
 const PREVIEW_HEIGHT: f32 = WINDOW_HEIGHT;
 const PREVIEW_GAP: f32 = 8.0;
@@ -57,6 +68,7 @@ const SCROLLBAR_IDLE: Color32 = Color32::from_rgb(82, 72, 48);
 const SELECTED_TAB: Color32 = Color32::from_rgb(77, 63, 28);
 const INACTIVE_TAB: Color32 = Color32::from_rgb(42, 43, 40);
 const CLIPBOARD_WINDOW_TITLE: &str = "SunSwitcher Clipboard";
+const SETTINGS_WINDOW_TITLE: &str = "SunSwitcher settings";
 const TITLE_BAR_BG_COLOR: u32 = windows_colorref_rgb(36, 38, 45);
 const TITLE_BAR_TEXT_COLOR: u32 = windows_colorref_rgb(244, 242, 226);
 
@@ -169,12 +181,36 @@ impl ClipboardManagerHandle {
     }
 }
 
+#[derive(Debug)]
+struct SettingsUiState {
+    visible: bool,
+    title_bar_styled: bool,
+    error: Option<String>,
+    notification_timeout_edit: u32,
+    notification_timeout_dirty: bool,
+    capture_keyboard_state: [bool; 256],
+}
+
+#[derive(Clone)]
+struct SettingsView {
+    database_path: PathBuf,
+    settings: SettingsStore,
+    hotkey_capture: HotkeyCaptureHandle,
+    state: Arc<Mutex<SettingsUiState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SettingsButtonIcon {
+    Refresh,
+    Confirm,
+    Cancel,
+}
 pub(crate) struct ClipboardManagerApp {
     database_path: PathBuf,
     state: Arc<RwLock<ClipboardManagerState>>,
     shown: bool,
     filter: String,
-    settings_visible: bool,
+    settings_view: SettingsView,
     last_serial: u64,
     preview: Arc<RwLock<Option<ClipboardPreview>>>,
     preview_hovered_at: Arc<RwLock<Option<Instant>>>,
@@ -190,6 +226,14 @@ pub(crate) struct ClipboardManagerApp {
 enum EntryActivation {
     CopyOnly,
     InsertIntoTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardEntryMenuAction {
+    Pin,
+    Unpin,
+    Clear,
+    ClearAll,
 }
 
 #[derive(Debug, Clone)]
@@ -223,13 +267,19 @@ struct ClipboardDrag {
     active_tab: ClipboardManagerTab,
 }
 impl ClipboardManagerApp {
-    pub(crate) fn new(database_path: PathBuf, state: Arc<RwLock<ClipboardManagerState>>) -> Self {
+    pub(crate) fn new(
+        database_path: PathBuf,
+        state: Arc<RwLock<ClipboardManagerState>>,
+        settings: SettingsStore,
+        hotkey_capture: HotkeyCaptureHandle,
+    ) -> Self {
+        let settings_view = SettingsView::new(database_path.clone(), settings, hotkey_capture);
         Self {
             database_path,
             state,
             shown: false,
             filter: String::new(),
-            settings_visible: false,
+            settings_view,
             last_serial: 0,
             preview: Arc::new(RwLock::new(None)),
             preview_hovered_at: Arc::new(RwLock::new(None)),
@@ -242,6 +292,7 @@ impl ClipboardManagerApp {
         }
     }
     pub(crate) fn logic(&mut self, ctx: &egui::Context) -> bool {
+        self.settings_view.render_viewport(ctx);
         if ctx.input(|input| input.viewport().close_requested()) {
             // The root viewport is SunSwitcher's permanent eframe event pump. Native close
             // requests may be delivered again after the clipboard window was already parked;
@@ -291,7 +342,7 @@ impl ClipboardManagerApp {
                 self.style_applied = true;
             }
             if !self.title_bar_styled {
-                self.title_bar_styled = apply_clipboard_title_bar_color();
+                self.title_bar_styled = apply_window_title_bar_color(CLIPBOARD_WINDOW_TITLE);
                 if !self.title_bar_styled {
                     ctx.request_repaint_after(Duration::from_millis(50));
                 }
@@ -412,12 +463,11 @@ impl ClipboardManagerApp {
                         ui.ctx().request_repaint();
                     }
                     if gear_button(ui).clicked() {
-                        self.settings_visible = true;
+                        self.settings_view.open(ui.ctx());
                     }
                 });
             });
         self.expire_preview(ui.ctx(), preview_source_hovered);
-        self.show_settings(ui.ctx());
         self.show_preview(ui.ctx());
         true
     }
@@ -575,7 +625,7 @@ impl ClipboardManagerApp {
         target_window_id: usize,
     ) -> bool {
         let mut activation = None;
-        let mut pin_action = None;
+        let mut menu_action = None;
         let mut preview_candidate_touched = false;
         ui.horizontal(|ui| {
             if index < 9 {
@@ -639,7 +689,19 @@ impl ClipboardManagerApp {
             let pin_label = if pinned { "Unpin" } else { "Pin" };
             response.context_menu(|ui| {
                 if ui.button(pin_label).clicked() {
-                    pin_action = Some(!pinned);
+                    menu_action = Some(if pinned {
+                        ClipboardEntryMenuAction::Unpin
+                    } else {
+                        ClipboardEntryMenuAction::Pin
+                    });
+                    ui.close();
+                }
+                if ui.button("Clear").clicked() {
+                    menu_action = Some(ClipboardEntryMenuAction::Clear);
+                    ui.close();
+                }
+                if active_tab == ClipboardManagerTab::Current && ui.button("Clear All").clicked() {
+                    menu_action = Some(ClipboardEntryMenuAction::ClearAll);
                     ui.close();
                 }
             });
@@ -648,8 +710,19 @@ impl ClipboardManagerApp {
             }
         });
 
-        if let Some(pinned) = pin_action {
-            self.pin_entry(entry.id(), pinned);
+        if let Some(action) = menu_action {
+            match action {
+                ClipboardEntryMenuAction::Pin => self.pin_entry(entry.id(), true),
+                ClipboardEntryMenuAction::Unpin => self.pin_entry(entry.id(), false),
+                ClipboardEntryMenuAction::Clear => {
+                    self.clear_entry(entry.id());
+                    self.clear_preview(ui.ctx());
+                }
+                ClipboardEntryMenuAction::ClearAll => {
+                    self.clear_all_entries();
+                    self.clear_preview(ui.ctx());
+                }
+            }
             self.invalidate_entries_cache();
             ui.ctx().request_repaint();
         }
@@ -827,6 +900,30 @@ impl ClipboardManagerApp {
         }
     }
 
+    fn clear_entry(&self, entry_id: ClipboardEntryId) {
+        let Ok(database) = Database::open(&self.database_path) else {
+            return;
+        };
+        match database.delete_clipboard_entry(entry_id) {
+            Ok(true) => {}
+            Ok(false) => crate::runtime_log!(
+                "clipboard clear skipped: entry {} no longer exists",
+                entry_id.get()
+            ),
+            Err(error) => crate::runtime_log!("clipboard clear failed: {error}"),
+        }
+    }
+
+    fn clear_all_entries(&self) {
+        let Ok(database) = Database::open(&self.database_path) else {
+            return;
+        };
+        match database.clear_clipboard_history() {
+            Ok(deleted) => crate::runtime_log!("clipboard clear all removed {deleted} entries"),
+            Err(error) => crate::runtime_log!("clipboard clear all failed: {error}"),
+        }
+    }
+
     fn reorder_entry(
         &mut self,
         active_tab: ClipboardManagerTab,
@@ -956,27 +1053,497 @@ impl ClipboardManagerApp {
             self.preview_shown = false;
         }
     }
+}
 
-    fn show_settings(&mut self, ctx: &egui::Context) {
-        if !self.settings_visible {
+impl SettingsView {
+    fn new(
+        database_path: PathBuf,
+        settings: SettingsStore,
+        hotkey_capture: HotkeyCaptureHandle,
+    ) -> Self {
+        let notification_timeout_edit = settings
+            .load()
+            .map(|settings| settings.notification_timeout_seconds().get())
+            .unwrap_or(NotificationTimeoutSeconds::DEFAULT.get());
+        Self {
+            database_path,
+            settings,
+            hotkey_capture,
+            state: Arc::new(Mutex::new(SettingsUiState {
+                visible: false,
+                title_bar_styled: false,
+                error: None,
+                notification_timeout_edit,
+                notification_timeout_dirty: false,
+                capture_keyboard_state: keyboard_down_snapshot(),
+            })),
+        }
+    }
+
+    fn viewport_id() -> ViewportId {
+        ViewportId::from_hash_of("sunswitcher_settings_child")
+    }
+
+    fn open(&self, ctx: &egui::Context) {
+        self.hotkey_capture.cancel();
+        if let Ok(mut state) = self.state.lock() {
+            state.visible = true;
+            state.title_bar_styled = false;
+            state.error = None;
+            state.capture_keyboard_state = keyboard_down_snapshot();
+            if let Ok(settings) = self.settings.load() {
+                state.notification_timeout_edit = settings.notification_timeout_seconds().get();
+                state.notification_timeout_dirty = false;
+            }
+        }
+        ctx.send_viewport_cmd_to(Self::viewport_id(), egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd_to(Self::viewport_id(), egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(Self::viewport_id(), egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    fn close(&self) {
+        self.hotkey_capture.cancel();
+        if let Ok(mut state) = self.state.lock() {
+            state.visible = false;
+            state.title_bar_styled = false;
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.visible)
+    }
+
+    fn render_viewport(&self, ctx: &egui::Context) {
+        if !self.is_visible() {
             return;
         }
-        egui::Window::new("SunSwitcher settings")
-            .open(&mut self.settings_visible)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.label("Default hotkeys");
-                ui.separator();
-                ui.monospace("Clipboard Current: Ctrl+Shift+Num-");
-                ui.monospace("Clipboard Pinned: Ctrl+Shift+Num+");
-                ui.monospace("Double Shift: physical Shift x2");
-                ui.monospace("Completion accept: Tab");
-                ui.monospace("Completion next: Alt+Right");
-                ui.monospace("Undo correction: Pause");
-            });
+        if matches!(
+            self.hotkey_capture.state(),
+            HotkeyCaptureState::Listening(_)
+        ) {
+            ctx.request_repaint_after(HOTKEY_CAPTURE_POLL_INTERVAL);
+        }
+        let view = self.clone();
+        let viewport = ViewportBuilder::default()
+            .with_title(SETTINGS_WINDOW_TITLE)
+            .with_inner_size(vec2(SETTINGS_WIDTH, SETTINGS_HEIGHT))
+            .with_min_inner_size(vec2(380.0, 300.0))
+            .with_resizable(true)
+            .with_decorations(true)
+            .with_taskbar(true)
+            .with_always_on_top()
+            .with_visible(true);
+        ctx.show_viewport_deferred(Self::viewport_id(), viewport, move |ui, _class| {
+            if matches!(
+                view.hotkey_capture.state(),
+                HotkeyCaptureState::Listening(_)
+            ) {
+                ui.ctx().request_repaint_after(HOTKEY_CAPTURE_POLL_INTERVAL);
+            }
+            if ui.input(|input| input.viewport().close_requested()) {
+                view.close();
+                return;
+            }
+            if !view.hotkey_capture.is_active()
+                && ui.input(|input| input.key_pressed(egui::Key::Escape))
+            {
+                view.close();
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            egui::Frame::new()
+                .fill(WINDOW_BG)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| view.contents(ui));
+                });
+        });
+        self.ensure_title_bar_style(ctx);
+    }
+
+    fn ensure_title_bar_style(&self, ctx: &egui::Context) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.title_bar_styled {
+            return;
+        }
+        state.title_bar_styled = apply_window_title_bar_color(SETTINGS_WINDOW_TITLE);
+        if !state.title_bar_styled {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    fn poll_hotkey_capture(&self, state: &mut SettingsUiState) {
+        let current = keyboard_down_snapshot();
+        if matches!(
+            self.hotkey_capture.state(),
+            HotkeyCaptureState::Listening(_)
+        ) && let Some(vk_code) = first_new_capture_key(&state.capture_keyboard_state, &current)
+        {
+            let (control, shift, alt, win) = capture_modifiers(&current);
+            let effect =
+                self.hotkey_capture
+                    .observe_key_down(u32::from(vk_code), control, shift, alt, win);
+            if effect == HotkeyCaptureEffect::Captured {
+                crate::runtime_log!(
+                    "[hotkey-capture] settings fallback captured vk=0x{vk_code:02X} ctrl={control} shift={shift} alt={alt} win={win}"
+                );
+            }
+        }
+        state.capture_keyboard_state = current;
+    }
+
+    fn persist_settings(&self, state: &mut SettingsUiState, next: AppSettings) -> bool {
+        match Database::open(&self.database_path).and_then(|database| database.save_settings(next))
+        {
+            Ok(()) => match self.settings.replace(next) {
+                Ok(()) => {
+                    state.error = None;
+                    true
+                }
+                Err(error) => {
+                    state.error = Some(error.to_string());
+                    false
+                }
+            },
+            Err(error) => {
+                state.error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn hotkey_action_label(action: HotkeyAction) -> &'static str {
+        match action {
+            HotkeyAction::ClipboardCurrent => "Clipboard Current",
+            HotkeyAction::ClipboardPinned => "Clipboard Pinned",
+            HotkeyAction::CompletionAccept => "Completion accept",
+            HotkeyAction::CompletionNextWord => "Completion next word",
+            HotkeyAction::UndoOrForgetWord => "Undo / forget word",
+            HotkeyAction::IgnoreWord => "Ignore word",
+        }
+    }
+
+    fn hotkey_row(
+        &self,
+        ui: &mut egui::Ui,
+        state: &mut SettingsUiState,
+        current: &mut AppSettings,
+        action: HotkeyAction,
+    ) {
+        let capture = self.hotkey_capture.state();
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [160.0, 22.0],
+                egui::Label::new(Self::hotkey_action_label(action)),
+            );
+            match capture {
+                HotkeyCaptureState::Listening(capturing) if capturing == action => {
+                    ui.add_sized(
+                        [190.0, 22.0],
+                        egui::Label::new(RichText::new("Press shortcut...").monospace()),
+                    );
+                    if settings_icon_button(ui, SettingsButtonIcon::Cancel, true, "Cancel")
+                        .clicked()
+                    {
+                        self.hotkey_capture.cancel();
+                    }
+                }
+                HotkeyCaptureState::Pending {
+                    action: capturing,
+                    binding,
+                } if capturing == action => {
+                    ui.add_sized(
+                        [190.0, 22.0],
+                        egui::Label::new(RichText::new(format_hotkey(binding)).monospace()),
+                    );
+                    if settings_icon_button(ui, SettingsButtonIcon::Confirm, true, "Save shortcut")
+                        .clicked()
+                    {
+                        if let Some(conflict) = current.hotkey_conflict(action, binding) {
+                            state.error = Some(match conflict {
+                                HotkeyConflict::Configured(conflict) => format!(
+                                    "Shortcut is already used by {}",
+                                    Self::hotkey_action_label(conflict)
+                                ),
+                                HotkeyConflict::ReservedCompletionControl => {
+                                    "Shortcut is reserved for autocomplete navigation".to_owned()
+                                }
+                            });
+                        } else {
+                            let next = current.with_hotkey(action, binding);
+                            if self.persist_settings(state, next) {
+                                *current = next;
+                                self.hotkey_capture.cancel();
+                            }
+                        }
+                    }
+                    if settings_icon_button(ui, SettingsButtonIcon::Cancel, true, "Cancel")
+                        .clicked()
+                    {
+                        self.hotkey_capture.cancel();
+                    }
+                }
+                _ => {
+                    ui.add_sized(
+                        [190.0, 22.0],
+                        egui::Label::new(
+                            RichText::new(format_hotkey(current.hotkey(action))).monospace(),
+                        ),
+                    );
+                    let can_start = matches!(capture, HotkeyCaptureState::Idle);
+                    if settings_icon_button(
+                        ui,
+                        SettingsButtonIcon::Refresh,
+                        can_start,
+                        "Record a new shortcut",
+                    )
+                    .clicked()
+                        && can_start
+                    {
+                        state.error = None;
+                        state.capture_keyboard_state = keyboard_down_snapshot();
+                        self.hotkey_capture.begin(action);
+                    }
+                }
+            }
+        });
+    }
+
+    fn contents(&self, ui: &mut egui::Ui) {
+        let Ok(mut state) = self.state.lock() else {
+            ui.colored_label(Color32::LIGHT_RED, "Settings state is unavailable");
+            return;
+        };
+        self.poll_hotkey_capture(&mut state);
+        let mut current = match self.settings.load() {
+            Ok(settings) => settings,
+            Err(error) => {
+                ui.colored_label(Color32::LIGHT_RED, error.to_string());
+                return;
+            }
+        };
+
+        ui.heading("Hotkeys");
+        ui.separator();
+        for action in HotkeyAction::ALL {
+            self.hotkey_row(ui, &mut state, &mut current, action);
+        }
+        ui.horizontal(|ui| {
+            ui.add_sized([160.0, 22.0], egui::Label::new("Manual keyboard switch"));
+            ui.add_sized(
+                [190.0, 22.0],
+                egui::Label::new(RichText::new("Double Shift").monospace()),
+            );
+        });
+
+        ui.add_space(12.0);
+        ui.heading("Features");
+        ui.separator();
+        let mut autocomplete = current.enable_autocomplete();
+        if ui
+            .checkbox(&mut autocomplete, "Enable autocomplete")
+            .changed()
+        {
+            let next = current.with_enable_autocomplete(autocomplete);
+            if self.persist_settings(&mut state, next) {
+                current = next;
+            }
+        }
+        let mut autocorrections = current.enable_autocorrections();
+        if ui
+            .checkbox(&mut autocorrections, "Enable autocorrections")
+            .changed()
+        {
+            let next = current.with_enable_autocorrections(autocorrections);
+            if self.persist_settings(&mut state, next) {
+                current = next;
+            }
+        }
+        let mut auto_switches = current.enable_auto_keyboard_switches();
+        if ui
+            .checkbox(&mut auto_switches, "Enable auto keyboard switches")
+            .changed()
+        {
+            let next = current.with_enable_auto_keyboard_switches(auto_switches);
+            if self.persist_settings(&mut state, next) {
+                current = next;
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.heading("Notifications");
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Notification timeout seconds");
+            let response = ui.add(
+                egui::DragValue::new(&mut state.notification_timeout_edit)
+                    .range(NotificationTimeoutSeconds::MIN..=NotificationTimeoutSeconds::MAX),
+            );
+            if response.changed() {
+                state.notification_timeout_dirty =
+                    state.notification_timeout_edit != current.notification_timeout_seconds().get();
+            }
+            if state.notification_timeout_dirty
+                && settings_icon_button(ui, SettingsButtonIcon::Confirm, true, "Save timeout")
+                    .clicked()
+            {
+                match NotificationTimeoutSeconds::try_new(state.notification_timeout_edit) {
+                    Ok(timeout) => {
+                        let next = current.with_notification_timeout_seconds(timeout);
+                        if self.persist_settings(&mut state, next) {
+                            state.notification_timeout_dirty = false;
+                        }
+                    }
+                    Err(error) => state.error = Some(error.to_string()),
+                }
+            }
+        });
+
+        if let Some(error) = &state.error {
+            ui.add_space(8.0);
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
     }
 }
 
+fn settings_icon_button(
+    ui: &mut egui::Ui,
+    icon: SettingsButtonIcon,
+    enabled: bool,
+    hover_text: &'static str,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(24.0, 22.0), sense);
+    let fill = if response.hovered() && enabled {
+        ROW_HOVER_BG
+    } else {
+        PANEL_BG
+    };
+    let color = if enabled { ACCENT } else { MUTED_TEXT };
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 3.0, fill);
+    painter.rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.0, ACCENT_DIM),
+        egui::StrokeKind::Inside,
+    );
+    let center = rect.center();
+    match icon {
+        SettingsButtonIcon::Refresh => {
+            let radius = 5.3;
+            let stroke = Stroke::new(1.5, color);
+            for (start, end) in [
+                (std::f32::consts::PI * 1.08, std::f32::consts::PI * 1.92),
+                (std::f32::consts::PI * 0.08, std::f32::consts::PI * 0.92),
+            ] {
+                let mut previous = center + vec2(start.cos(), start.sin()) * radius;
+                for step in 1..=10 {
+                    let angle = start + (end - start) * step as f32 / 10.0;
+                    let next = center + vec2(angle.cos(), angle.sin()) * radius;
+                    painter.line_segment([previous, next], stroke);
+                    previous = next;
+                }
+                let tangent = vec2(-end.sin(), end.cos());
+                let radial = vec2(end.cos(), end.sin());
+                let head_base = previous - tangent * 3.0;
+                painter.line_segment([previous, head_base + radial * 1.8], stroke);
+                painter.line_segment([previous, head_base - radial * 1.8], stroke);
+            }
+        }
+        SettingsButtonIcon::Confirm => {
+            painter.line_segment(
+                [center + vec2(-5.0, 0.0), center + vec2(-1.5, 3.5)],
+                Stroke::new(1.8, color),
+            );
+            painter.line_segment(
+                [center + vec2(-1.5, 3.5), center + vec2(5.5, -4.0)],
+                Stroke::new(1.8, color),
+            );
+        }
+        SettingsButtonIcon::Cancel => {
+            painter.line_segment(
+                [center + vec2(-4.0, -4.0), center + vec2(4.0, 4.0)],
+                Stroke::new(1.6, color),
+            );
+            painter.line_segment(
+                [center + vec2(-4.0, 4.0), center + vec2(4.0, -4.0)],
+                Stroke::new(1.6, color),
+            );
+        }
+    }
+    response.on_hover_text(hover_text)
+}
+
+fn keyboard_down_snapshot() -> [bool; 256] {
+    let mut down = [false; 256];
+    for (vk_code, is_down) in down.iter_mut().enumerate().skip(0x08) {
+        if vk_code == VK_PAUSE as usize {
+            continue;
+        }
+        *is_down = unsafe { GetAsyncKeyState(vk_code as i32) < 0 };
+    }
+    down[VK_CANCEL as usize] = async_key_down_or_pressed(VK_CANCEL);
+    down[VK_PAUSE as usize] = async_key_down_or_pressed(VK_PAUSE);
+    down
+}
+
+fn async_key_down_or_pressed(vk_code: u16) -> bool {
+    let state = unsafe { GetAsyncKeyState(vk_code as i32) } as u16;
+    state & 0x8001 != 0
+}
+
+fn first_new_capture_key(previous: &[bool; 256], current: &[bool; 256]) -> Option<u16> {
+    [VK_CANCEL, VK_PAUSE]
+        .into_iter()
+        .find(|&vk_code| {
+            let index = usize::from(vk_code);
+            current[index] && !previous[index]
+        })
+        .or_else(|| {
+            (0x08u16..=0xFE).find(|&vk_code| {
+                let index = usize::from(vk_code);
+                current[index] && !previous[index] && !is_capture_modifier_vk(vk_code)
+            })
+        })
+}
+
+fn is_capture_modifier_vk(vk_code: u16) -> bool {
+    [
+        VK_CONTROL,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_SHIFT,
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_MENU,
+        VK_LMENU,
+        VK_RMENU,
+        VK_LWIN,
+        VK_RWIN,
+    ]
+    .contains(&vk_code)
+}
+
+fn capture_modifiers(down: &[bool; 256]) -> (bool, bool, bool, bool) {
+    let any_down = |keys: &[u16]| keys.iter().any(|key| down[usize::from(*key)]);
+    (
+        any_down(&[VK_CONTROL, VK_LCONTROL, VK_RCONTROL]),
+        any_down(&[VK_SHIFT, VK_LSHIFT, VK_RSHIFT]),
+        any_down(&[VK_MENU, VK_LMENU, VK_RMENU]),
+        any_down(&[VK_LWIN, VK_RWIN]),
+    )
+}
+// Settings icon rendering and keyboard-capture helpers are defined above.
 fn entry_text_response(ui: &mut egui::Ui, text: &str, dragging: bool) -> (egui::Response, bool) {
     let width = ui.available_width().max(80.0);
     let (rect, response) =
@@ -1134,9 +1701,9 @@ fn preview_window_position(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 
     })
 }
 
-// Preview style is inherited from the manager root viewport.
-fn apply_clipboard_title_bar_color() -> bool {
-    let Some(hwnd) = find_current_process_window(CLIPBOARD_WINDOW_TITLE) else {
+// Native child viewports do not inherit the manager root caption styling.
+fn apply_window_title_bar_color(title: &str) -> bool {
+    let Some(hwnd) = find_current_process_window(title) else {
         return false;
     };
     unsafe {
@@ -1370,6 +1937,48 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    fn test_app(state: Arc<RwLock<ClipboardManagerState>>) -> ClipboardManagerApp {
+        let repaint_ctx = egui::Context::default();
+        let settings = SettingsStore::new(AppSettings::default());
+        let hotkey_capture =
+            HotkeyCaptureHandle::new(HotkeyCaptureHandle::shared_state(), repaint_ctx);
+        ClipboardManagerApp::new(std::path::PathBuf::new(), state, settings, hotkey_capture)
+    }
+
+    #[test]
+    fn settings_hotkey_fallback_detects_new_key_with_current_modifiers() {
+        let previous = [false; 256];
+        let mut current = previous;
+        current[usize::from(VK_CONTROL)] = true;
+        current[usize::from(VK_SHIFT)] = true;
+        current[0xBD] = true;
+
+        assert_eq!(first_new_capture_key(&previous, &current), Some(0xBD));
+        assert_eq!(capture_modifiers(&current), (true, true, false, false));
+    }
+
+    #[test]
+    fn settings_ctrl_pause_capture_prefers_cancel_over_other_reported_keys() {
+        let previous = [false; 256];
+        let mut current = previous;
+        current[usize::from(VK_CONTROL)] = true;
+        current[usize::from(VK_CANCEL)] = true;
+        current[0xC0] = true;
+
+        assert_eq!(first_new_capture_key(&previous, &current), Some(VK_CANCEL));
+        assert_eq!(capture_modifiers(&current), (true, false, false, false));
+    }
+
+    #[test]
+    fn settings_hotkey_fallback_ignores_modifier_only_and_already_down_keys() {
+        let mut previous = [false; 256];
+        previous[0xBB] = true;
+        let mut current = previous;
+        current[usize::from(VK_CONTROL)] = true;
+
+        assert_eq!(first_new_capture_key(&previous, &current), None);
+    }
+
     #[test]
     fn preview_expiry_respects_live_source_hover() {
         let now = Instant::now();
@@ -1472,7 +2081,7 @@ mod tests {
             target_window_id: 42,
             serial: 1,
         }));
-        let mut app = ClipboardManagerApp::new(std::path::PathBuf::new(), Arc::clone(&state));
+        let mut app = test_app(Arc::clone(&state));
         app.shown = true;
         let ctx = egui::Context::default();
 
@@ -1542,7 +2151,7 @@ mod tests {
             target_window_id: 42,
             serial: 1,
         }));
-        let mut app = ClipboardManagerApp::new(std::path::PathBuf::new(), Arc::clone(&state));
+        let mut app = test_app(Arc::clone(&state));
         app.shown = true;
         app.last_serial = 1;
         let ctx = egui::Context::default();
@@ -1586,7 +2195,7 @@ mod tests {
     #[test]
     fn clipboard_style_keeps_idle_scrollbar_handle_visible() {
         let state = Arc::new(RwLock::new(ClipboardManagerState::default()));
-        let app = ClipboardManagerApp::new(std::path::PathBuf::new(), state);
+        let app = test_app(state);
         let ctx = egui::Context::default();
         app.apply_style(&ctx);
 

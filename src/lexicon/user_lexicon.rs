@@ -107,7 +107,7 @@ impl UserLexicon {
             }
         }
 
-        let delete_index = DeleteIndex::build(
+        let delete_index = DeleteIndex::build_bounded(
             entries
                 .iter()
                 .enumerate()

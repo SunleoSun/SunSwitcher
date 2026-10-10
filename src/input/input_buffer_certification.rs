@@ -46,6 +46,7 @@ fn certification_all_layout_ambiguous_oem_keys_can_remain_in_a_potential_token()
         ('\'', PhysicalKey::Quote),
         (',', PhysicalKey::Comma),
         ('.', PhysicalKey::Period),
+        ('/', PhysicalKey::Slash),
         ('~', PhysicalKey::Grave),
         ('{', PhysicalKey::LeftBracket),
         ('}', PhysicalKey::RightBracket),
@@ -53,6 +54,7 @@ fn certification_all_layout_ambiguous_oem_keys_can_remain_in_a_potential_token()
         ('"', PhysicalKey::Quote),
         ('<', PhysicalKey::Comma),
         ('>', PhysicalKey::Period),
+        ('?', PhysicalKey::Slash),
     ];
 
     for (produced, key) in cases {

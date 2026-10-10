@@ -9,6 +9,7 @@ pub enum PhysicalKey {
     Quote,
     Comma,
     Period,
+    Slash,
 }
 
 impl PhysicalKey {
@@ -26,10 +27,10 @@ impl PhysicalKey {
             '\'' | '"' => Self::Quote,
             ',' | '<' => Self::Comma,
             '.' | '>' => Self::Period,
+            '/' => Self::Slash,
             _ => Self::Other,
         }
     }
-    // shifted-symbol helpers continue below
 
     pub fn is_shifted_symbol(self, character: char) -> bool {
         self.shifted_symbol() == Some(character)
@@ -45,6 +46,7 @@ impl PhysicalKey {
             Self::Quote => Some('"'),
             Self::Comma => Some('<'),
             Self::Period => Some('>'),
+            Self::Slash => Some('?'),
             Self::Other => None,
         }
     }
@@ -244,6 +246,17 @@ impl InputBuffer {
 
     pub fn current_physical_keys(&self) -> &[PhysicalKey] {
         &self.physical_keys
+    }
+
+    pub(crate) fn snapshot_current_token(&self, boundary: Boundary) -> Option<CompletedToken> {
+        if self.token.is_empty() || self.token.chars().count() != self.physical_keys.len() {
+            return None;
+        }
+        Some(CompletedToken::from_typed_parts(
+            self.token.clone(),
+            self.physical_keys.clone(),
+            boundary,
+        ))
     }
 
     pub fn current_layout_span(&self) -> &str {

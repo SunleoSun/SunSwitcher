@@ -3,8 +3,8 @@ mod lexical_provider;
 
 pub use correction_engine::{
     Confidence, ConfidenceError, CorrectionCandidate, CorrectionCandidateProvider,
-    CorrectionDecision, CorrectionEngine, CorrectionReplacement, ReplacementText,
-    ReplacementTextError,
+    CorrectionDecision, CorrectionEngine, CorrectionFeaturePolicy, CorrectionFeatures,
+    CorrectionReplacement, ReplacementText, ReplacementTextError,
 };
 pub use lexical_provider::{LexicalCorrectionProvider, LexicalProviderError, LexicalSnapshot};
 

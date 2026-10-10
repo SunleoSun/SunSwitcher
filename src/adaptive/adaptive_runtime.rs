@@ -12,12 +12,16 @@ use crate::completion::{
     CompletionSuppressionSnapshotStore, SequenceSnapshotStore,
 };
 use crate::correction::{
-    Confidence, CorrectionDecision, CorrectionEngine, LexicalCorrectionProvider, LexicalSnapshot,
+    Confidence, CorrectionDecision, CorrectionEngine, CorrectionFeaturePolicy,
+    CorrectionReplacement, LexicalCorrectionProvider, LexicalSnapshot,
 };
 use crate::input::{Boundary, CompletedToken, InputBuffer, InputEvent, InputOutcome};
 use crate::language::normalize_word;
 use crate::lexicon::{UserLexicon, UserWord};
-use crate::persistence::{CorrectionEventId, CorrectionUndoPlan, Database, DatabaseError};
+use crate::persistence::{
+    CorrectionEventId, CorrectionUndoPlan, Database, DatabaseError, ForgetWordOutcome,
+    IgnoreWordOutcome,
+};
 use crate::replacement::{
     LivePrefixReplacementAction, ReplacementAction, ReplacementEngine, ReplacementOutcome,
     UndoOutcome, UndoReplacementAction,
@@ -103,6 +107,21 @@ impl LexicalSnapshotStore {
         *slot = replacement;
         Ok(())
     }
+
+    fn replace_lexical_overrides(
+        &self,
+        user_lexicon: UserLexicon,
+        ignored_words: crate::lexicon::IgnoredWords,
+    ) -> Result<(), AdaptiveRuntimeError> {
+        let current = self.load()?;
+        let replacement = Arc::new(current.with_lexical_overrides(user_lexicon, ignored_words));
+        let mut slot = self
+            .current
+            .write()
+            .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
+        *slot = replacement;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -122,8 +141,13 @@ enum LearningCommand {
     DeleteCompletion {
         target: CompletionDeletionTarget,
     },
-    DeleteUserWord {
+    IgnoreWord {
         term: String,
+        response: mpsc::Sender<Result<IgnoreWordOutcome, String>>,
+    },
+    ForgetWord {
+        term: String,
+        response: mpsc::Sender<Result<ForgetWordOutcome, String>>,
     },
     RecordCorrection {
         observed_text: String,
@@ -151,6 +175,20 @@ enum LearningCommand {
 #[derive(Debug)]
 struct CorrectionEventReceipt {
     response: mpsc::Receiver<Result<CorrectionEventId, String>>,
+}
+
+#[derive(Debug)]
+pub struct WordMutationReceipt<T> {
+    response: mpsc::Receiver<Result<T, String>>,
+}
+
+impl<T> WordMutationReceipt<T> {
+    pub fn wait(self) -> Result<T, AdaptiveRuntimeError> {
+        self.response
+            .recv()
+            .map_err(|_| AdaptiveRuntimeError::LearningWorkerUnavailable)?
+            .map_err(AdaptiveRuntimeError::LearningWorkerFailed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,8 +238,28 @@ impl LearningClient {
         self.send(LearningCommand::DeleteCompletion { target })
     }
 
-    pub fn delete_user_word(&self, term: impl Into<String>) -> Result<(), AdaptiveRuntimeError> {
-        self.send(LearningCommand::DeleteUserWord { term: term.into() })
+    pub fn ignore_word(
+        &self,
+        term: impl Into<String>,
+    ) -> Result<WordMutationReceipt<IgnoreWordOutcome>, AdaptiveRuntimeError> {
+        let (response, receiver) = mpsc::channel();
+        self.send(LearningCommand::IgnoreWord {
+            term: term.into(),
+            response,
+        })?;
+        Ok(WordMutationReceipt { response: receiver })
+    }
+
+    pub fn forget_word(
+        &self,
+        term: impl Into<String>,
+    ) -> Result<WordMutationReceipt<ForgetWordOutcome>, AdaptiveRuntimeError> {
+        let (response, receiver) = mpsc::channel();
+        self.send(LearningCommand::ForgetWord {
+            term: term.into(),
+            response,
+        })?;
+        Ok(WordMutationReceipt { response: receiver })
     }
 
     fn record_correction(
@@ -299,10 +357,12 @@ impl AdaptiveLexicalRuntime {
     ) -> Result<Self, AdaptiveRuntimeError> {
         let languages = database.load_enabled_language_packs()?;
         let user_lexicon = database.load_user_lexicon()?;
-        let sequence_history = database.load_text_history()?;
+        let ignored_words = database.load_ignored_words()?;
+        let sequence_history = load_active_sequence_history(&database)?;
         let completion_suppressions = database.load_hidden_completion_words()?;
-        let snapshot = LexicalSnapshot::try_new(languages, user_lexicon)
-            .map_err(|_| AdaptiveRuntimeError::NoLanguages)?;
+        let snapshot =
+            LexicalSnapshot::try_new_with_ignored(languages, user_lexicon, ignored_words)
+                .map_err(|_| AdaptiveRuntimeError::NoLanguages)?;
         let snapshots = LexicalSnapshotStore::new(snapshot);
         let sequences = SequenceSnapshotStore::new(sequence_history);
         let completion_suppressions =
@@ -742,6 +802,15 @@ impl AdaptiveCorrectionSession {
         event: InputEvent,
         observed_at_ms: i64,
     ) -> Result<AdaptiveCorrectionDirective, AdaptiveRuntimeError> {
+        self.process_with_policy(event, observed_at_ms, CorrectionFeaturePolicy::ALL)
+    }
+
+    pub fn process_with_policy(
+        &mut self,
+        event: InputEvent,
+        observed_at_ms: i64,
+        policy: CorrectionFeaturePolicy,
+    ) -> Result<AdaptiveCorrectionDirective, AdaptiveRuntimeError> {
         self.resolved_completion_word = None;
         self.resolved_live_prefix = None;
         // A side-effect result is valid only for the directive returned immediately before it.
@@ -764,7 +833,10 @@ impl AdaptiveCorrectionSession {
         let outcome = self.input.process(event);
         let token = match outcome {
             InputOutcome::Continue => {
-                if self.live_prefix_enabled && matches!(event, InputEvent::Character(_)) {
+                if self.live_prefix_enabled
+                    && policy.auto_keyboard_switches()
+                    && matches!(event, InputEvent::Character(_))
+                {
                     return self.live_prefix_directive(observed_at_ms);
                 }
                 return Ok(AdaptiveCorrectionDirective::Pass);
@@ -780,7 +852,8 @@ impl AdaptiveCorrectionSession {
         let snapshot = self.snapshots.load()?;
         let provider = LexicalCorrectionProvider::from_snapshot(snapshot);
         let canonical_kept_term = provider.canonical_learning_term(&token);
-        let decision = CorrectionEngine::new(provider, self.minimum_confidence).decide(&token);
+        let decision = CorrectionEngine::new(provider, self.minimum_confidence)
+            .decide_with_policy(&token, policy);
         let action = self.replacements.plan(&token, decision.clone());
         match &decision {
             CorrectionDecision::Keep => {
@@ -809,6 +882,68 @@ impl AdaptiveCorrectionSession {
             Some(action) => AdaptiveCorrectionDirective::Replace(action),
             None => AdaptiveCorrectionDirective::Pass,
         })
+    }
+
+    pub fn recheck_text_layout_after_lexical_override(
+        &self,
+        text: &str,
+        policy: CorrectionFeaturePolicy,
+    ) -> Result<Option<CorrectionReplacement>, AdaptiveRuntimeError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let token = CompletedToken::new(text, Boundary::Character(' '));
+        let snapshot = self.snapshots.load()?;
+        let provider = LexicalCorrectionProvider::from_snapshot(snapshot);
+        let decision = CorrectionEngine::new(provider, self.minimum_confidence)
+            .decide_with_policy(&token, policy);
+        Ok(match decision {
+            CorrectionDecision::Replace(replacement) if replacement.target_language().is_some() => {
+                Some(replacement)
+            }
+            _ => None,
+        })
+    }
+
+    pub fn recheck_current_layout_after_lexical_override(
+        &mut self,
+        observed_at_ms: i64,
+        policy: CorrectionFeaturePolicy,
+    ) -> Result<AdaptiveCorrectionDirective, AdaptiveRuntimeError> {
+        self.resolved_completion_word = None;
+        self.resolved_live_prefix = None;
+        let Some(token) = self.input.snapshot_current_token(Boundary::Character(' ')) else {
+            return Ok(AdaptiveCorrectionDirective::Pass);
+        };
+        let snapshot = self.snapshots.load()?;
+        let provider = LexicalCorrectionProvider::from_snapshot(snapshot);
+        let decision = CorrectionEngine::new(provider, self.minimum_confidence)
+            .decide_with_policy(&token, policy);
+        let CorrectionDecision::Replace(replacement) = decision else {
+            return Ok(AdaptiveCorrectionDirective::Pass);
+        };
+        let Some(target_language) = replacement.target_language().cloned() else {
+            return Ok(AdaptiveCorrectionDirective::Pass);
+        };
+        let original_visible = token.text().to_owned();
+        let replacement_text = replacement.as_str().to_owned();
+        let Some(action) = self.replacements.plan_live_prefix(
+            original_visible.chars().count(),
+            &original_visible,
+            &replacement_text,
+            Some(target_language.clone()),
+        ) else {
+            return Ok(AdaptiveCorrectionDirective::Pass);
+        };
+        self.pending_live_correction = Some(PendingLivePrefixCorrection {
+            observed_text: original_visible,
+            replacement_text,
+            observed_at_ms,
+            action: action.clone(),
+            target_language,
+        });
+        Ok(AdaptiveCorrectionDirective::ReplaceLivePrefix(action))
     }
 
     fn live_prefix_directive(
@@ -1024,6 +1159,16 @@ impl AdaptiveCorrectionSession {
         }
     }
 
+    pub fn current_lexical_term_for_hotkey(&self) -> Result<Option<String>, AdaptiveRuntimeError> {
+        let Some(token) = self.input.snapshot_current_token(Boundary::Character(' ')) else {
+            return Ok(None);
+        };
+        let snapshot = self.snapshots.load()?;
+        let provider = LexicalCorrectionProvider::from_snapshot(snapshot);
+        let term = provider.canonical_learning_term(&token);
+        Ok((!term.is_empty()).then_some(term))
+    }
+
     pub fn current_layout_switch_span(&self) -> &str {
         self.input.current_layout_span()
     }
@@ -1103,16 +1248,30 @@ fn learning_worker(
                 canonical_tokens,
                 used_at_ms,
             } => observe_typed_sequence(&mut database, &sequences, &canonical_tokens, used_at_ms),
-            LearningCommand::DeleteUserWord { term } => database
-                .delete_user_word(&term)
-                .map_err(AdaptiveRuntimeError::from)
-                .and_then(|deleted| {
-                    if deleted {
-                        snapshots.replace_user_lexicon(database.load_user_lexicon()?)
-                    } else {
-                        Ok(())
-                    }
-                }),
+            LearningCommand::IgnoreWord { term, response } => {
+                let result = database
+                    .ignore_word(&term)
+                    .map_err(AdaptiveRuntimeError::from)
+                    .and_then(|outcome| {
+                        refresh_lexical_overrides(&database, &snapshots)?;
+                        Ok(outcome)
+                    });
+                let response_result = result.as_ref().copied().map_err(ToString::to_string);
+                let _ = response.send(response_result);
+                result.map(|_| ())
+            }
+            LearningCommand::ForgetWord { term, response } => {
+                let result = database
+                    .forget_word(&term)
+                    .map_err(AdaptiveRuntimeError::from)
+                    .and_then(|outcome| {
+                        refresh_lexical_overrides(&database, &snapshots)?;
+                        Ok(outcome)
+                    });
+                let response_result = result.as_ref().copied().map_err(ToString::to_string);
+                let _ = response.send(response_result);
+                result.map(|_| ())
+            }
             LearningCommand::DeleteCompletion { target } => match target {
                 CompletionDeletionTarget::TextHistory(text) => database
                     .delete_text_history(&text)
@@ -1120,7 +1279,7 @@ fn learning_worker(
                     .and_then(|deleted| {
                         if deleted {
                             sequences
-                                .replace(database.load_text_history()?)
+                                .replace(load_active_sequence_history(&database)?)
                                 .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
                         }
                         Ok(())
@@ -1162,9 +1321,7 @@ fn learning_worker(
                 let result = database
                     .commit_correction_undo(event_id, undone_at_ms)
                     .map_err(AdaptiveRuntimeError::from)
-                    .and_then(|updated| {
-                        refresh_user_lexicon_from_updates(&database, &snapshots, vec![updated])
-                    });
+                    .and_then(|_| refresh_lexical_overrides(&database, &snapshots));
                 let response_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
                 let _ = response.send(response_result);
                 result
@@ -1176,9 +1333,7 @@ fn learning_worker(
                 Ok(Ok(event_id)) => database
                     .commit_correction_undo(event_id, undone_at_ms)
                     .map_err(AdaptiveRuntimeError::from)
-                    .and_then(|updated| {
-                        refresh_user_lexicon_from_updates(&database, &snapshots, vec![updated])
-                    }),
+                    .and_then(|_| refresh_lexical_overrides(&database, &snapshots)),
                 Ok(Err(error)) => Err(AdaptiveRuntimeError::LearningWorkerFailed(error)),
                 Err(_) => Err(AdaptiveRuntimeError::LearningWorkerUnavailable),
             },
@@ -1302,6 +1457,17 @@ fn observe_typed_sequence(
     )
 }
 
+fn load_active_sequence_history(
+    database: &Database,
+) -> Result<SequenceHistory, AdaptiveRuntimeError> {
+    database
+        .load_active_text_history(
+            SequenceSnapshotStore::ACTIVE_REPEATED_BASE_LIMIT,
+            SequenceSnapshotStore::ACTIVE_RECENT_SINGLETON_BASE_LIMIT,
+        )
+        .map_err(AdaptiveRuntimeError::from)
+}
+
 fn persist_sequence_observations(
     database: &mut Database,
     sequences: &SequenceSnapshotStore,
@@ -1314,7 +1480,7 @@ fn persist_sequence_observations(
     }
     if updates.len() >= SequenceSnapshotStore::REBASE_LIMIT {
         return sequences
-            .replace(database.load_text_history()?)
+            .replace(load_active_sequence_history(database)?)
             .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable);
     }
     let pending = sequences
@@ -1322,7 +1488,7 @@ fn persist_sequence_observations(
         .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
     if pending >= SequenceSnapshotStore::REBASE_LIMIT {
         sequences
-            .replace(database.load_text_history()?)
+            .replace(load_active_sequence_history(database)?)
             .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
     }
     Ok(())
@@ -1429,6 +1595,16 @@ fn elapsed_millis(started_at: Instant) -> u128 {
     started_at.elapsed().as_millis()
 }
 
+fn refresh_lexical_overrides(
+    database: &Database,
+    snapshots: &LexicalSnapshotStore,
+) -> Result<(), AdaptiveRuntimeError> {
+    snapshots.replace_lexical_overrides(
+        database.load_user_lexicon()?,
+        database.load_ignored_words()?,
+    )
+}
+
 fn refresh_user_lexicon_from_updates(
     database: &Database,
     snapshots: &LexicalSnapshotStore,
@@ -1462,6 +1638,9 @@ fn observe_user_word(
 fn should_record_user_word(token: &str, snapshot: &LexicalSnapshot) -> bool {
     let normalized = normalize_word(token);
     if normalized.is_empty() {
+        return false;
+    }
+    if snapshot.ignored_words().contains_normalized(&normalized) {
         return false;
     }
     if snapshot.user_lexicon().contains_normalized(&normalized) {

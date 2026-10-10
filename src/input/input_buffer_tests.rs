@@ -76,6 +76,24 @@ fn plain_punctuation_is_a_boundary_but_layout_ambiguous_physical_key_is_deferred
 }
 
 #[test]
+fn current_token_snapshot_preserves_physical_layout_evidence_without_consuming_input() {
+    let mut buffer = InputBuffer::new();
+    buffer.process(InputEvent::character('j'));
+    buffer.process(InputEvent::character('r'));
+    buffer.process(InputEvent::typed_character('?', PhysicalKey::Slash));
+
+    let token = buffer
+        .snapshot_current_token(Boundary::Character(' '))
+        .expect("tracked token should be snapshotable");
+    assert_eq!(token.text(), "jr?");
+    assert_eq!(
+        token.physical_keys(),
+        &[PhysicalKey::Other, PhysicalKey::Other, PhysicalKey::Slash]
+    );
+    assert_eq!(buffer.current_token(), "jr?");
+}
+
+#[test]
 fn invalidation_discards_old_state_but_first_fresh_character_restarts_tracking() {
     let mut buffer = InputBuffer::new();
     buffer.process(InputEvent::typed_character('[', PhysicalKey::LeftBracket));
@@ -162,7 +180,9 @@ fn physical_key_recognizes_base_and_shifted_oem_symbols() {
         ('<', PhysicalKey::Comma),
         ('.', PhysicalKey::Period),
         ('>', PhysicalKey::Period),
+        ('/', PhysicalKey::Slash),
     ] {
         assert_eq!(PhysicalKey::from_layout_symbol(character), expected);
     }
+    assert_eq!(PhysicalKey::from_layout_symbol('?'), PhysicalKey::Other);
 }

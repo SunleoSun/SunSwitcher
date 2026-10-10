@@ -1,4 +1,3 @@
-use std::env;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -15,12 +14,13 @@ use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
-    LoadIconW, LoadImageW, MF_STRING, MSG, PostThreadMessageW, RegisterClassW, SetForegroundWindow,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU,
-    WM_DESTROY, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, IDI_APPLICATION,
+    LR_DEFAULTCOLOR, LoadIconW, MF_STRING, MSG, PostThreadMessageW, RegisterClassW, SM_CXSMICON,
+    SM_CYSMICON, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 
 use super::clipboard_manager::{ClipboardManagerHandle, ClipboardManagerTab};
@@ -31,7 +31,7 @@ const WM_TRAY_ICON: u32 = WM_APP + 31;
 const NIN_SELECT: u32 = 0x0400;
 const NIN_KEYSELECT: u32 = 0x0401;
 const TRAY_READY_TIMEOUT: Duration = Duration::from_secs(2);
-const CLIPBOARD_ICON_PATH: &str = "assets/clipboard.ico";
+const TRAY_ICON_ICO: &[u8] = include_bytes!("../../assets/clipboard.ico");
 const TRAY_EXIT_COMMAND: usize = 1001;
 
 #[derive(Clone)]
@@ -262,19 +262,20 @@ struct TrayIconResource {
 
 impl TrayIconResource {
     fn load() -> Self {
-        for path in clipboard_icon_candidates() {
-            if !path.exists() {
-                continue;
-            }
-            let wide_path = wide_null(&path.to_string_lossy());
+        let target_width = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(1);
+        let target_height = unsafe { GetSystemMetrics(SM_CYSMICON) }.max(1);
+        if let Some(payload) =
+            embedded_icon_payload(TRAY_ICON_ICO, target_width as u32, target_height as u32)
+        {
             let handle = unsafe {
-                LoadImageW(
-                    null_mut(),
-                    wide_path.as_ptr(),
-                    IMAGE_ICON,
-                    0,
-                    0,
-                    LR_LOADFROMFILE | LR_DEFAULTSIZE,
+                CreateIconFromResourceEx(
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                    1,
+                    0x0003_0000,
+                    target_width,
+                    target_height,
+                    LR_DEFAULTCOLOR,
                 )
             };
             if !handle.is_null() {
@@ -305,17 +306,29 @@ impl Drop for TrayIconResource {
     }
 }
 
-fn clipboard_icon_candidates() -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(current_dir) = env::current_dir() {
-        paths.push(current_dir.join(CLIPBOARD_ICON_PATH));
+fn embedded_icon_payload(ico: &[u8], target_width: u32, target_height: u32) -> Option<&[u8]> {
+    if ico.len() < 6 || ico[0..4] != [0, 0, 1, 0] {
+        return None;
     }
-    if let Ok(executable) = env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        paths.push(directory.join(CLIPBOARD_ICON_PATH));
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    let mut best: Option<(u32, &[u8])> = None;
+    for index in 0..count {
+        let entry = 6usize.checked_add(index.checked_mul(16)?)?;
+        let row = ico.get(entry..entry.checked_add(16)?)?;
+        let width = if row[0] == 0 { 256 } else { u32::from(row[0]) };
+        let height = if row[1] == 0 { 256 } else { u32::from(row[1]) };
+        let size = u32::from_le_bytes(row[8..12].try_into().ok()?) as usize;
+        let offset = u32::from_le_bytes(row[12..16].try_into().ok()?) as usize;
+        let payload = ico.get(offset..offset.checked_add(size)?)?;
+        let score = width.abs_diff(target_width) + height.abs_diff(target_height);
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score < *best_score)
+        {
+            best = Some((score, payload));
+        }
     }
-    paths
+    best.map(|(_, payload)| payload)
 }
 
 fn wide_null(text: &str) -> Vec<u16> {
@@ -328,5 +341,21 @@ fn write_wide_fixed(target: &mut [u16], text: &str) {
         .zip(text.encode_utf16().chain(std::iter::once(0)))
     {
         *slot = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_tray_icon_contains_usable_sizes() {
+        assert!(embedded_icon_payload(TRAY_ICON_ICO, 16, 16).is_some());
+        assert!(embedded_icon_payload(TRAY_ICON_ICO, 32, 32).is_some());
+    }
+
+    #[test]
+    fn malformed_embedded_icon_fails_closed() {
+        assert!(embedded_icon_payload(&[0, 0, 2, 0, 0, 0], 16, 16).is_none());
     }
 }

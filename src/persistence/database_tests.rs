@@ -1,7 +1,8 @@
 use super::{
     AppSettings, ClipboardEntryContent, ClipboardEntryKind, ClipboardEntryList,
-    ClipboardHistoryLimit, ClipboardReorderPosition, Database, DatabaseError, SettingsError,
-    UndoHotkey,
+    ClipboardHistoryLimit, ClipboardReorderPosition, Database, DatabaseError, ForgetWordOutcome,
+    HotkeyAction, HotkeyBinding, HotkeyConflict, IgnoreWordOutcome, NotificationTimeoutSeconds,
+    SettingsError, UndoHotkey,
 };
 
 #[test]
@@ -35,7 +36,7 @@ fn file_database_uses_wal_normal_and_in_memory_keeps_memory_journal() {
 fn default_settings_use_the_explicit_clipboard_history_limit() {
     let database = Database::open_in_memory().expect("fresh in-memory database should open");
 
-    assert_eq!(database.schema_version().unwrap(), 6);
+    assert_eq!(database.schema_version().unwrap(), 8);
     assert_eq!(
         database.settings().unwrap().clipboard_history_limit(),
         ClipboardHistoryLimit::DEFAULT
@@ -65,6 +66,98 @@ fn clipboard_history_limit_is_typed_and_round_trips_through_sqlite() {
         database.settings().unwrap().clipboard_history_limit(),
         limit
     );
+}
+
+#[test]
+fn hotkey_conflicts_include_legacy_clipboard_key_aliases() {
+    let settings = AppSettings::default();
+    let current_oem_minus = HotkeyBinding::try_new(0xBD, true, true, false, false).unwrap();
+    let pinned_oem_plus = HotkeyBinding::try_new(0xBB, true, true, false, false).unwrap();
+
+    assert_eq!(
+        settings.hotkey_conflict(HotkeyAction::CompletionAccept, current_oem_minus),
+        Some(HotkeyConflict::Configured(HotkeyAction::ClipboardCurrent))
+    );
+    assert_eq!(
+        settings.hotkey_conflict(HotkeyAction::CompletionAccept, pinned_oem_plus),
+        Some(HotkeyConflict::Configured(HotkeyAction::ClipboardPinned))
+    );
+}
+
+#[test]
+fn fixed_completion_controls_are_reserved_from_configurable_hotkeys() {
+    let settings = AppSettings::default();
+    for key_code in [0x1B, 0x26, 0x28, 0x2E] {
+        let binding = HotkeyBinding::try_new(key_code, false, false, false, false).unwrap();
+        assert_eq!(
+            settings.hotkey_conflict(HotkeyAction::CompletionAccept, binding),
+            Some(HotkeyConflict::ReservedCompletionControl)
+        );
+    }
+
+    let modified_up = HotkeyBinding::try_new(0x26, true, false, false, false).unwrap();
+    assert_eq!(
+        settings.hotkey_conflict(HotkeyAction::CompletionAccept, modified_up),
+        None
+    );
+}
+
+#[test]
+fn ctrl_break_canonicalizes_to_ctrl_pause_and_survives_reassignment() {
+    let ctrl_break = HotkeyBinding::try_new(0x03, true, false, false, false).unwrap();
+    assert_eq!(ctrl_break, HotkeyBinding::IGNORE_WORD_DEFAULT);
+
+    assert_eq!(ctrl_break.as_stored(), "ctrl+vk:19");
+
+    let database = Database::open_in_memory().unwrap();
+    let alternate = HotkeyBinding::try_new(b'F' as u16, true, false, false, false).unwrap();
+    database
+        .save_settings(AppSettings::default().with_hotkey(HotkeyAction::IgnoreWord, alternate))
+        .unwrap();
+    assert_eq!(
+        database
+            .settings()
+            .unwrap()
+            .hotkey(HotkeyAction::IgnoreWord),
+        alternate
+    );
+
+    database
+        .save_settings(
+            database
+                .settings()
+                .unwrap()
+                .with_hotkey(HotkeyAction::IgnoreWord, ctrl_break),
+        )
+        .unwrap();
+    assert_eq!(
+        database
+            .settings()
+            .unwrap()
+            .hotkey(HotkeyAction::IgnoreWord),
+        HotkeyBinding::IGNORE_WORD_DEFAULT
+    );
+}
+
+#[test]
+fn all_live_settings_round_trip_through_sqlite() {
+    let database = Database::open_in_memory().unwrap();
+    let settings = AppSettings::default()
+        .with_hotkey(
+            HotkeyAction::ClipboardCurrent,
+            HotkeyBinding::try_new(b'J' as u16, true, false, false, false).unwrap(),
+        )
+        .with_hotkey(
+            HotkeyAction::CompletionAccept,
+            HotkeyBinding::try_new(0x71, false, false, false, false).unwrap(),
+        )
+        .with_enable_autocomplete(false)
+        .with_enable_autocorrections(false)
+        .with_enable_auto_keyboard_switches(false)
+        .with_notification_timeout_seconds(NotificationTimeoutSeconds::try_new(9).unwrap());
+
+    database.save_settings(settings).unwrap();
+    assert_eq!(database.settings().unwrap(), settings);
 }
 
 #[test]
@@ -259,6 +352,39 @@ fn clipboard_prune_keeps_pinned_entries_and_recent_current_entries() {
 }
 
 #[test]
+fn clipboard_clear_all_removes_only_clipboard_storage() {
+    let database = Database::open_in_memory().unwrap();
+    let text = database
+        .record_clipboard_text("learned clipboard text", 10)
+        .unwrap();
+    let image = database
+        .record_clipboard_image("CF_DIB", &[1, 2, 3, 4], 20)
+        .unwrap();
+    database.pin_clipboard_entry(image.id(), 30).unwrap();
+    database
+        .record_user_word("LearnedClipboardToken", 40)
+        .unwrap();
+    database
+        .record_text_history("learned clipboard", 50)
+        .unwrap();
+
+    assert_eq!(database.clear_clipboard_history().unwrap(), 2);
+    assert!(database.load_clipboard_current("", 10).unwrap().is_empty());
+    assert!(database.load_clipboard_pinned("", 10).unwrap().is_empty());
+    assert!(matches!(
+        database.mark_clipboard_entry_used(text.id(), 60),
+        Err(DatabaseError::ClipboardEntryNotFound(_))
+    ));
+    assert!(database.delete_user_word("learnedclipboardtoken").unwrap());
+    assert!(database.delete_text_history("learned clipboard").unwrap());
+
+    let rerecorded = database
+        .record_clipboard_image("CF_DIB", &[1, 2, 3, 4], 70)
+        .unwrap();
+    assert_eq!(rerecorded.copy_count(), 1);
+}
+
+#[test]
 fn user_word_upsert_accumulates_usage_without_rewriting_canonical_spelling() {
     let database = Database::open_in_memory().unwrap();
     database
@@ -287,6 +413,7 @@ fn correction_undo_requires_valid_text_is_single_use_and_adds_a_user_word() {
         Err(DatabaseError::InvalidCorrectionText)
     ));
 
+    database.ignore_word("QuantileEntryStrategy1").unwrap();
     let event = database
         .record_correction_event("QuantileEntryStrategy1", "QuantileEntryStrategy", 10)
         .unwrap();
@@ -297,6 +424,12 @@ fn correction_undo_requires_valid_text_is_single_use_and_adds_a_user_word() {
     let learned = database.commit_correction_undo(event, 20).unwrap();
     assert_eq!(learned.term(), "QuantileEntryStrategy1");
     assert_eq!(learned.use_count(), 1);
+    assert!(
+        !database
+            .load_ignored_words()
+            .unwrap()
+            .contains_normalized("quantileentrystrategy1")
+    );
     assert!(matches!(
         database.prepare_correction_undo(event),
         Err(DatabaseError::CorrectionEventAlreadyUndone(_))
@@ -317,4 +450,75 @@ fn user_word_delete_is_normalized_and_idempotent() {
     let lexicon = database.load_user_lexicon().unwrap();
     assert!(!lexicon.contains_normalized("quantileentrystrategy1"));
     assert!(lexicon.contains_normalized("othertoken"));
+}
+
+#[test]
+fn ignored_word_addition_removes_user_word_and_forget_resets_the_override() {
+    let mut database = Database::open_in_memory().unwrap();
+    database.record_user_word("JR", 1).unwrap();
+
+    assert_eq!(
+        database.ignore_word("jr").unwrap(),
+        IgnoreWordOutcome::AddedToIgnoreList
+    );
+    assert!(
+        !database
+            .load_user_lexicon()
+            .unwrap()
+            .contains_normalized("jr")
+    );
+    assert!(
+        database
+            .load_ignored_words()
+            .unwrap()
+            .contains_normalized("jr")
+    );
+    assert_eq!(
+        database.ignore_word("JR").unwrap(),
+        IgnoreWordOutcome::AlreadyInIgnoreList
+    );
+
+    assert_eq!(
+        database.forget_word("JR").unwrap(),
+        ForgetWordOutcome::RemovedFromIgnoreList
+    );
+    assert!(
+        !database
+            .load_ignored_words()
+            .unwrap()
+            .contains_normalized("jr")
+    );
+    assert_eq!(
+        database.forget_word("jr").unwrap(),
+        ForgetWordOutcome::NotFound
+    );
+}
+
+#[test]
+fn active_text_history_preserves_strong_repetition_and_fresh_singletons_without_deleting_rows() {
+    let database = Database::open_in_memory().unwrap();
+
+    database.record_text_history("repeat strong", 10).unwrap();
+    database.record_text_history("repeat strong", 20).unwrap();
+    database.record_text_history("repeat strong", 30).unwrap();
+
+    database.record_text_history("repeat weaker", 100).unwrap();
+    database.record_text_history("repeat weaker", 110).unwrap();
+
+    database.record_text_history("singleton old", 200).unwrap();
+    database
+        .record_text_history("singleton fresh", 300)
+        .unwrap();
+
+    let active = database.load_active_text_history(1, 1).unwrap();
+    let mut active_texts = active
+        .entries()
+        .iter()
+        .map(|entry| entry.text().to_owned())
+        .collect::<Vec<_>>();
+    active_texts.sort();
+    assert_eq!(active_texts, ["repeat strong", "singleton fresh"]);
+
+    let full = database.load_text_history().unwrap();
+    assert_eq!(full.entries().len(), 4);
 }

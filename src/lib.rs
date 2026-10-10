@@ -7,6 +7,7 @@ pub mod language;
 pub mod lexicon;
 pub mod persistence;
 pub mod replacement;
+pub mod settings;
 
 #[cfg(target_os = "windows")]
 pub mod windows;

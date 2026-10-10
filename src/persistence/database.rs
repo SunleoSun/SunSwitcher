@@ -9,9 +9,9 @@ use crate::completion::sequence::{SequenceCandidate, SequenceHistory, SequenceHi
 use crate::language::{
     LanguageId, LanguagePack, LanguagePackError, builtin_language_pack, normalize_word,
 };
-use crate::lexicon::{UserLexicon, UserLexiconError, UserWord};
+use crate::lexicon::{IgnoredWords, UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const SCHEMA_V1: &str = r#"
 CREATE TABLE app_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -276,6 +276,58 @@ ON clipboard_entries(pinned_order_index DESC, id DESC)
 WHERE pinned_at_ms IS NOT NULL;
 "#;
 
+const SCHEMA_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS ignored_words (
+    normalized_term TEXT PRIMARY KEY CHECK (length(normalized_term) > 0)
+) STRICT;
+"#;
+
+const APP_SETTINGS_V8_COLUMNS: [(&str, &str); 9] = [
+    (
+        "enable_autocomplete",
+        "ALTER TABLE app_settings ADD COLUMN enable_autocomplete INTEGER NOT NULL DEFAULT 1 CHECK (enable_autocomplete IN (0, 1))",
+    ),
+    (
+        "enable_autocorrections",
+        "ALTER TABLE app_settings ADD COLUMN enable_autocorrections INTEGER NOT NULL DEFAULT 1 CHECK (enable_autocorrections IN (0, 1))",
+    ),
+    (
+        "enable_auto_keyboard_switches",
+        "ALTER TABLE app_settings ADD COLUMN enable_auto_keyboard_switches INTEGER NOT NULL DEFAULT 1 CHECK (enable_auto_keyboard_switches IN (0, 1))",
+    ),
+    (
+        "notification_timeout_seconds",
+        "ALTER TABLE app_settings ADD COLUMN notification_timeout_seconds INTEGER NOT NULL DEFAULT 3 CHECK (notification_timeout_seconds BETWEEN 1 AND 60)",
+    ),
+    (
+        "clipboard_current_hotkey",
+        "ALTER TABLE app_settings ADD COLUMN clipboard_current_hotkey TEXT NOT NULL DEFAULT 'ctrl+shift+vk:109'",
+    ),
+    (
+        "clipboard_pinned_hotkey",
+        "ALTER TABLE app_settings ADD COLUMN clipboard_pinned_hotkey TEXT NOT NULL DEFAULT 'ctrl+shift+vk:107'",
+    ),
+    (
+        "completion_accept_hotkey",
+        "ALTER TABLE app_settings ADD COLUMN completion_accept_hotkey TEXT NOT NULL DEFAULT 'vk:9'",
+    ),
+    (
+        "completion_next_word_hotkey",
+        "ALTER TABLE app_settings ADD COLUMN completion_next_word_hotkey TEXT NOT NULL DEFAULT 'alt+vk:39'",
+    ),
+    (
+        "ignore_word_hotkey",
+        "ALTER TABLE app_settings ADD COLUMN ignore_word_hotkey TEXT NOT NULL DEFAULT 'ctrl+vk:19'",
+    ),
+];
+
+const HOTKEY_CTRL: u8 = 1;
+const HOTKEY_SHIFT: u8 = 2;
+const HOTKEY_ALT: u8 = 4;
+const HOTKEY_WIN: u8 = 8;
+const WINDOWS_VK_CANCEL: u16 = 0x03;
+const WINDOWS_VK_PAUSE: u16 = 0x13;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipboardHistoryLimit(u32);
 
@@ -301,32 +353,244 @@ impl ClipboardHistoryLimit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HotkeyAction {
+    ClipboardCurrent,
+    ClipboardPinned,
+    CompletionAccept,
+    CompletionNextWord,
+    UndoOrForgetWord,
+    IgnoreWord,
+}
+
+impl HotkeyAction {
+    pub const ALL: [Self; 6] = [
+        Self::ClipboardCurrent,
+        Self::ClipboardPinned,
+        Self::CompletionAccept,
+        Self::CompletionNextWord,
+        Self::UndoOrForgetWord,
+        Self::IgnoreWord,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyConflict {
+    Configured(HotkeyAction),
+    ReservedCompletionControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HotkeyModifiers(u8);
+
+impl HotkeyModifiers {
+    pub const NONE: Self = Self(0);
+
+    pub const fn new(control: bool, shift: bool, alt: bool, win: bool) -> Self {
+        Self(
+            (if control { HOTKEY_CTRL } else { 0 })
+                | (if shift { HOTKEY_SHIFT } else { 0 })
+                | (if alt { HOTKEY_ALT } else { 0 })
+                | (if win { HOTKEY_WIN } else { 0 }),
+        )
+    }
+
+    pub const fn control(self) -> bool {
+        self.0 & HOTKEY_CTRL != 0
+    }
+
+    pub const fn shift(self) -> bool {
+        self.0 & HOTKEY_SHIFT != 0
+    }
+
+    pub const fn alt(self) -> bool {
+        self.0 & HOTKEY_ALT != 0
+    }
+
+    pub const fn win(self) -> bool {
+        self.0 & HOTKEY_WIN != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HotkeyBinding {
+    key_code: u16,
+    modifiers: HotkeyModifiers,
+}
+
+impl HotkeyBinding {
+    pub const CLIPBOARD_CURRENT_DEFAULT: Self =
+        Self::from_parts(0x6D, HotkeyModifiers::new(true, true, false, false));
+    pub const CLIPBOARD_PINNED_DEFAULT: Self =
+        Self::from_parts(0x6B, HotkeyModifiers::new(true, true, false, false));
+    pub const COMPLETION_ACCEPT_DEFAULT: Self = Self::from_parts(0x09, HotkeyModifiers::NONE);
+    pub const COMPLETION_NEXT_WORD_DEFAULT: Self =
+        Self::from_parts(0x27, HotkeyModifiers::new(false, false, true, false));
+    pub const UNDO_DEFAULT: Self = Self::from_parts(0x13, HotkeyModifiers::NONE);
+    pub const IGNORE_WORD_DEFAULT: Self =
+        Self::from_parts(0x13, HotkeyModifiers::new(true, false, false, false));
+
+    const fn from_parts(key_code: u16, modifiers: HotkeyModifiers) -> Self {
+        Self {
+            key_code,
+            modifiers,
+        }
+    }
+
+    pub fn try_new(
+        key_code: u16,
+        control: bool,
+        shift: bool,
+        alt: bool,
+        win: bool,
+    ) -> Result<Self, SettingsError> {
+        if key_code == 0 || key_code > 0xFF {
+            return Err(SettingsError::InvalidHotkeyKeyCode(key_code));
+        }
+        let modifiers = HotkeyModifiers::new(control, shift, alt, win);
+        // Windows reports Ctrl+Pause/Break as VK_CANCEL on common keyboards. Keep one
+        // canonical persisted/display identity so capture and runtime matching cannot diverge.
+        let key_code = if key_code == WINDOWS_VK_CANCEL && modifiers.control() {
+            WINDOWS_VK_PAUSE
+        } else {
+            key_code
+        };
+        Ok(Self::from_parts(key_code, modifiers))
+    }
+
+    pub const fn key_code(self) -> u16 {
+        self.key_code
+    }
+
+    pub const fn modifiers(self) -> HotkeyModifiers {
+        self.modifiers
+    }
+
+    pub fn alternate_key_code(self, action: HotkeyAction) -> Option<u16> {
+        match action {
+            HotkeyAction::ClipboardCurrent if self == Self::CLIPBOARD_CURRENT_DEFAULT => Some(0xBD),
+            HotkeyAction::ClipboardPinned if self == Self::CLIPBOARD_PINNED_DEFAULT => Some(0xBB),
+            _ => None,
+        }
+    }
+
+    pub fn as_stored(self) -> String {
+        let mut parts = Vec::with_capacity(5);
+        if self.modifiers.control() {
+            parts.push("ctrl".to_owned());
+        }
+        if self.modifiers.shift() {
+            parts.push("shift".to_owned());
+        }
+        if self.modifiers.alt() {
+            parts.push("alt".to_owned());
+        }
+        if self.modifiers.win() {
+            parts.push("win".to_owned());
+        }
+        parts.push(format!("vk:{}", self.key_code));
+        parts.join("+")
+    }
+
+    fn try_from_stored(value: &str) -> Result<Self, SettingsError> {
+        let mut control = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut win = false;
+        let mut key_code = None;
+        for part in value.split('+') {
+            match part {
+                "ctrl" if !control => control = true,
+                "shift" if !shift => shift = true,
+                "alt" if !alt => alt = true,
+                "win" if !win => win = true,
+                _ if part.starts_with("vk:") && key_code.is_none() => {
+                    key_code = part[3..].parse::<u16>().ok();
+                    if key_code.is_none() {
+                        return Err(SettingsError::InvalidHotkeyEncoding);
+                    }
+                }
+                _ => return Err(SettingsError::InvalidHotkeyEncoding),
+            }
+        }
+        let key_code = key_code.ok_or(SettingsError::InvalidHotkeyEncoding)?;
+        Self::try_new(key_code, control, shift, alt, win)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UndoHotkey {
     Pause,
+    Binding(HotkeyBinding),
 }
 
 impl UndoHotkey {
     pub const DEFAULT: Self = Self::Pause;
 
-    pub const fn as_stored(self) -> &'static str {
+    pub const fn binding(self) -> HotkeyBinding {
         match self {
-            Self::Pause => "pause",
+            Self::Pause => HotkeyBinding::UNDO_DEFAULT,
+            Self::Binding(binding) => binding,
+        }
+    }
+
+    pub const fn from_binding(binding: HotkeyBinding) -> Self {
+        if binding.key_code == HotkeyBinding::UNDO_DEFAULT.key_code
+            && binding.modifiers.0 == HotkeyBinding::UNDO_DEFAULT.modifiers.0
+        {
+            Self::Pause
+        } else {
+            Self::Binding(binding)
         }
     }
 
     fn try_from_stored(value: &str) -> Result<Self, DatabaseError> {
-        match value {
-            "pause" => Ok(Self::Pause),
-            _ => Err(DatabaseError::InvalidStoredUndoHotkey(value.to_owned())),
+        if value == "pause" {
+            return Ok(Self::Pause);
         }
+        HotkeyBinding::try_from_stored(value)
+            .map(Self::from_binding)
+            .map_err(|_| DatabaseError::InvalidStoredUndoHotkey(value.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationTimeoutSeconds(u32);
+
+impl NotificationTimeoutSeconds {
+    pub const DEFAULT: Self = Self(3);
+    pub const MIN: u32 = 1;
+    pub const MAX: u32 = 60;
+
+    pub fn try_new(value: u32) -> Result<Self, SettingsError> {
+        if !(Self::MIN..=Self::MAX).contains(&value) {
+            return Err(SettingsError::NotificationTimeoutOutOfRange(value));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub const fn duration(self) -> Duration {
+        Duration::from_secs(self.0 as u64)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppSettings {
     clipboard_history_limit: ClipboardHistoryLimit,
-    undo_hotkey: UndoHotkey,
+    undo_hotkey: HotkeyBinding,
+    ignore_word_hotkey: HotkeyBinding,
+    clipboard_current_hotkey: HotkeyBinding,
+    clipboard_pinned_hotkey: HotkeyBinding,
+    completion_accept_hotkey: HotkeyBinding,
+    completion_next_word_hotkey: HotkeyBinding,
+    enable_autocomplete: bool,
+    enable_autocorrections: bool,
+    enable_auto_keyboard_switches: bool,
+    notification_timeout_seconds: NotificationTimeoutSeconds,
 }
 
 impl AppSettings {
@@ -336,7 +600,16 @@ impl AppSettings {
     ) -> Self {
         Self {
             clipboard_history_limit,
-            undo_hotkey,
+            undo_hotkey: undo_hotkey.binding(),
+            ignore_word_hotkey: HotkeyBinding::IGNORE_WORD_DEFAULT,
+            clipboard_current_hotkey: HotkeyBinding::CLIPBOARD_CURRENT_DEFAULT,
+            clipboard_pinned_hotkey: HotkeyBinding::CLIPBOARD_PINNED_DEFAULT,
+            completion_accept_hotkey: HotkeyBinding::COMPLETION_ACCEPT_DEFAULT,
+            completion_next_word_hotkey: HotkeyBinding::COMPLETION_NEXT_WORD_DEFAULT,
+            enable_autocomplete: true,
+            enable_autocorrections: true,
+            enable_auto_keyboard_switches: true,
+            notification_timeout_seconds: NotificationTimeoutSeconds::DEFAULT,
         }
     }
 
@@ -345,7 +618,95 @@ impl AppSettings {
     }
 
     pub const fn undo_hotkey(self) -> UndoHotkey {
-        self.undo_hotkey
+        UndoHotkey::from_binding(self.undo_hotkey)
+    }
+
+    pub const fn hotkey(self, action: HotkeyAction) -> HotkeyBinding {
+        match action {
+            HotkeyAction::ClipboardCurrent => self.clipboard_current_hotkey,
+            HotkeyAction::ClipboardPinned => self.clipboard_pinned_hotkey,
+            HotkeyAction::CompletionAccept => self.completion_accept_hotkey,
+            HotkeyAction::CompletionNextWord => self.completion_next_word_hotkey,
+            HotkeyAction::UndoOrForgetWord => self.undo_hotkey,
+            HotkeyAction::IgnoreWord => self.ignore_word_hotkey,
+        }
+    }
+
+    pub const fn with_hotkey(mut self, action: HotkeyAction, binding: HotkeyBinding) -> Self {
+        match action {
+            HotkeyAction::ClipboardCurrent => self.clipboard_current_hotkey = binding,
+            HotkeyAction::ClipboardPinned => self.clipboard_pinned_hotkey = binding,
+            HotkeyAction::CompletionAccept => self.completion_accept_hotkey = binding,
+            HotkeyAction::CompletionNextWord => self.completion_next_word_hotkey = binding,
+            HotkeyAction::UndoOrForgetWord => self.undo_hotkey = binding,
+            HotkeyAction::IgnoreWord => self.ignore_word_hotkey = binding,
+        }
+        self
+    }
+
+    pub fn hotkey_conflict(
+        self,
+        action: HotkeyAction,
+        binding: HotkeyBinding,
+    ) -> Option<HotkeyConflict> {
+        if binding.modifiers() == HotkeyModifiers::NONE
+            && matches!(binding.key_code(), 0x1B | 0x26 | 0x28 | 0x2E)
+        {
+            return Some(HotkeyConflict::ReservedCompletionControl);
+        }
+        HotkeyAction::ALL
+            .into_iter()
+            .find(|candidate| {
+                if *candidate == action {
+                    return false;
+                }
+                let existing = self.hotkey(*candidate);
+                if existing == binding || existing.modifiers() != binding.modifiers() {
+                    return existing == binding;
+                }
+                existing.alternate_key_code(*candidate) == Some(binding.key_code())
+                    || binding.alternate_key_code(action) == Some(existing.key_code())
+            })
+            .map(HotkeyConflict::Configured)
+    }
+
+    pub const fn enable_autocomplete(self) -> bool {
+        self.enable_autocomplete
+    }
+
+    pub const fn with_enable_autocomplete(mut self, enabled: bool) -> Self {
+        self.enable_autocomplete = enabled;
+        self
+    }
+
+    pub const fn enable_autocorrections(self) -> bool {
+        self.enable_autocorrections
+    }
+
+    pub const fn with_enable_autocorrections(mut self, enabled: bool) -> Self {
+        self.enable_autocorrections = enabled;
+        self
+    }
+
+    pub const fn enable_auto_keyboard_switches(self) -> bool {
+        self.enable_auto_keyboard_switches
+    }
+
+    pub const fn with_enable_auto_keyboard_switches(mut self, enabled: bool) -> Self {
+        self.enable_auto_keyboard_switches = enabled;
+        self
+    }
+
+    pub const fn notification_timeout_seconds(self) -> NotificationTimeoutSeconds {
+        self.notification_timeout_seconds
+    }
+
+    pub const fn with_notification_timeout_seconds(
+        mut self,
+        timeout: NotificationTimeoutSeconds,
+    ) -> Self {
+        self.notification_timeout_seconds = timeout;
+        self
     }
 }
 
@@ -358,6 +719,9 @@ impl Default for AppSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsError {
     ClipboardHistoryLimitMustBePositive,
+    InvalidHotkeyKeyCode(u16),
+    InvalidHotkeyEncoding,
+    NotificationTimeoutOutOfRange(u32),
 }
 
 impl Display for SettingsError {
@@ -366,6 +730,16 @@ impl Display for SettingsError {
             Self::ClipboardHistoryLimitMustBePositive => {
                 formatter.write_str("clipboard history limit must be positive")
             }
+            Self::InvalidHotkeyKeyCode(value) => {
+                write!(formatter, "invalid hotkey key code: {value}")
+            }
+            Self::InvalidHotkeyEncoding => formatter.write_str("invalid hotkey encoding"),
+            Self::NotificationTimeoutOutOfRange(value) => write!(
+                formatter,
+                "notification timeout must be between {} and {} seconds, got {value}",
+                NotificationTimeoutSeconds::MIN,
+                NotificationTimeoutSeconds::MAX
+            ),
         }
     }
 }
@@ -386,6 +760,20 @@ pub struct CorrectionUndoPlan {
     event_id: CorrectionEventId,
     original_text: String,
     replacement_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoreWordOutcome {
+    AddedToIgnoreList,
+    AlreadyInIgnoreList,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetWordOutcome {
+    RemovedFromIgnoreList,
+    RemovedFromUserWords,
+    RemovedFromBoth,
+    NotFound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +891,15 @@ pub enum DatabaseError {
     },
     InvalidStoredClipboardHistoryLimit(i64),
     InvalidStoredUndoHotkey(String),
+    InvalidStoredHotkey {
+        setting: &'static str,
+        value: String,
+    },
+    InvalidStoredBoolean {
+        setting: &'static str,
+        value: i64,
+    },
+    InvalidStoredNotificationTimeout(i64),
     InvalidStoredDictionaryFrequency(i64),
     InvalidStoredUserWordUseCount(i64),
     InvalidStoredClipboardKind(String),
@@ -538,6 +935,15 @@ impl Display for DatabaseError {
             }
             Self::InvalidStoredUndoHotkey(value) => {
                 write!(formatter, "invalid stored undo hotkey: {value:?}")
+            }
+            Self::InvalidStoredHotkey { setting, value } => {
+                write!(formatter, "invalid stored hotkey for {setting}: {value:?}")
+            }
+            Self::InvalidStoredBoolean { setting, value } => {
+                write!(formatter, "invalid stored boolean for {setting}: {value}")
+            }
+            Self::InvalidStoredNotificationTimeout(value) => {
+                write!(formatter, "invalid stored notification timeout: {value}")
             }
             Self::InvalidStoredDictionaryFrequency(value) => {
                 write!(formatter, "invalid stored dictionary frequency: {value}")
@@ -664,29 +1070,140 @@ impl Database {
 
     pub fn settings(&self) -> Result<AppSettings, DatabaseError> {
         let result = self.connection.query_row(
-            "SELECT clipboard_history_limit, undo_hotkey FROM app_settings WHERE singleton = 1",
+            r#"
+            SELECT clipboard_history_limit, undo_hotkey, ignore_word_hotkey,
+                   clipboard_current_hotkey, clipboard_pinned_hotkey,
+                   completion_accept_hotkey, completion_next_word_hotkey,
+                   enable_autocomplete, enable_autocorrections, enable_auto_keyboard_switches,
+                   notification_timeout_seconds
+            FROM app_settings WHERE singleton = 1
+            "#,
             [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
         );
-        let (stored_limit, stored_undo_hotkey) = match result {
+        let (
+            stored_limit,
+            stored_undo_hotkey,
+            stored_ignore_hotkey,
+            stored_clipboard_current,
+            stored_clipboard_pinned,
+            stored_completion_accept,
+            stored_completion_next,
+            stored_autocomplete,
+            stored_autocorrections,
+            stored_auto_switches,
+            stored_notification_timeout,
+        ) = match result {
             Ok(value) => value,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(DatabaseError::MissingAppSettings);
             }
             Err(error) => return Err(DatabaseError::Sqlite(error)),
         };
-        Ok(AppSettings::new(
+
+        let mut settings = AppSettings::new(
             ClipboardHistoryLimit::try_from_stored(stored_limit)?,
             UndoHotkey::try_from_stored(&stored_undo_hotkey)?,
-        ))
+        );
+        for (action, setting_name, stored) in [
+            (
+                HotkeyAction::IgnoreWord,
+                "ignore_word_hotkey",
+                stored_ignore_hotkey,
+            ),
+            (
+                HotkeyAction::ClipboardCurrent,
+                "clipboard_current_hotkey",
+                stored_clipboard_current,
+            ),
+            (
+                HotkeyAction::ClipboardPinned,
+                "clipboard_pinned_hotkey",
+                stored_clipboard_pinned,
+            ),
+            (
+                HotkeyAction::CompletionAccept,
+                "completion_accept_hotkey",
+                stored_completion_accept,
+            ),
+            (
+                HotkeyAction::CompletionNextWord,
+                "completion_next_word_hotkey",
+                stored_completion_next,
+            ),
+        ] {
+            let binding = HotkeyBinding::try_from_stored(&stored).map_err(|_| {
+                DatabaseError::InvalidStoredHotkey {
+                    setting: setting_name,
+                    value: stored.clone(),
+                }
+            })?;
+            settings = settings.with_hotkey(action, binding);
+        }
+        let timeout = u32::try_from(stored_notification_timeout)
+            .ok()
+            .and_then(|value| NotificationTimeoutSeconds::try_new(value).ok())
+            .ok_or(DatabaseError::InvalidStoredNotificationTimeout(
+                stored_notification_timeout,
+            ))?;
+        Ok(settings
+            .with_enable_autocomplete(stored_bool("enable_autocomplete", stored_autocomplete)?)
+            .with_enable_autocorrections(stored_bool(
+                "enable_autocorrections",
+                stored_autocorrections,
+            )?)
+            .with_enable_auto_keyboard_switches(stored_bool(
+                "enable_auto_keyboard_switches",
+                stored_auto_switches,
+            )?)
+            .with_notification_timeout_seconds(timeout))
     }
 
     pub fn save_settings(&self, settings: AppSettings) -> Result<(), DatabaseError> {
         let changed = self.connection.execute(
-            "UPDATE app_settings SET clipboard_history_limit = ?1, undo_hotkey = ?2 WHERE singleton = 1",
+            r#"
+            UPDATE app_settings SET
+                clipboard_history_limit = ?1,
+                undo_hotkey = ?2,
+                ignore_word_hotkey = ?3,
+                clipboard_current_hotkey = ?4,
+                clipboard_pinned_hotkey = ?5,
+                completion_accept_hotkey = ?6,
+                completion_next_word_hotkey = ?7,
+                enable_autocomplete = ?8,
+                enable_autocorrections = ?9,
+                enable_auto_keyboard_switches = ?10,
+                notification_timeout_seconds = ?11
+            WHERE singleton = 1
+            "#,
             params![
                 i64::from(settings.clipboard_history_limit().get()),
-                settings.undo_hotkey().as_stored(),
+                settings.hotkey(HotkeyAction::UndoOrForgetWord).as_stored(),
+                settings.hotkey(HotkeyAction::IgnoreWord).as_stored(),
+                settings.hotkey(HotkeyAction::ClipboardCurrent).as_stored(),
+                settings.hotkey(HotkeyAction::ClipboardPinned).as_stored(),
+                settings.hotkey(HotkeyAction::CompletionAccept).as_stored(),
+                settings
+                    .hotkey(HotkeyAction::CompletionNextWord)
+                    .as_stored(),
+                i64::from(settings.enable_autocomplete()),
+                i64::from(settings.enable_autocorrections()),
+                i64::from(settings.enable_auto_keyboard_switches()),
+                i64::from(settings.notification_timeout_seconds().get()),
             ],
         )?;
         if changed != 1 {
@@ -749,6 +1266,57 @@ impl Database {
             "DELETE FROM user_words WHERE normalized_term = ?1",
             [normalized_term],
         )? != 0)
+    }
+
+    pub fn ignore_word(&mut self, term: &str) -> Result<IgnoreWordOutcome, DatabaseError> {
+        let input = UserWord::try_new(term.trim(), 1, 0)?;
+        let normalized_term = input.normalized_term().to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO ignored_words (normalized_term) VALUES (?1)",
+            [&normalized_term],
+        )? != 0;
+        transaction.execute(
+            "DELETE FROM user_words WHERE normalized_term = ?1",
+            [&normalized_term],
+        )?;
+        transaction.commit()?;
+        Ok(if inserted {
+            IgnoreWordOutcome::AddedToIgnoreList
+        } else {
+            IgnoreWordOutcome::AlreadyInIgnoreList
+        })
+    }
+
+    pub fn forget_word(&mut self, term: &str) -> Result<ForgetWordOutcome, DatabaseError> {
+        let trimmed = term.trim();
+        let normalized_term = normalize_word(trimmed);
+        if normalized_term.is_empty()
+            || trimmed.chars().any(char::is_whitespace)
+            || !trimmed.chars().any(char::is_alphanumeric)
+        {
+            return Ok(ForgetWordOutcome::NotFound);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ignored_deleted = transaction.execute(
+            "DELETE FROM ignored_words WHERE normalized_term = ?1",
+            [&normalized_term],
+        )? != 0;
+        let user_deleted = transaction.execute(
+            "DELETE FROM user_words WHERE normalized_term = ?1",
+            [&normalized_term],
+        )? != 0;
+        transaction.commit()?;
+        Ok(match (ignored_deleted, user_deleted) {
+            (true, true) => ForgetWordOutcome::RemovedFromBoth,
+            (true, false) => ForgetWordOutcome::RemovedFromIgnoreList,
+            (false, true) => ForgetWordOutcome::RemovedFromUserWords,
+            (false, false) => ForgetWordOutcome::NotFound,
+        })
     }
 
     pub fn record_correction_event(
@@ -823,6 +1391,10 @@ impl Database {
         }
 
         let accepted = UserWord::try_new(original_text, 1, undone_at_ms)?;
+        transaction.execute(
+            "DELETE FROM ignored_words WHERE normalized_term = ?1",
+            [accepted.normalized_term()],
+        )?;
         let stored = upsert_user_word(&transaction, &accepted)?;
         let changed = transaction.execute(
             "UPDATE correction_events SET undone_at_ms = ?1 WHERE id = ?2 AND undone_at_ms IS NULL",
@@ -1067,6 +1639,12 @@ WHERE id = ?2
         )? != 0)
     }
 
+    pub fn clear_clipboard_history(&self) -> Result<usize, DatabaseError> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM clipboard_entries", [])?)
+    }
+
     pub fn prune_clipboard_history(
         &self,
         limit: ClipboardHistoryLimit,
@@ -1199,11 +1777,43 @@ ORDER BY clipboard_entries.pinned_order_index DESC, clipboard_entries.id DESC
         let stored: Vec<(String, i64, i64)> = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<_, _>>()?;
-        let mut entries = Vec::with_capacity(stored.len());
-        for row in stored {
-            entries.push(sequence_candidate_from_stored(row)?);
-        }
-        Ok(SequenceHistory::new(entries))
+        sequence_history_from_stored(stored)
+    }
+
+    pub(crate) fn load_active_text_history(
+        &self,
+        repeated_limit: usize,
+        recent_singleton_limit: usize,
+    ) -> Result<SequenceHistory, DatabaseError> {
+        let repeated_limit = i64::try_from(repeated_limit).unwrap_or(i64::MAX);
+        let recent_singleton_limit = i64::try_from(recent_singleton_limit).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT text, use_count, last_used_at_ms
+            FROM (
+                SELECT text, use_count, last_used_at_ms
+                FROM text_history
+                WHERE use_count > 1
+                ORDER BY use_count DESC, last_used_at_ms DESC, text ASC
+                LIMIT ?1
+            )
+            UNION ALL
+            SELECT text, use_count, last_used_at_ms
+            FROM (
+                SELECT text, use_count, last_used_at_ms
+                FROM text_history
+                WHERE use_count = 1
+                ORDER BY last_used_at_ms DESC, text ASC
+                LIMIT ?2
+            )
+            "#,
+        )?;
+        let stored: Vec<(String, i64, i64)> = statement
+            .query_map(params![repeated_limit, recent_singleton_limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        sequence_history_from_stored(stored)
     }
 
     // Correction history owns Undo state only; user vocabulary changes through user-word APIs.
@@ -1222,6 +1832,25 @@ ORDER BY clipboard_entries.pinned_order_index DESC, clipboard_entries.id DESC
             words.push(user_word_from_stored(row)?);
         }
         Ok(UserLexicon::try_new(words)?)
+    }
+
+    pub fn load_ignored_words(&self) -> Result<IgnoredWords, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT normalized_term FROM ignored_words ORDER BY normalized_term")?;
+        let stored = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for normalized_term in &stored {
+            let validated = UserWord::try_new(normalized_term.clone(), 1, 0)?;
+            if validated.normalized_term() != normalized_term {
+                return Err(DatabaseError::InvalidStoredNormalizedTerm {
+                    term: normalized_term.clone(),
+                    normalized_term: normalized_term.clone(),
+                });
+            }
+        }
+        Ok(IgnoredWords::from_normalized_words(stored))
     }
 }
 
@@ -1408,6 +2037,16 @@ fn clipboard_entries_from_stored(
     Ok(entries)
 }
 
+fn sequence_history_from_stored(
+    stored: Vec<(String, i64, i64)>,
+) -> Result<SequenceHistory, DatabaseError> {
+    let mut entries = Vec::with_capacity(stored.len());
+    for row in stored {
+        entries.push(sequence_candidate_from_stored(row)?);
+    }
+    Ok(SequenceHistory::new(entries))
+}
+
 fn sequence_candidate_from_stored(
     stored: (String, i64, i64),
 ) -> Result<SequenceCandidate, DatabaseError> {
@@ -1449,6 +2088,14 @@ fn sqlite_column_exists(
         }
     }
     Ok(false)
+}
+
+fn stored_bool(setting: &'static str, value: i64) -> Result<bool, DatabaseError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(DatabaseError::InvalidStoredBoolean { setting, value }),
+    }
 }
 
 fn schema_version(connection: &Connection) -> Result<i64, DatabaseError> {
@@ -1508,9 +2155,9 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !sqlite_column_exists(&transaction, "clipboard_entries", "current_order_index")? {
             transaction.execute(
-"ALTER TABLE clipboard_entries ADD COLUMN current_order_index INTEGER NOT NULL DEFAULT 0",
-[],
-)?;
+                "ALTER TABLE clipboard_entries ADD COLUMN current_order_index INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         if !sqlite_column_exists(&transaction, "clipboard_entries", "pinned_order_index")? {
             transaction.execute(
@@ -1520,6 +2167,26 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         }
         transaction.execute_batch(SCHEMA_V6)?;
         transaction.pragma_update(None, "user_version", 6)?;
+        transaction.commit()?;
+        version = 6;
+    }
+
+    if version < 7 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V7)?;
+        transaction.pragma_update(None, "user_version", 7)?;
+        transaction.commit()?;
+        version = 7;
+    }
+
+    if version < 8 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (column_name, statement) in APP_SETTINGS_V8_COLUMNS {
+            if !sqlite_column_exists(&transaction, "app_settings", column_name)? {
+                transaction.execute(statement, [])?;
+            }
+        }
+        transaction.pragma_update(None, "user_version", 8)?;
         transaction.commit()?;
     }
 

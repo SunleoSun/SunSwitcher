@@ -6,7 +6,7 @@ use crate::input::CompletedToken;
 use crate::language::{
     KeyboardLayoutMap, LanguageId, LanguagePack, TextCasePattern, normalize_word,
 };
-use crate::lexicon::{MAX_INDEX_DELETIONS, UserLexicon, UserWord};
+use crate::lexicon::{IgnoredWords, MAX_INDEX_DELETIONS, UserLexicon, UserWord};
 
 use super::{Confidence, CorrectionCandidate, CorrectionCandidateProvider, ReplacementText};
 const REPEATED_DELETE_COST: f32 = 0.45;
@@ -21,6 +21,7 @@ pub enum LexicalProviderError {
 pub struct LexicalSnapshot {
     languages: Arc<[LanguagePack]>,
     user_lexicon: Arc<UserLexicon>,
+    ignored_words: Arc<IgnoredWords>,
 }
 
 impl LexicalSnapshot {
@@ -28,12 +29,21 @@ impl LexicalSnapshot {
         languages: Vec<LanguagePack>,
         user_lexicon: UserLexicon,
     ) -> Result<Self, LexicalProviderError> {
+        Self::try_new_with_ignored(languages, user_lexicon, IgnoredWords::default())
+    }
+
+    pub fn try_new_with_ignored(
+        languages: Vec<LanguagePack>,
+        user_lexicon: UserLexicon,
+        ignored_words: IgnoredWords,
+    ) -> Result<Self, LexicalProviderError> {
         if languages.is_empty() {
             return Err(LexicalProviderError::NoLanguages);
         }
         Ok(Self {
             languages: languages.into(),
             user_lexicon: Arc::new(user_lexicon),
+            ignored_words: Arc::new(ignored_words),
         })
     }
 
@@ -45,10 +55,46 @@ impl LexicalSnapshot {
         &self.user_lexicon
     }
 
+    pub fn ignored_words(&self) -> &IgnoredWords {
+        &self.ignored_words
+    }
+
+    pub fn contains_normalized(&self, normalized: &str) -> bool {
+        if self.ignored_words.contains_normalized(normalized) {
+            return false;
+        }
+        self.user_lexicon.contains_normalized(normalized)
+            || self
+                .languages
+                .iter()
+                .any(|language| language.contains_normalized(normalized))
+    }
+
+    pub fn contains_system_normalized(&self, normalized: &str) -> bool {
+        !self.ignored_words.contains_normalized(normalized)
+            && self
+                .languages
+                .iter()
+                .any(|language| language.contains_normalized(normalized))
+    }
+
     pub(crate) fn with_user_lexicon(&self, user_lexicon: UserLexicon) -> Self {
         Self {
             languages: Arc::clone(&self.languages),
             user_lexicon: Arc::new(user_lexicon),
+            ignored_words: Arc::clone(&self.ignored_words),
+        }
+    }
+
+    pub(crate) fn with_lexical_overrides(
+        &self,
+        user_lexicon: UserLexicon,
+        ignored_words: IgnoredWords,
+    ) -> Self {
+        Self {
+            languages: Arc::clone(&self.languages),
+            user_lexicon: Arc::new(user_lexicon),
+            ignored_words: Arc::new(ignored_words),
         }
     }
 }
@@ -81,14 +127,11 @@ impl LexicalCorrectionProvider {
     }
 
     fn contains_normalized(&self, normalized: &str) -> bool {
-        self.user_lexicon().contains_normalized(normalized)
-            || self.contains_system_normalized(normalized)
+        self.snapshot.contains_normalized(normalized)
     }
 
     fn contains_system_normalized(&self, normalized: &str) -> bool {
-        self.languages()
-            .iter()
-            .any(|language| language.contains_normalized(normalized))
+        self.snapshot.contains_system_normalized(normalized)
     }
 
     fn exact_cross_layout_interpretation(
@@ -101,6 +144,13 @@ impl LexicalCorrectionProvider {
                     transform.transform_with_physical(token.text(), token.physical_keys())?;
                 let view = LiteralWordView::from_transformed(&transformed)?;
                 let normalized_core = normalize_word(&view.core);
+                if self
+                    .snapshot
+                    .ignored_words()
+                    .contains_normalized(&normalized_core)
+                {
+                    return None;
+                }
                 language.exact_entry(&normalized_core)?;
                 Some(CrossLayoutInterpretation {
                     normalized_core,
@@ -130,7 +180,12 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
             return Vec::new();
         }
 
-        let exact_user_entry = self.user_lexicon().exact(&normalized);
+        let exact_user_entry = (!self
+            .snapshot
+            .ignored_words()
+            .contains_normalized(&normalized))
+        .then(|| self.user_lexicon().exact(&normalized))
+        .flatten();
         let exact_user_word = exact_user_entry.is_some();
         let exact_system_word = self.contains_system_normalized(&normalized);
         let exact_cross_layout = self.exact_cross_layout_interpretation(token);
@@ -174,7 +229,12 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
 
         for language in self.languages() {
             for variant in language_variants(language, token, &literal_view) {
-                if let Some(entry) = language.exact_entry(&variant.text) {
+                if let Some(entry) = language.exact_entry(&variant.text)
+                    && !self
+                        .snapshot
+                        .ignored_words()
+                        .contains_normalized(entry.word())
+                {
                     consider_language_entry(
                         &mut best_by_replacement,
                         observed,
@@ -184,7 +244,12 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                     );
                 }
                 for entry in language.candidate_entries(&variant.text, MAX_INDEX_DELETIONS) {
-                    if entry.word() == variant.text {
+                    if entry.word() == variant.text
+                        || self
+                            .snapshot
+                            .ignored_words()
+                            .contains_normalized(entry.word())
+                    {
                         continue;
                     }
                     consider_language_entry(
@@ -204,7 +269,12 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                 .user_lexicon()
                 .candidate_entries(&variant.text, MAX_INDEX_DELETIONS)
             {
-                if !digit_signature_matches(&variant.text, entry.normalized_term()) {
+                if self
+                    .snapshot
+                    .ignored_words()
+                    .contains_normalized(entry.normalized_term())
+                    || !digit_signature_matches(&variant.text, entry.normalized_term())
+                {
                     continue;
                 }
                 let edit_cost = weighted_damerau_cost(&variant.text, entry.normalized_term());
@@ -259,14 +329,16 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
             .into_iter()
             .filter_map(|candidate| {
                 let replacement = ReplacementText::try_new(candidate.replacement).ok()?;
-                Some(match candidate.target_language {
-                    Some(target_language) => CorrectionCandidate::for_language(
-                        replacement,
-                        candidate.confidence,
-                        target_language,
-                    ),
-                    None => CorrectionCandidate::new(replacement, candidate.confidence),
-                })
+                let features = crate::correction::CorrectionFeatures::new(
+                    candidate.edit_cost > f32::EPSILON,
+                    candidate.target_language.is_some(),
+                );
+                Some(CorrectionCandidate::classified(
+                    replacement,
+                    candidate.confidence,
+                    candidate.target_language,
+                    features,
+                ))
             })
             .collect()
     }

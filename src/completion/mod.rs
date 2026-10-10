@@ -176,6 +176,8 @@ pub struct SequenceSnapshotStore {
 
 impl SequenceSnapshotStore {
     pub const REBASE_LIMIT: usize = 1024;
+    pub const ACTIVE_REPEATED_BASE_LIMIT: usize = 225_000;
+    pub const ACTIVE_RECENT_SINGLETON_BASE_LIMIT: usize = 25_000;
 
     pub fn new(history: SequenceHistory) -> Self {
         Self {
@@ -335,24 +337,24 @@ impl CompletionProvider {
         }
 
         let mut evidence = PrefixEvidence::default();
-        if self
-            .snapshot
-            .user_lexicon()
-            .contains_normalized(&normalized)
-            || self
-                .snapshot
-                .languages()
-                .iter()
-                .any(|language| language.contains_normalized(&normalized))
-        {
+        if self.snapshot.contains_normalized(&normalized) {
             evidence.has_exact_word = true;
         }
 
         for word in self
             .snapshot
             .user_lexicon()
-            .prefix_matches(&normalized, limit)
+            .prefix_matches(
+                &normalized,
+                limit.saturating_add(self.snapshot.ignored_words().len()),
+            )
             .into_iter()
+            .filter(|word| {
+                !self
+                    .snapshot
+                    .ignored_words()
+                    .contains_normalized(word.normalized_term())
+            })
             .take(limit)
         {
             evidence.best_user_use_count = evidence.best_user_use_count.max(word.use_count());
@@ -361,8 +363,17 @@ impl CompletionProvider {
 
         for language in self.snapshot.languages() {
             for entry in language
-                .prefix_matches(&normalized, limit)
+                .prefix_matches(
+                    &normalized,
+                    limit.saturating_add(self.snapshot.ignored_words().len()),
+                )
                 .into_iter()
+                .filter(|entry| {
+                    !self
+                        .snapshot
+                        .ignored_words()
+                        .contains_normalized(entry.word())
+                })
                 .take(limit)
             {
                 evidence.best_system_frequency =
@@ -386,13 +397,21 @@ impl CompletionProvider {
             return Vec::new();
         }
 
-        let lookup_limit = limit.saturating_add(self.word_suppressions.len());
+        let lookup_limit = limit
+            .saturating_add(self.word_suppressions.len())
+            .saturating_add(self.snapshot.ignored_words().len());
         let mut ranked = self
             .snapshot
             .user_lexicon()
             .prefix_matches(prefix, lookup_limit)
             .into_iter()
-            .filter(|word| !self.word_suppressions.contains(word.term()))
+            .filter(|word| {
+                !self
+                    .snapshot
+                    .ignored_words()
+                    .contains_normalized(word.normalized_term())
+                    && !self.word_suppressions.contains(word.term())
+            })
             .map(|word: &UserWord| RankedWordCandidate {
                 candidate: CompletionCandidate {
                     text: word.term().to_owned(),
@@ -406,7 +425,12 @@ impl CompletionProvider {
 
         for language in self.snapshot.languages() {
             for entry in language.prefix_matches(prefix, lookup_limit) {
-                if self.word_suppressions.contains(entry.word()) {
+                if self
+                    .snapshot
+                    .ignored_words()
+                    .contains_normalized(entry.word())
+                    || self.word_suppressions.contains(entry.word())
+                {
                     continue;
                 }
                 ranked.push(RankedWordCandidate {
@@ -481,16 +505,7 @@ impl CompletionProvider {
     fn sequence_completion_is_lexically_valid(&self, candidate: &SequenceCompletion) -> bool {
         candidate.text().split_whitespace().all(|token| {
             let normalized = normalize_word(token);
-            !normalized.is_empty()
-                && (self
-                    .snapshot
-                    .user_lexicon()
-                    .contains_normalized(&normalized)
-                    || self
-                        .snapshot
-                        .languages()
-                        .iter()
-                        .any(|language| language.contains_normalized(&normalized)))
+            !normalized.is_empty() && self.snapshot.contains_normalized(&normalized)
         })
     }
 }

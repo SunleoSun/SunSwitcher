@@ -51,11 +51,14 @@ fn production_log(args: fmt::Arguments<'_>) {
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 fn start_log_worker() -> SyncSender<String> {
     let (sender, receiver) = mpsc::sync_channel(LOG_QUEUE_CAPACITY);
-    if let Ok(executable_path) = std::env::current_exe() {
-        let log_path = executable_path.with_file_name("sunswitcher.log");
-        let _ = thread::Builder::new()
-            .name("sunswitcher-log".to_owned())
-            .spawn(move || run_log_worker(log_path, receiver));
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let app_data_dir = PathBuf::from(local_app_data).join("SunSwitcher");
+        if fs::create_dir_all(&app_data_dir).is_ok() {
+            let log_path = app_data_dir.join("sunswitcher.log");
+            let _ = thread::Builder::new()
+                .name("sunswitcher-log".to_owned())
+                .spawn(move || run_log_worker(log_path, receiver));
+        }
     }
     sender
 }

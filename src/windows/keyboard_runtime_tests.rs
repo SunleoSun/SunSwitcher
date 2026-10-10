@@ -1,7 +1,7 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_KEYBOARD, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_ADD, VK_BACK,
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU,
-    VK_LSHIFT, VK_MENU, VK_OEM_1, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
+    VK_LSHIFT, VK_MENU, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
     VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
     VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SUBTRACT, VK_TAB, VK_UP,
 };
@@ -18,19 +18,21 @@ use super::keyboard_runtime::{
     build_completion_word_inputs, build_ctrl_chord_inputs, build_ctrl_shift_chord_inputs,
     build_previous_caret_range_replacement_inputs, build_replacement_inputs,
     build_tracked_text_replacement_inputs, clipboard_hotkey_command, completion_hotkey_command,
-    foreground_change_requires_invalidation, injected_marker, input_ownership_matches,
-    is_foreign_injected_keyboard_event, is_physical_keyboard_event, is_shift_modifier_key,
-    is_toggle_key, keyup_suppression_after_injection, mouse_message_invalidates_tracking,
-    pause_hotkey_action, physical_key_from_vk, preclassify_key_down, refresh_modifier_state_from,
+    configured_clipboard_hotkey_command, configured_completion_hotkey_command,
+    foreground_change_requires_invalidation, hotkey_binding_matches, ignore_hotkey_matches,
+    injected_marker, input_ownership_matches, is_foreign_injected_keyboard_event,
+    is_physical_keyboard_event, is_shift_modifier_key, is_toggle_key,
+    keyup_suppression_after_injection, mouse_message_invalidates_tracking, pause_hotkey_action,
+    physical_key_from_vk, preclassify_key_down, refresh_modifier_state_from,
     selection_capture_intent_for_navigation,
     should_refresh_modifier_state_before_key_classification, undo_hotkey_matches,
-    undo_outcome_after_injection, update_keyboard_state,
+    undo_outcome_after_injection, update_keyboard_state, word_hotkey_dispatch_ready,
 };
 use super::selected_text_runtime::SelectionCaptureIntent;
 use crate::completion::CompletionCommand;
 use crate::correction::{CorrectionDecision, ReplacementText};
 use crate::input::{Boundary, CompletedToken, InputEvent, PhysicalKey};
-use crate::persistence::UndoHotkey;
+use crate::persistence::{AppSettings, HotkeyAction, HotkeyBinding, UndoHotkey};
 use crate::replacement::{ReplacementEngine, UndoOutcome};
 
 #[test]
@@ -333,6 +335,96 @@ fn pause_undo_hotkey_requires_an_unmodified_keypress() {
 }
 
 #[test]
+fn configurable_ctrl_w_matches_undo_binding_and_waits_for_modifier_release() {
+    let binding = HotkeyBinding::try_new(b'W' as u16, true, false, false, false).unwrap();
+    let settings = AppSettings::default().with_hotkey(HotkeyAction::UndoOrForgetWord, binding);
+    let mut state = [0u8; 256];
+    state[VK_CONTROL as usize] = 0x80;
+
+    assert!(hotkey_binding_matches(
+        settings.hotkey(HotkeyAction::UndoOrForgetWord),
+        b'W' as u32,
+        &state
+    ));
+    assert!(!word_hotkey_dispatch_ready(true, &state));
+
+    state[VK_CONTROL as usize] = 0;
+    assert!(word_hotkey_dispatch_ready(true, &state));
+}
+
+#[test]
+fn stale_modifier_reconciliation_recovers_configured_ctrl_w() {
+    let binding = HotkeyBinding::try_new(b'W' as u16, true, false, false, false).unwrap();
+    let settings = AppSettings::default().with_hotkey(HotkeyAction::UndoOrForgetWord, binding);
+    let mut state = [0u8; 256];
+    state[VK_CONTROL as usize] = 0x80;
+    state[VK_SHIFT as usize] = 0x80;
+
+    assert!(!hotkey_binding_matches(
+        settings.hotkey(HotkeyAction::UndoOrForgetWord),
+        b'W' as u32,
+        &state
+    ));
+    refresh_modifier_state_from(&mut state, |vk_code| vk_code == VK_CONTROL);
+    assert!(hotkey_binding_matches(
+        settings.hotkey(HotkeyAction::UndoOrForgetWord),
+        b'W' as u32,
+        &state
+    ));
+}
+
+#[test]
+fn unmodified_word_hotkey_is_ready_without_waiting_for_keyup() {
+    assert!(word_hotkey_dispatch_ready(true, &[0u8; 256]));
+}
+
+#[test]
+fn pending_ignore_dispatch_waits_until_all_chord_modifiers_are_released() {
+    let mut state = [0u8; 256];
+    state[VK_CONTROL as usize] = 0x80;
+    assert!(!word_hotkey_dispatch_ready(true, &state));
+    state[VK_CONTROL as usize] = 0;
+    assert!(word_hotkey_dispatch_ready(true, &state));
+    assert!(!word_hotkey_dispatch_ready(false, &state));
+}
+
+#[test]
+fn ctrl_pause_is_the_ignore_binding_without_other_modifiers() {
+    let mut state = [0u8; 256];
+    state[VK_CONTROL as usize] = 0x80;
+    let ignore_active = ignore_hotkey_matches(UndoHotkey::Pause, VK_PAUSE as u32, &state);
+    assert!(ignore_active);
+    assert!(ignore_hotkey_matches(UndoHotkey::Pause, 0x03, &state));
+    assert!(hotkey_binding_matches(
+        AppSettings::default().hotkey(HotkeyAction::IgnoreWord),
+        0x03,
+        &state
+    ));
+    assert!(!should_refresh_modifier_state_before_key_classification(
+        VK_PAUSE as u32,
+        ignore_active,
+        false,
+    ));
+    assert!(!undo_hotkey_matches(
+        UndoHotkey::Pause,
+        VK_PAUSE as u32,
+        &state
+    ));
+
+    state[VK_SHIFT as usize] = 0x80;
+    assert!(!ignore_hotkey_matches(
+        UndoHotkey::Pause,
+        VK_PAUSE as u32,
+        &state
+    ));
+    assert!(!hotkey_binding_matches(
+        AppSettings::default().hotkey(HotkeyAction::IgnoreWord),
+        0x03,
+        &state
+    ));
+}
+
+#[test]
 fn grave_oem_key_is_service_input_instead_of_token_text() {
     assert_eq!(
         preclassify_key_down(VK_OEM_3 as u32, false),
@@ -341,10 +433,10 @@ fn grave_oem_key_is_service_input_instead_of_token_text() {
 }
 
 #[test]
-fn pause_with_selection_deletes_that_user_word_instead_of_undoing() {
+fn pause_with_selection_forgets_personal_word_state_instead_of_undoing() {
     assert_eq!(
         pause_hotkey_action(Some("CustomToken")),
-        PauseHotkeyAction::DeleteSelectedUserWord("CustomToken".to_owned())
+        PauseHotkeyAction::ForgetSelectedWord("CustomToken".to_owned())
     );
     assert_eq!(
         pause_hotkey_action(None),
@@ -380,14 +472,74 @@ fn clipboard_manager_hotkey_mapping_uses_ctrl_shift_numpad_plus_minus() {
     let mut stale_modifier_state = [0u8; 256];
     update_keyboard_state(&mut stale_modifier_state, VK_CONTROL as u32, true);
     update_keyboard_state(&mut stale_modifier_state, VK_SHIFT as u32, true);
-    assert!(should_refresh_modifier_state_before_key_classification(
+    let clipboard_add_active =
+        clipboard_hotkey_command(VK_ADD as u32, &stale_modifier_state).is_some();
+    assert!(clipboard_add_active);
+    assert!(!should_refresh_modifier_state_before_key_classification(
         VK_ADD as u32,
-        &stale_modifier_state,
+        clipboard_add_active,
+        false,
     ));
-    assert!(should_refresh_modifier_state_before_key_classification(
+    let clipboard_minus_active =
+        clipboard_hotkey_command(VK_OEM_MINUS as u32, &stale_modifier_state).is_some();
+    assert!(clipboard_minus_active);
+    assert!(!should_refresh_modifier_state_before_key_classification(
         VK_OEM_MINUS as u32,
-        &stale_modifier_state,
+        clipboard_minus_active,
+        false,
     ));
+}
+
+#[test]
+fn configured_hotkeys_replace_the_default_runtime_bindings() {
+    let settings = AppSettings::default()
+        .with_hotkey(
+            HotkeyAction::ClipboardCurrent,
+            HotkeyBinding::try_new(b'J' as u16, true, false, false, false).unwrap(),
+        )
+        .with_hotkey(
+            HotkeyAction::ClipboardPinned,
+            HotkeyBinding::try_new(b'K' as u16, true, false, false, false).unwrap(),
+        )
+        .with_hotkey(
+            HotkeyAction::CompletionAccept,
+            HotkeyBinding::try_new(0x71, false, false, false, false).unwrap(),
+        );
+
+    let mut control = [0u8; 256];
+    control[VK_CONTROL as usize] = 0x80;
+    let configured_current = configured_clipboard_hotkey_command(b'J' as u32, &control, settings);
+    assert_eq!(configured_current, Some(ClipboardCommand::OpenCurrent));
+    assert!(!should_refresh_modifier_state_before_key_classification(
+        b'J' as u32,
+        configured_current.is_some(),
+        false,
+    ));
+    let configured_pinned = configured_clipboard_hotkey_command(b'K' as u32, &control, settings);
+    assert_eq!(configured_pinned, Some(ClipboardCommand::OpenPinned));
+    assert!(!should_refresh_modifier_state_before_key_classification(
+        b'K' as u32,
+        configured_pinned.is_some(),
+        false,
+    ));
+
+    let mut legacy_clipboard = [0u8; 256];
+    legacy_clipboard[VK_CONTROL as usize] = 0x80;
+    legacy_clipboard[VK_SHIFT as usize] = 0x80;
+    assert_eq!(
+        configured_clipboard_hotkey_command(VK_SUBTRACT as u32, &legacy_clipboard, settings),
+        None
+    );
+
+    let plain = [0u8; 256];
+    assert_eq!(
+        configured_completion_hotkey_command(0x71, &plain, settings),
+        Some(CompletionCommand::Accept)
+    );
+    assert_eq!(
+        configured_completion_hotkey_command(VK_TAB as u32, &plain, settings),
+        None
+    );
 }
 
 #[test]
@@ -448,11 +600,18 @@ fn completion_hotkeys_require_exact_default_modifier_contract() {
     update_keyboard_state(&mut stale_ctrl_state, VK_CONTROL as u32, true);
     assert!(should_refresh_modifier_state_before_key_classification(
         b'A' as u32,
-        &stale_ctrl_state
+        completion_hotkey_command(b'A' as u32, &stale_ctrl_state).is_some(),
+        false,
     ));
     assert!(should_refresh_modifier_state_before_key_classification(
         VK_TAB as u32,
-        &stale_ctrl_state
+        completion_hotkey_command(VK_TAB as u32, &stale_ctrl_state).is_some(),
+        false,
+    ));
+    assert!(!should_refresh_modifier_state_before_key_classification(
+        b'J' as u32,
+        false,
+        true,
     ));
 }
 
@@ -466,7 +625,8 @@ fn modifier_refresh_is_deferred_for_alt_right_completion_hotkey() {
     );
     assert!(!should_refresh_modifier_state_before_key_classification(
         VK_RIGHT as u32,
-        &state
+        completion_hotkey_command(VK_RIGHT as u32, &state).is_some(),
+        false,
     ));
 }
 
@@ -743,6 +903,7 @@ fn windows_oem_keys_map_to_layout_ambiguous_physical_identity() {
         (VK_OEM_7, PhysicalKey::Quote),
         (VK_OEM_COMMA, PhysicalKey::Comma),
         (VK_OEM_PERIOD, PhysicalKey::Period),
+        (VK_OEM_2, PhysicalKey::Slash),
     ] {
         assert_eq!(physical_key_from_vk(vk_code as u32), expected);
     }
