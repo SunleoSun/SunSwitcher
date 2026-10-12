@@ -267,9 +267,10 @@ impl AutocompletePopupHandle {
                 options,
                 Box::new(move |creation_context| {
                     install_system_font(&creation_context.egui_ctx)?;
-                    creation_context
-                        .egui_ctx
-                        .options_mut(|options| options.zoom_with_keyboard = false);
+                    creation_context.egui_ctx.options_mut(|options| {
+                        options.zoom_with_keyboard = false;
+                        options.quit_shortcuts.clear();
+                    });
                     let repaint_ctx = creation_context.egui_ctx.clone();
                     let notification = TransientNotificationHandle {
                         state: worker_notification_state,

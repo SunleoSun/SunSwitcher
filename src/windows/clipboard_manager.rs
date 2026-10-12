@@ -33,7 +33,9 @@ use super::clipboard_listener::InternalClipboardMutationGuard;
 use super::hotkey_capture::{
     HotkeyCaptureEffect, HotkeyCaptureHandle, HotkeyCaptureState, format_hotkey,
 };
-use super::keyboard_runtime::{RuntimeError, inject_ctrl_chord};
+use super::keyboard_runtime::{
+    ClipboardCommand, RuntimeError, configured_clipboard_hotkey_command, inject_ctrl_chord,
+};
 use super::selected_text_runtime::{set_image_clipboard_payload, set_unicode_clipboard};
 
 const WINDOW_WIDTH: f32 = 520.0;
@@ -134,10 +136,15 @@ impl ClipboardManagerHandle {
             .read()
             .map(|state| state.clone())
             .unwrap_or_default();
+        let effective_target_window_id = if previous.visible {
+            previous.target_window_id
+        } else {
+            target_window_id
+        };
         let next = ClipboardManagerState {
             visible: true,
             active_tab,
-            target_window_id,
+            target_window_id: effective_target_window_id,
             serial: previous.serial.wrapping_add(1),
         };
         let next_serial = next.serial;
@@ -220,6 +227,7 @@ pub(crate) struct ClipboardManagerApp {
     title_bar_styled: bool,
     entries_cache: Option<ClipboardEntriesCache>,
     dragging: Option<ClipboardDrag>,
+    focused_hotkey_keyboard_state: [bool; 256],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +297,7 @@ impl ClipboardManagerApp {
             title_bar_styled: false,
             entries_cache: None,
             dragging: None,
+            focused_hotkey_keyboard_state: keyboard_down_snapshot(),
         }
     }
     pub(crate) fn logic(&mut self, ctx: &egui::Context) -> bool {
@@ -365,9 +374,7 @@ impl ClipboardManagerApp {
             self.hide_shared(ui.ctx());
             return true;
         }
-        if let Some(tab) = self.consume_tab_switch_shortcuts(ui.ctx()) {
-            self.set_active_tab(tab);
-        }
+        self.apply_focused_hotkey_fallback(ui.ctx());
         let state = self
             .state
             .read()
@@ -471,31 +478,40 @@ impl ClipboardManagerApp {
         self.show_preview(ui.ctx());
         true
     }
+    fn apply_focused_hotkey_fallback(&mut self, ctx: &egui::Context) {
+        let current = keyboard_down_snapshot();
+        let new_key = first_new_capture_key(&self.focused_hotkey_keyboard_state, &current);
+        self.focused_hotkey_keyboard_state = current;
 
-    fn consume_tab_switch_shortcuts(&self, ctx: &egui::Context) -> Option<ClipboardManagerTab> {
-        let modifiers = egui::Modifiers {
-            ctrl: true,
-            shift: true,
-            ..Default::default()
+        let Some(vk_code) = new_key else {
+            return;
         };
-        let pinned = ctx.input_mut(|input| {
-            input.consume_key(modifiers, egui::Key::Plus)
-                || input.consume_key(modifiers, egui::Key::Equals)
-        });
-        if pinned {
-            return Some(ClipboardManagerTab::Pinned);
+        let state = self
+            .state
+            .read()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        if !state.visible {
+            return;
         }
-        let current = ctx.input_mut(|input| input.consume_key(modifiers, egui::Key::Minus));
-        current.then_some(ClipboardManagerTab::Current)
-    }
+        let Ok(settings) = self.settings_view.settings.load() else {
+            return;
+        };
+        let Some(command) =
+            clipboard_hotkey_command_from_down_snapshot(vk_code, &current, settings)
+        else {
+            return;
+        };
+        let requested_tab = match command {
+            ClipboardCommand::OpenCurrent => ClipboardManagerTab::Current,
+            ClipboardCommand::OpenPinned => ClipboardManagerTab::Pinned,
+        };
+        if requested_tab == state.active_tab {
+            return;
+        }
 
-    fn set_active_tab(&self, tab: ClipboardManagerTab) {
-        if let Ok(mut shared) = self.state.write()
-            && shared.active_tab != tab
-        {
-            shared.active_tab = tab;
-            shared.serial = shared.serial.wrapping_add(1);
-        }
+        ClipboardManagerHandle::new(Arc::clone(&self.state), ctx.clone())
+            .show(requested_tab, state.target_window_id);
     }
 
     fn expire_preview(&mut self, ctx: &egui::Context, source_hovered: bool) {
@@ -1483,6 +1499,19 @@ fn settings_icon_button(
     }
     response.on_hover_text(hover_text)
 }
+fn clipboard_hotkey_command_from_down_snapshot(
+    vk_code: u16,
+    down: &[bool; 256],
+    settings: AppSettings,
+) -> Option<ClipboardCommand> {
+    let mut keyboard_state = [0u8; 256];
+    for (index, is_down) in down.iter().copied().enumerate() {
+        if is_down {
+            keyboard_state[index] = 0x80;
+        }
+    }
+    configured_clipboard_hotkey_command(u32::from(vk_code), &keyboard_state, settings)
+}
 
 fn keyboard_down_snapshot() -> [bool; 256] {
     let mut down = [false; 256];
@@ -1943,6 +1972,47 @@ mod tests {
         let hotkey_capture =
             HotkeyCaptureHandle::new(HotkeyCaptureHandle::shared_state(), repaint_ctx);
         ClipboardManagerApp::new(std::path::PathBuf::new(), state, settings, hotkey_capture)
+    }
+
+    #[test]
+    fn visible_show_preserves_original_target_window() {
+        let state = Arc::new(RwLock::new(ClipboardManagerState {
+            visible: true,
+            active_tab: ClipboardManagerTab::Current,
+            target_window_id: 42,
+            serial: 1,
+        }));
+        let ctx = egui::Context::default();
+        let handle = ClipboardManagerHandle::new(Arc::clone(&state), ctx);
+
+        handle.show(ClipboardManagerTab::Pinned, 99);
+
+        let shared = state.read().expect("clipboard state");
+        assert_eq!(shared.active_tab, ClipboardManagerTab::Pinned);
+        assert_eq!(shared.target_window_id, 42);
+    }
+
+    #[test]
+    fn focused_hotkey_snapshot_uses_the_canonical_clipboard_bindings() {
+        let settings = AppSettings::default();
+
+        let mut current = [false; 256];
+        current[usize::from(VK_CONTROL)] = true;
+        current[usize::from(VK_SHIFT)] = true;
+        current[0x6D] = true;
+        assert_eq!(
+            clipboard_hotkey_command_from_down_snapshot(0x6D, &current, settings),
+            Some(ClipboardCommand::OpenCurrent)
+        );
+
+        let mut pinned = [false; 256];
+        pinned[usize::from(VK_CONTROL)] = true;
+        pinned[usize::from(VK_SHIFT)] = true;
+        pinned[0x6B] = true;
+        assert_eq!(
+            clipboard_hotkey_command_from_down_snapshot(0x6B, &pinned, settings),
+            Some(ClipboardCommand::OpenPinned)
+        );
     }
 
     #[test]
