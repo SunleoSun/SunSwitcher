@@ -27,7 +27,23 @@ fn trailing_non_whitespace_range_keeps_layout_punctuation_and_trailing_spaces() 
             trailing_chars: 0,
         })
     );
-    assert_eq!(trailing_non_whitespace_range("   \t"), None);
+    assert_eq!(
+        trailing_non_whitespace_range("prefix \"\""),
+        Some(TrailingNonWhitespaceRange {
+            leading_chars: 7,
+            selected_chars: 2,
+            trailing_chars: 0,
+        })
+    );
+    assert_eq!(
+        trailing_non_whitespace_range("@@"),
+        Some(TrailingNonWhitespaceRange {
+            leading_chars: 0,
+            selected_chars: 2,
+            trailing_chars: 0,
+        })
+    );
+    assert_eq!(trailing_non_whitespace_range(" \t"), None);
 }
 
 #[test]

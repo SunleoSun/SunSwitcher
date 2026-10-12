@@ -11,6 +11,7 @@ use crate::settings::SettingsStore;
 use super::caret_locator::{CaretAnchor, CaretLocator, CaretSource, popup_placement};
 use super::clipboard_manager::{
     ClipboardManagerApp, ClipboardManagerHandle, ClipboardManagerState, ClipboardManagerTab,
+    park_root_viewport,
 };
 use super::hotkey_capture::HotkeyCaptureHandle;
 use super::tray_icon::TrayIcon;
@@ -36,29 +37,66 @@ fn install_system_font(ctx: &egui::Context) -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "WINDIR is not set"))?;
     let fonts_dir = windows_dir.join("Fonts");
 
-    for filename in ["segoeui.ttf", "arial.ttf", "tahoma.ttf"] {
+    let (primary_filename, primary_bytes) = ["segoeui.ttf", "arial.ttf", "tahoma.ttf"]
+        .into_iter()
+        .find_map(|filename| {
+            std::fs::read(fonts_dir.join(filename))
+                .ok()
+                .map(|bytes| (filename, bytes))
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no supported Windows UI font found in %WINDIR%\\Fonts",
+            )
+        })?;
+
+    let mut definitions = egui::FontDefinitions::empty();
+    let primary_name = format!("windows-ui-{primary_filename}");
+    definitions.font_data.insert(
+        primary_name.clone(),
+        Arc::new(egui::FontData::from_owned(primary_bytes)),
+    );
+
+    let mut fallback_names = Vec::new();
+    for (font_name, filename) in [
+        ("windows-symbol", "seguisym.ttf"),
+        ("windows-monospace", "consola.ttf"),
+    ] {
         if let Ok(bytes) = std::fs::read(fonts_dir.join(filename)) {
-            let font_name = "windows-ui".to_owned();
-            let mut definitions = egui::FontDefinitions::empty();
             definitions.font_data.insert(
-                font_name.clone(),
+                font_name.to_owned(),
                 Arc::new(egui::FontData::from_owned(bytes)),
             );
-            definitions
-                .families
-                .insert(egui::FontFamily::Proportional, vec![font_name.clone()]);
-            definitions
-                .families
-                .insert(egui::FontFamily::Monospace, vec![font_name]);
-            ctx.set_fonts(definitions);
-            return Ok(());
+            fallback_names.push(font_name.to_owned());
         }
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no supported Windows UI font found in %WINDIR%\\Fonts",
-    ))
+    let mut proportional = vec![primary_name.clone()];
+    proportional.extend(fallback_names.iter().cloned());
+    definitions
+        .families
+        .insert(egui::FontFamily::Proportional, proportional);
+
+    let mut monospace = Vec::new();
+    if fallback_names
+        .iter()
+        .any(|font_name| font_name == "windows-monospace")
+    {
+        monospace.push("windows-monospace".to_owned());
+    }
+    monospace.push(primary_name);
+    monospace.extend(
+        fallback_names
+            .into_iter()
+            .filter(|font_name| font_name != "windows-monospace"),
+    );
+    definitions
+        .families
+        .insert(egui::FontFamily::Monospace, monospace);
+
+    ctx.set_fonts(definitions);
+    Ok(())
 }
 
 fn load_window_icon() -> Option<Arc<egui::IconData>> {
@@ -79,6 +117,38 @@ fn suggestion_viewport_id() -> ViewportId {
 
 fn notification_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("sunswitcher_notification_child")
+}
+
+fn suggestion_viewport_builder(
+    position: egui::Pos2,
+    height: f32,
+    visible: bool,
+) -> ViewportBuilder {
+    ViewportBuilder::default()
+        .with_title("SunSwitcher suggestions")
+        .with_inner_size(vec2(POPUP_WIDTH, height))
+        .with_position(position)
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_always_on_top()
+        .with_active(false)
+        .with_visible(visible)
+        .with_transparent(false)
+}
+
+fn notification_viewport_builder(position: egui::Pos2, visible: bool) -> ViewportBuilder {
+    ViewportBuilder::default()
+        .with_title("SunSwitcher notification")
+        .with_inner_size(vec2(NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT))
+        .with_position(position)
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_always_on_top()
+        .with_active(false)
+        .with_visible(visible)
+        .with_transparent(false)
 }
 
 fn render_suggestion_rows(ui: &mut egui::Ui, state: &PopupState) {
@@ -415,16 +485,7 @@ struct AutocompletePopupApp {
     notification_viewport: NotificationViewportCache,
 }
 
-fn park_root_viewport(ctx: &egui::Context) {
-    ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
-    ctx.send_viewport_cmd(ViewportCommand::Resizable(false));
-    ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(1.0, 1.0)));
-    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(
-        PARKED_POSITION,
-        PARKED_POSITION,
-    )));
-    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-}
+// root viewport parking is owned by clipboard_manager
 
 fn root_viewport_anchor(ctx: &egui::Context) -> Option<CaretAnchor> {
     ctx.input(|input| {
@@ -443,9 +504,12 @@ fn root_viewport_anchor(ctx: &egui::Context) -> Option<CaretAnchor> {
 
 impl AutocompletePopupApp {
     fn hide_suggestion_viewport(&mut self, ctx: &egui::Context) {
-        if self.suggestion_viewport.visible {
-            ctx.send_viewport_cmd_to(suggestion_viewport_id(), ViewportCommand::Visible(false));
-        }
+        let viewport = suggestion_viewport_builder(
+            pos2(PARKED_POSITION, PARKED_POSITION),
+            POPUP_PADDING * 2.0 + ROW_HEIGHT,
+            false,
+        );
+        ctx.show_viewport_deferred(suggestion_viewport_id(), viewport, |_ui, _class| {});
         self.suggestion_viewport.visible = false;
         self.suggestion_viewport.spec = None;
     }
@@ -517,17 +581,11 @@ impl AutocompletePopupApp {
 
     fn render_suggestion_viewport(&self, ctx: &egui::Context, spec: &SuggestionViewportSpec) {
         let state_handle = Arc::clone(&self.state);
-        let viewport = ViewportBuilder::default()
-            .with_title("SunSwitcher suggestions")
-            .with_inner_size(vec2(POPUP_WIDTH, spec.height as f32))
-            .with_position(pos2(spec.x as f32, spec.y as f32))
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_always_on_top()
-            .with_active(false)
-            .with_visible(true)
-            .with_transparent(false);
+        let viewport = suggestion_viewport_builder(
+            pos2(spec.x as f32, spec.y as f32),
+            spec.height as f32,
+            true,
+        );
         ctx.show_viewport_deferred(suggestion_viewport_id(), viewport, move |ui, _class| {
             let state = state_handle
                 .read()
@@ -540,9 +598,8 @@ impl AutocompletePopupApp {
     }
 
     fn hide_notification_viewport(&mut self, ctx: &egui::Context) {
-        if self.notification_viewport.visible {
-            ctx.send_viewport_cmd_to(notification_viewport_id(), ViewportCommand::Visible(false));
-        }
+        let viewport = notification_viewport_builder(pos2(PARKED_POSITION, PARKED_POSITION), false);
+        ctx.show_viewport_deferred(notification_viewport_id(), viewport, |_ui, _class| {});
         self.notification_viewport.visible = false;
         self.notification_viewport.spec = None;
     }
@@ -615,17 +672,7 @@ impl AutocompletePopupApp {
 
     fn render_notification_viewport(&self, ctx: &egui::Context, spec: &NotificationViewportSpec) {
         let message = spec.message.clone();
-        let viewport = ViewportBuilder::default()
-            .with_title("SunSwitcher notification")
-            .with_inner_size(vec2(NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT))
-            .with_position(pos2(spec.x as f32, spec.y as f32))
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_always_on_top()
-            .with_active(false)
-            .with_visible(true)
-            .with_transparent(false);
+        let viewport = notification_viewport_builder(pos2(spec.x as f32, spec.y as f32), true);
         ctx.show_viewport_deferred(notification_viewport_id(), viewport, move |ui, _class| {
             let bounds = ui.max_rect();
             ui.painter().rect_filled(bounds, 6.0, SUGGESTION_BG);
@@ -702,6 +749,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hidden_suggestion_viewport_is_parked_and_never_fullscreen() {
+        let viewport = suggestion_viewport_builder(
+            pos2(PARKED_POSITION, PARKED_POSITION),
+            POPUP_PADDING * 2.0 + ROW_HEIGHT,
+            false,
+        );
+        assert_eq!(viewport.visible, Some(false));
+        assert_eq!(
+            viewport.position,
+            Some(pos2(PARKED_POSITION, PARKED_POSITION))
+        );
+        assert_eq!(viewport.fullscreen, None);
+        assert_eq!(viewport.maximized, None);
+    }
+
+    #[test]
     fn notification_updates_replace_the_message_and_restart_the_deadline() {
         let state = Arc::new(RwLock::new(None));
         let handle = TransientNotificationHandle {
@@ -752,6 +815,24 @@ mod tests {
         assert_eq!(resized_anchor.x(), 180.0);
         assert_eq!(resized_anchor.y(), 210.0);
         assert_eq!(resized_anchor.height(), 144.0);
+    }
+
+    #[test]
+    fn system_font_stack_covers_clipboard_preview_unicode_symbols() {
+        let ctx = egui::Context::default();
+        install_system_font(&ctx).expect("Windows font stack must install");
+        let font_id = egui::FontId::monospace(14.0);
+        let mut missing = Vec::new();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            missing = ui.ctx().fonts_mut(|fonts| {
+                "█▀▄─→Привет"
+                    .chars()
+                    .filter(|character| !fonts.has_glyph(&font_id, *character))
+                    .collect()
+            });
+        });
+        output.drop_without_applying_deltas();
+        assert!(missing.is_empty(), "missing preview glyphs: {missing:?}");
     }
 
     #[test]

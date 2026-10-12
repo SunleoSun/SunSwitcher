@@ -830,6 +830,48 @@ pub enum ClipboardEntryContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardEntrySummaryContent {
+    Text(String),
+    Image { format: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardEntrySummary {
+    id: ClipboardEntryId,
+    kind: ClipboardEntryKind,
+    last_seen_at_ms: i64,
+    copy_count: u32,
+    pinned_at_ms: Option<i64>,
+    content: ClipboardEntrySummaryContent,
+}
+
+impl ClipboardEntrySummary {
+    pub const fn id(&self) -> ClipboardEntryId {
+        self.id
+    }
+
+    pub const fn kind(&self) -> ClipboardEntryKind {
+        self.kind
+    }
+
+    pub const fn last_seen_at_ms(&self) -> i64 {
+        self.last_seen_at_ms
+    }
+
+    pub const fn copy_count(&self) -> u32 {
+        self.copy_count
+    }
+
+    pub const fn pinned_at_ms(&self) -> Option<i64> {
+        self.pinned_at_ms
+    }
+
+    pub const fn content(&self) -> &ClipboardEntrySummaryContent {
+        &self.content
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardEntryView {
     id: ClipboardEntryId,
     kind: ClipboardEntryKind,
@@ -1712,7 +1754,52 @@ ORDER BY clipboard_entries.pinned_order_index DESC, clipboard_entries.id DESC
         clipboard_entries_from_stored(stored, filter, limit)
     }
 
-    fn load_clipboard_entry(
+    pub fn load_clipboard_current_summaries(
+        &self,
+        filter: &str,
+    ) -> Result<Vec<ClipboardEntrySummary>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
+                   clipboard_text.text, clipboard_images.format
+            FROM clipboard_entries
+            LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.kind IN ('text', 'image')
+            ORDER BY clipboard_entries.current_order_index DESC, clipboard_entries.id DESC
+            "#,
+        )?;
+        let stored = statement
+            .query_map([], stored_clipboard_summary_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        clipboard_summaries_from_stored(stored, filter)
+    }
+
+    pub fn load_clipboard_pinned_summaries(
+        &self,
+        filter: &str,
+    ) -> Result<Vec<ClipboardEntrySummary>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT clipboard_entries.id, clipboard_entries.kind, clipboard_entries.last_seen_at_ms,
+                   clipboard_entries.copy_count, clipboard_entries.pinned_at_ms,
+                   clipboard_text.text, clipboard_images.format
+            FROM clipboard_entries
+            LEFT JOIN clipboard_text ON clipboard_text.entry_id = clipboard_entries.id
+            LEFT JOIN clipboard_images ON clipboard_images.entry_id = clipboard_entries.id
+            WHERE clipboard_entries.kind IN ('text', 'image')
+              AND clipboard_entries.pinned_at_ms IS NOT NULL
+            ORDER BY clipboard_entries.pinned_order_index DESC, clipboard_entries.id DESC
+            "#,
+        )?;
+        let stored = statement
+            .query_map([], stored_clipboard_summary_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        clipboard_summaries_from_stored(stored, filter)
+    }
+
+    pub fn load_clipboard_entry(
         &self,
         entry_id: ClipboardEntryId,
     ) -> Result<ClipboardEntryView, DatabaseError> {
@@ -1939,6 +2026,84 @@ fn clipboard_content_hash(kind: ClipboardEntryKind, bytes: &[u8]) -> Vec<u8> {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash.to_be_bytes().to_vec()
+}
+
+type StoredClipboardSummary = (
+    i64,
+    String,
+    i64,
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+fn stored_clipboard_summary_from_sql(
+    row: &rusqlite::Row<'_>,
+) -> Result<StoredClipboardSummary, rusqlite::Error> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, i64>(2)?,
+        row.get::<_, i64>(3)?,
+        row.get::<_, Option<i64>>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(6)?,
+    ))
+}
+
+fn clipboard_summaries_from_stored(
+    stored: Vec<StoredClipboardSummary>,
+    filter: &str,
+) -> Result<Vec<ClipboardEntrySummary>, DatabaseError> {
+    let normalized_filter = filter.trim().to_lowercase();
+    let mut entries = Vec::with_capacity(stored.len());
+    for row in stored {
+        let entry = clipboard_summary_from_stored(row)?;
+        let matches_filter = normalized_filter.is_empty()
+            || match entry.content() {
+                ClipboardEntrySummaryContent::Text(text) => {
+                    text.to_lowercase().contains(&normalized_filter)
+                }
+                ClipboardEntrySummaryContent::Image { format } => {
+                    "image".contains(&normalized_filter)
+                        || format.to_lowercase().contains(&normalized_filter)
+                }
+            };
+        if matches_filter {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn clipboard_summary_from_stored(
+    stored: StoredClipboardSummary,
+) -> Result<ClipboardEntrySummary, DatabaseError> {
+    let (id, stored_kind, last_seen_at_ms, stored_copy_count, pinned_at_ms, text, image_format) =
+        stored;
+    let kind = ClipboardEntryKind::try_from_stored(&stored_kind)?;
+    let copy_count = u32::try_from(stored_copy_count)
+        .map_err(|_| DatabaseError::InvalidStoredClipboardCopyCount(stored_copy_count))?;
+    let content = match kind {
+        ClipboardEntryKind::Text => ClipboardEntrySummaryContent::Text(
+            text.ok_or(DatabaseError::ClipboardEntryNotFound(id))?,
+        ),
+        ClipboardEntryKind::Image => ClipboardEntrySummaryContent::Image {
+            format: image_format.ok_or(DatabaseError::InvalidClipboardImage)?,
+        },
+        ClipboardEntryKind::Files => {
+            return Err(DatabaseError::InvalidStoredClipboardKind(stored_kind));
+        }
+    };
+    Ok(ClipboardEntrySummary {
+        id: ClipboardEntryId(id),
+        kind,
+        last_seen_at_ms,
+        copy_count,
+        pinned_at_ms,
+        content,
+    })
 }
 
 type StoredClipboardRow = (

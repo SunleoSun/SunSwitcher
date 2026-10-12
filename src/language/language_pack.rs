@@ -111,6 +111,23 @@ impl KeyboardLayoutMap {
         })
     }
 
+    pub fn with_text_mappings(
+        mut self,
+        source: &str,
+        target: &str,
+    ) -> Result<Self, LanguagePackError> {
+        let source_chars: Vec<char> = source.chars().collect();
+        let target_chars: Vec<char> = target.chars().collect();
+        if source_chars.is_empty() || source_chars.len() != target_chars.len() {
+            return Err(LanguagePackError::InvalidLayoutMap);
+        }
+
+        for (source_char, target_char) in source_chars.into_iter().zip(target_chars) {
+            insert_unique_mapping(&mut self.map, source_char, target_char)?;
+        }
+        Ok(self)
+    }
+
     pub fn transform(&self, text: &str) -> Option<String> {
         let physical_keys: Vec<_> = text.chars().map(PhysicalKey::from_layout_symbol).collect();
         self.transform_with_physical(text, &physical_keys)

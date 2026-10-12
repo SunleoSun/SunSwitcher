@@ -1,8 +1,8 @@
 use super::{
     AppSettings, ClipboardEntryContent, ClipboardEntryKind, ClipboardEntryList,
-    ClipboardHistoryLimit, ClipboardReorderPosition, Database, DatabaseError, ForgetWordOutcome,
-    HotkeyAction, HotkeyBinding, HotkeyConflict, IgnoreWordOutcome, NotificationTimeoutSeconds,
-    SettingsError, UndoHotkey,
+    ClipboardEntrySummaryContent, ClipboardHistoryLimit, ClipboardReorderPosition, Database,
+    DatabaseError, ForgetWordOutcome, HotkeyAction, HotkeyBinding, HotkeyConflict,
+    IgnoreWordOutcome, NotificationTimeoutSeconds, SettingsError, UndoHotkey,
 };
 
 #[test]
@@ -199,6 +199,41 @@ fn clipboard_text_history_deduplicates_orders_filters_and_pins() {
     assert_eq!(
         database.load_clipboard_pinned("", 9).unwrap()[0].pinned_at_ms(),
         Some(40)
+    );
+}
+
+#[test]
+fn clipboard_summary_query_returns_full_history_without_loading_image_payloads() {
+    let database = Database::open_in_memory().unwrap();
+    for index in 0..150 {
+        database
+            .record_clipboard_text(&format!("entry-{index:03}"), i64::from(index))
+            .unwrap();
+    }
+    let image = database
+        .record_clipboard_image("CF_DIB", &[1, 2, 3, 4], 500)
+        .unwrap();
+
+    let summaries = database.load_clipboard_current_summaries("").unwrap();
+    assert_eq!(summaries.len(), 151);
+    let image_summary = summaries
+        .iter()
+        .find(|entry| entry.id() == image.id())
+        .unwrap();
+    assert_eq!(
+        image_summary.content(),
+        &ClipboardEntrySummaryContent::Image {
+            format: "CF_DIB".to_owned()
+        }
+    );
+
+    let filtered = database
+        .load_clipboard_current_summaries("ENTRY-149")
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        filtered[0].content(),
+        &ClipboardEntrySummaryContent::Text("entry-149".to_owned())
     );
 }
 

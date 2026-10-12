@@ -77,6 +77,22 @@ pub fn switch_keyboard_layout_text(
     languages: &[LanguagePack],
     text: &str,
 ) -> Option<KeyboardLayoutSwitch> {
+    switch_keyboard_layout_text_with_target(languages, text, None)
+}
+
+pub fn switch_keyboard_layout_text_to(
+    languages: &[LanguagePack],
+    text: &str,
+    target_language: &LanguageId,
+) -> Option<KeyboardLayoutSwitch> {
+    switch_keyboard_layout_text_with_target(languages, text, Some(target_language))
+}
+
+fn switch_keyboard_layout_text_with_target(
+    languages: &[LanguagePack],
+    text: &str,
+    preferred_target: Option<&LanguageId>,
+) -> Option<KeyboardLayoutSwitch> {
     struct CharacterTransform {
         original: char,
         candidates: Vec<(String, LanguageId)>,
@@ -120,30 +136,54 @@ pub fn switch_keyboard_layout_text(
         });
     }
 
-    let best_votes = target_votes.iter().map(|(_, votes)| *votes).max()?;
-    let mut winners = target_votes
-        .into_iter()
-        .filter(|(_, votes)| *votes == best_votes);
-    let (target_language, _) = winners.next()?;
-    if winners.next().is_some() {
-        return None;
-    }
+    let target_language = if let Some(target_language) = preferred_target {
+        languages
+            .iter()
+            .any(|language| language.id() == target_language)
+            .then(|| target_language.clone())?
+    } else {
+        let best_votes = target_votes.iter().map(|(_, votes)| *votes).max()?;
+        let mut winners = target_votes
+            .into_iter()
+            .filter(|(_, votes)| *votes == best_votes);
+        let (target_language, _) = winners.next()?;
+        if winners.next().is_some() {
+            return None;
+        }
+        target_language
+    };
 
     let mut transformed_text = String::with_capacity(text.len());
     let mut changed = false;
     for character in character_transforms {
-        let transformed = match character.candidates.as_slice() {
-            [] => character.original.to_string(),
-            [(transformed, _)] => transformed.clone(),
-            candidates => {
-                let mut matching = candidates
-                    .iter()
-                    .filter(|(_, language)| language == &target_language);
-                let (transformed, _) = matching.next()?;
-                if matching.next().is_some() {
-                    return None;
+        let transformed = if preferred_target.is_some() {
+            match character.candidates.as_slice() {
+                [] => character.original.to_string(),
+                candidates => {
+                    let mut matching = candidates
+                        .iter()
+                        .filter(|(_, language)| language == &target_language);
+                    let (transformed, _) = matching.next()?;
+                    if matching.next().is_some() {
+                        return None;
+                    }
+                    transformed.clone()
                 }
-                transformed.clone()
+            }
+        } else {
+            match character.candidates.as_slice() {
+                [] => character.original.to_string(),
+                [(transformed, _)] => transformed.clone(),
+                candidates => {
+                    let mut matching = candidates
+                        .iter()
+                        .filter(|(_, language)| language == &target_language);
+                    let (transformed, _) = matching.next()?;
+                    if matching.next().is_some() {
+                        return None;
+                    }
+                    transformed.clone()
+                }
             }
         };
         changed |= transformed != character.original.to_string();
@@ -185,7 +225,7 @@ fn layout_transforms_for(id: &LanguageId) -> Result<Vec<KeyboardLayoutMap>, Lang
 mod tests {
     use super::{
         DictionaryEntry, LanguageId, TextCasePattern, language_pack_from_entries,
-        switch_keyboard_layout_text,
+        switch_keyboard_layout_text, switch_keyboard_layout_text_to,
     };
 
     #[test]
@@ -280,6 +320,78 @@ mod tests {
             None,
             "an exact target-language vote tie must stay fail-closed"
         );
+    }
+
+    #[test]
+    fn punctuation_only_layout_switch_uses_an_explicit_target_language() {
+        let english = language_pack_from_entries(
+            LanguageId::try_new("en").unwrap(),
+            vec![DictionaryEntry::try_new("hello", 1).unwrap()],
+        )
+        .unwrap();
+        let russian = language_pack_from_entries(
+            LanguageId::try_new("ru").unwrap(),
+            vec![DictionaryEntry::try_new("привет", 1).unwrap()],
+        )
+        .unwrap();
+        let languages = [english, russian];
+
+        assert_eq!(
+            switch_keyboard_layout_text(&languages, "\"\""),
+            None,
+            "quote characters are physically ambiguous without a target layout"
+        );
+
+        let english_target = LanguageId::try_new("en").unwrap();
+        let to_english =
+            switch_keyboard_layout_text_to(&languages, "\"\"", &english_target).unwrap();
+        assert_eq!(to_english.text(), "@@");
+        assert_eq!(to_english.target_language(), &english_target);
+
+        let russian_target = LanguageId::try_new("ru").unwrap();
+        let to_russian = switch_keyboard_layout_text_to(&languages, "@@", &russian_target).unwrap();
+        assert_eq!(to_russian.text(), "\"\"");
+        assert_eq!(to_russian.target_language(), &russian_target);
+
+        for (source, expected) in [
+            ("~", "Ё"),
+            ("@", "\""),
+            ("#", "№"),
+            ("$", ";"),
+            ("^", ":"),
+            ("{", "Х"),
+            ("}", "Ъ"),
+            (":", "Ж"),
+            ("\"", "Э"),
+            ("<", "Б"),
+            (">", "Ю"),
+            ("?", ","),
+            ("&", "?"),
+        ] {
+            let switched =
+                switch_keyboard_layout_text_to(&languages, source, &russian_target).unwrap();
+            assert_eq!(switched.text(), expected, "source={source:?}");
+        }
+
+        for (source, expected) in [
+            ("Ё", "~"),
+            ("\"", "@"),
+            ("№", "#"),
+            (";", "$"),
+            (":", "^"),
+            ("Х", "{"),
+            ("Ъ", "}"),
+            ("Ж", ":"),
+            ("Э", "\""),
+            ("Б", "<"),
+            ("Ю", ">"),
+            (",", "?"),
+            ("?", "&"),
+        ] {
+            let switched =
+                switch_keyboard_layout_text_to(&languages, source, &english_target).unwrap();
+            assert_eq!(switched.text(), expected, "source={source:?}");
+        }
     }
 
     #[test]

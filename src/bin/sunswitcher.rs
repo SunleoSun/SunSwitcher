@@ -22,7 +22,9 @@ mod windows_app {
     };
     use sunswitcher::correction::{Confidence, CorrectionFeaturePolicy};
     use sunswitcher::input::InputEvent;
-    use sunswitcher::language::{KeyboardLayoutSwitch, switch_keyboard_layout_text};
+    use sunswitcher::language::{
+        KeyboardLayoutSwitch, switch_keyboard_layout_text, switch_keyboard_layout_text_to,
+    };
     use sunswitcher::persistence::{Database, ForgetWordOutcome, IgnoreWordOutcome};
     use sunswitcher::replacement::{ReplacementOutcome, UndoOutcome, UndoReplacementAction};
     use sunswitcher::settings::SettingsStore;
@@ -336,6 +338,16 @@ adaptive_learning
             let snapshot = self.runtime.snapshots().load().ok()?;
             switch_keyboard_layout_text(snapshot.languages(), text)
         }
+
+        fn switch_layout_text_to(
+            &self,
+            text: &str,
+            target_language: &sunswitcher::language::LanguageId,
+        ) -> Option<KeyboardLayoutSwitch> {
+            let snapshot = self.runtime.snapshots().load().ok()?;
+            switch_keyboard_layout_text_to(snapshot.languages(), text, target_language)
+        }
+
         fn tracked_layout_switch_text(&self) -> Option<String> {
             let text = self.session.current_layout_switch_span();
             (!text.is_empty()).then(|| text.to_owned())

@@ -2,10 +2,10 @@ mod database;
 
 pub use database::{
     AppSettings, ClipboardEntryContent, ClipboardEntryId, ClipboardEntryKind, ClipboardEntryList,
-    ClipboardEntryView, ClipboardHistoryLimit, ClipboardReorderPosition, CorrectionEventId,
-    CorrectionUndoPlan, Database, DatabaseError, ForgetWordOutcome, HotkeyAction, HotkeyBinding,
-    HotkeyConflict, HotkeyModifiers, IgnoreWordOutcome, NotificationTimeoutSeconds, SettingsError,
-    UndoHotkey,
+    ClipboardEntrySummary, ClipboardEntrySummaryContent, ClipboardEntryView, ClipboardHistoryLimit,
+    ClipboardReorderPosition, CorrectionEventId, CorrectionUndoPlan, Database, DatabaseError,
+    ForgetWordOutcome, HotkeyAction, HotkeyBinding, HotkeyConflict, HotkeyModifiers,
+    IgnoreWordOutcome, NotificationTimeoutSeconds, SettingsError, UndoHotkey,
 };
 
 #[cfg(test)]
