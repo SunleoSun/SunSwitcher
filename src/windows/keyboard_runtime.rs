@@ -444,21 +444,6 @@ impl RuntimeState {
         })
     }
 
-    fn completion_modifier_is_sunswitcher_only(&self, vk_code: u32) -> bool {
-        if !self.processor.completion_active() || !is_alt_modifier_key(vk_code) {
-            return false;
-        }
-        self.settings.load().is_ok_and(|settings| {
-            settings.enable_autocomplete()
-                && [
-                    HotkeyAction::CompletionAccept,
-                    HotkeyAction::CompletionNextWord,
-                ]
-                .into_iter()
-                .any(|action| settings.hotkey(action).modifiers().alt())
-        })
-    }
-
     fn observe_hotkey_capture(&self, vk_code: u32) -> HotkeyCaptureEffect {
         let control = self.keyboard_state[VK_CONTROL as usize] & 0x80 != 0;
         let shift = self.keyboard_state[VK_SHIFT as usize] & 0x80 != 0;
@@ -911,7 +896,6 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             DoubleShiftEvent::None
         };
         runtime.update_key_state(event.vkCode, is_key_down);
-        // Modifier reconciliation is deferred until the hook-observed chord has been checked.
         let hotkey_capture_effect = if is_key_down && is_physical_keyboard_event(event.flags) {
             runtime.observe_hotkey_capture(event.vkCode)
         } else {
@@ -924,22 +908,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         let mut undo_hotkey = false;
         let mut completion_hotkey = None;
         if is_key_down && !hotkey_capture_active {
+            if should_refresh_modifier_state_before_key_classification(event.vkCode) {
+                runtime.refresh_modifier_state_from_async();
+            }
             clipboard_hotkey = runtime.clipboard_hotkey_command(event.vkCode);
             ignore_hotkey = runtime.ignore_hotkey_matches(event.vkCode);
             undo_hotkey = runtime.undo_hotkey_matches(event.vkCode);
             completion_hotkey = runtime.completion_hotkey_command(event.vkCode);
-
-            let command_matched = clipboard_hotkey.is_some()
-                || ignore_hotkey
-                || undo_hotkey
-                || completion_hotkey.is_some();
-            if should_reconcile_modifier_state_after_hotkey_match(event.vkCode, command_matched) {
-                runtime.refresh_modifier_state_from_async();
-                clipboard_hotkey = runtime.clipboard_hotkey_command(event.vkCode);
-                ignore_hotkey = runtime.ignore_hotkey_matches(event.vkCode);
-                undo_hotkey = runtime.undo_hotkey_matches(event.vkCode);
-                completion_hotkey = runtime.completion_hotkey_command(event.vkCode);
-            }
         }
 
         if is_key_down
@@ -985,9 +960,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 dispatch_ignore: dispatch_ignore_after_keyup,
                 dispatch_undo: dispatch_undo_after_keyup,
             }
-        } else if double_shift == DoubleShiftEvent::Consume
-            || runtime.completion_modifier_is_sunswitcher_only(event.vkCode)
-        {
+        } else if double_shift == DoubleShiftEvent::Consume {
             runtime.suppress_keyup(event.vkCode, SuppressedKeyUpRoute::SunSwitcherOnly);
             HookEventState::SunSwitcherOnlyKeyDown
         } else if let Some(command) = clipboard_hotkey {
@@ -2167,14 +2140,6 @@ fn is_alt_modifier_key(vk_code: u32) -> bool {
         .any(|key| vk_code == key as u32)
 }
 
-#[cfg(test)]
-pub(super) fn completion_modifier_is_sunswitcher_only(
-    completion_active: bool,
-    vk_code: u32,
-) -> bool {
-    completion_active && is_alt_modifier_key(vk_code)
-}
-
 fn is_modifier_key(vk_code: u32) -> bool {
     is_shift_modifier_key(vk_code)
         || [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_LWIN, VK_RWIN]
@@ -2199,13 +2164,6 @@ pub(super) fn should_refresh_modifier_state_before_key_classification(vk_code: u
     !is_modifier_key(vk_code)
 }
 
-pub(super) fn should_reconcile_modifier_state_after_hotkey_match(
-    vk_code: u32,
-    command_matched: bool,
-) -> bool {
-    !command_matched && should_refresh_modifier_state_before_key_classification(vk_code)
-}
-
 pub(super) const fn suppressed_keyup_calls_downstream(
     suppression: Option<SuppressedKeyUpRoute>,
 ) -> bool {
@@ -2227,6 +2185,8 @@ pub(super) fn active_completion_passthrough_modifiers(keyboard_state: &[u8; 256]
         VK_RCONTROL,
         VK_LSHIFT,
         VK_RSHIFT,
+        VK_LMENU,
+        VK_RMENU,
         VK_LWIN,
         VK_RWIN,
     ]
@@ -2688,10 +2648,106 @@ pub(super) fn build_ctrl_shift_chord_inputs(key: u16) -> Vec<INPUT> {
     ]
 }
 
+const SYNTHETIC_MODIFIER_KEYS: [u16; 11] = [
+    VK_SHIFT,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_CONTROL,
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_MENU,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
+];
+
+fn synthetic_modifier_index(vk_code: u16) -> Option<usize> {
+    SYNTHETIC_MODIFIER_KEYS
+        .iter()
+        .position(|candidate| *candidate == vk_code)
+}
+
+fn modifier_state_before_injection(inputs: &[INPUT]) -> [bool; SYNTHETIC_MODIFIER_KEYS.len()] {
+    let mut used = [false; SYNTHETIC_MODIFIER_KEYS.len()];
+    for input in inputs {
+        if input.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        let key = unsafe { input.Anonymous.ki };
+        if let Some(index) = synthetic_modifier_index(key.wVk) {
+            used[index] = true;
+        }
+    }
+
+    std::array::from_fn(|index| {
+        used[index] && unsafe { GetAsyncKeyState(SYNTHETIC_MODIFIER_KEYS[index] as i32) } < 0
+    })
+}
+
+pub(super) fn partial_send_modifier_cleanup_keys(
+    inputs: &[INPUT],
+    sent: u32,
+    initially_down: &[bool; SYNTHETIC_MODIFIER_KEYS.len()],
+) -> Vec<u16> {
+    let mut balance = [0i16; SYNTHETIC_MODIFIER_KEYS.len()];
+    for input in inputs.iter().take(sent as usize) {
+        if input.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        let key = unsafe { input.Anonymous.ki };
+        let Some(index) = synthetic_modifier_index(key.wVk) else {
+            continue;
+        };
+        if key.dwFlags & KEYEVENTF_KEYUP != 0 {
+            balance[index] = balance[index].saturating_sub(1);
+        } else {
+            balance[index] = balance[index].saturating_add(1);
+        }
+    }
+
+    let mut cleanup = Vec::new();
+    for input in inputs.iter().take(sent as usize).rev() {
+        if input.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        let key = unsafe { input.Anonymous.ki };
+        let Some(index) = synthetic_modifier_index(key.wVk) else {
+            continue;
+        };
+        if balance[index] > 0 && !initially_down[index] && !cleanup.contains(&key.wVk) {
+            cleanup.push(key.wVk);
+        }
+    }
+    cleanup
+}
+
 fn send_inputs(inputs: &[INPUT]) -> Result<(), RuntimeError> {
+    let initially_down = modifier_state_before_injection(inputs);
     let expected = inputs.len() as u32;
     let sent = unsafe { SendInput(expected, inputs.as_ptr(), size_of::<INPUT>() as i32) };
     if sent != expected {
+        let cleanup_keys = partial_send_modifier_cleanup_keys(inputs, sent, &initially_down);
+        if !cleanup_keys.is_empty() {
+            let cleanup_inputs = cleanup_keys
+                .iter()
+                .map(|key| virtual_key_input(*key, true))
+                .collect::<Vec<_>>();
+            let cleanup_expected = cleanup_inputs.len() as u32;
+            let cleanup_sent = unsafe {
+                SendInput(
+                    cleanup_expected,
+                    cleanup_inputs.as_ptr(),
+                    size_of::<INPUT>() as i32,
+                )
+            };
+            crate::runtime_log!(
+                "SunSwitcher partial input injection cleanup expected={} sent={} modifiers={:?}",
+                cleanup_expected,
+                cleanup_sent,
+                cleanup_keys
+            );
+        }
         return Err(RuntimeError::InjectionFailed { expected, sent });
     }
     Ok(())

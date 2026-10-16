@@ -1,5 +1,5 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_CONTROL, VK_MENU, VK_OEM_1, VK_OEM_2, VK_OEM_3,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_CONTROL, VK_OEM_1, VK_OEM_2, VK_OEM_3,
     VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_TAB,
 };
 
@@ -7,12 +7,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
 
 use super::keyboard_runtime::{
     InputOwnershipStamp, KeyDownDisposition, RuntimeError, SuppressedKeyUpRoute,
-    build_replacement_inputs, completion_modifier_is_sunswitcher_only,
-    completion_result_passes_through, foreground_change_requires_invalidation,
-    ignore_hotkey_matches, injected_marker, input_ownership_matches,
-    is_foreign_injected_keyboard_event, keyup_suppression_after_injection, physical_key_from_vk,
-    preclassify_key_down, replacement_outcome_after_injection, suppressed_keyup_calls_downstream,
-    undo_hotkey_matches, undo_outcome_after_injection,
+    build_replacement_inputs, completion_result_passes_through,
+    foreground_change_requires_invalidation, ignore_hotkey_matches, injected_marker,
+    input_ownership_matches, is_foreign_injected_keyboard_event, keyup_suppression_after_injection,
+    physical_key_from_vk, preclassify_key_down, replacement_outcome_after_injection,
+    suppressed_keyup_calls_downstream, undo_hotkey_matches, undo_outcome_after_injection,
 };
 use crate::completion::CompletionCommandResult;
 use crate::correction::{CorrectionDecision, ReplacementText};
@@ -145,17 +144,7 @@ fn certification_foreign_injected_input_cannot_become_owned_text_state() {
 }
 
 #[test]
-fn certification_only_unhandled_completion_hotkeys_reach_the_foreground_application() {
-    assert!(completion_modifier_is_sunswitcher_only(
-        true,
-        VK_MENU as u32
-    ));
-    assert!(!completion_modifier_is_sunswitcher_only(
-        false,
-        VK_MENU as u32
-    ));
-    assert!(!completion_modifier_is_sunswitcher_only(true, b'A' as u32));
-
+fn certification_only_consumed_completion_triggers_are_withheld_from_foreground() {
     assert!(completion_result_passes_through(
         &CompletionCommandResult::Pass
     ));

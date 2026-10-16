@@ -23,9 +23,9 @@ use super::keyboard_runtime::{
     foreground_change_requires_invalidation, hotkey_binding_matches, ignore_hotkey_matches,
     injected_marker, input_ownership_matches, is_foreign_injected_keyboard_event,
     is_physical_keyboard_event, is_shift_modifier_key, is_toggle_key,
-    keyup_suppression_after_injection, mouse_message_invalidates_tracking, pause_hotkey_action,
-    physical_key_from_vk, preclassify_key_down, refresh_modifier_state_from,
-    selection_capture_intent_for_navigation, should_reconcile_modifier_state_after_hotkey_match,
+    keyup_suppression_after_injection, mouse_message_invalidates_tracking,
+    partial_send_modifier_cleanup_keys, pause_hotkey_action, physical_key_from_vk,
+    preclassify_key_down, refresh_modifier_state_from, selection_capture_intent_for_navigation,
     should_refresh_modifier_state_before_key_classification, undo_hotkey_matches,
     undo_outcome_after_injection, update_keyboard_state, word_hotkey_dispatch_ready,
 };
@@ -478,12 +478,10 @@ fn clipboard_manager_hotkey_mapping_uses_ctrl_shift_numpad_plus_minus() {
         clipboard_hotkey_command(VK_OEM_PLUS as u32, &state),
         Some(ClipboardCommand::OpenPinned)
     );
-    let current_command = clipboard_hotkey_command(VK_OEM_MINUS as u32, &state);
-    assert_eq!(current_command, Some(ClipboardCommand::OpenCurrent));
-    assert!(!should_reconcile_modifier_state_after_hotkey_match(
-        VK_OEM_MINUS as u32,
-        current_command.is_some(),
-    ));
+    assert_eq!(
+        clipboard_hotkey_command(VK_OEM_MINUS as u32, &state),
+        Some(ClipboardCommand::OpenCurrent)
+    );
     state[VK_MENU as usize] = 0x80;
     assert_eq!(clipboard_hotkey_command(VK_ADD as u32, &state), None);
 
@@ -648,23 +646,56 @@ fn configured_completion_inserts_immediately_with_ctrl_temporarily_released() {
 }
 
 #[test]
-fn matched_alt_right_completion_is_not_erased_by_async_reconciliation() {
+fn completion_passthrough_tracks_shift_and_alt_when_both_are_physically_down() {
+    let mut state = [0u8; 256];
+    update_keyboard_state(&mut state, VK_LSHIFT as u32, true);
+    update_keyboard_state(&mut state, VK_LMENU as u32, true);
+
+    assert_eq!(
+        active_completion_passthrough_modifiers(&state),
+        [VK_LSHIFT, VK_LMENU]
+    );
+}
+
+#[test]
+fn partial_synthetic_modifier_send_cleans_up_unbalanced_modifiers() {
+    let none_down = std::array::from_fn(|_| false);
+
+    let selection = build_backward_selection_inputs(4);
+    assert_eq!(
+        partial_send_modifier_cleanup_keys(&selection, 1, &none_down),
+        [VK_LSHIFT]
+    );
+    assert!(
+        partial_send_modifier_cleanup_keys(&selection, selection.len() as u32, &none_down)
+            .is_empty()
+    );
+
+    let chord = build_ctrl_shift_chord_inputs(b'C' as u16);
+    assert_eq!(
+        partial_send_modifier_cleanup_keys(&chord, 2, &none_down),
+        [VK_LSHIFT, VK_LCONTROL]
+    );
+}
+
+#[test]
+fn physical_alt_remains_os_owned_while_alt_right_completion_still_matches() {
     let mut state = [0u8; 256];
     update_keyboard_state(&mut state, VK_MENU as u32, true);
 
-    let command = completion_hotkey_command(VK_RIGHT as u32, &state);
-    assert_eq!(command, Some(CompletionCommand::AcceptNextWord));
-    assert!(!should_reconcile_modifier_state_after_hotkey_match(
-        VK_RIGHT as u32,
-        command.is_some(),
-    ));
-
-    let mut prematurely_reconciled = state;
-    refresh_modifier_state_from(&mut prematurely_reconciled, |_| false);
     assert_eq!(
-        completion_hotkey_command(VK_RIGHT as u32, &prematurely_reconciled),
-        None
+        completion_hotkey_command(VK_RIGHT as u32, &state),
+        Some(CompletionCommand::AcceptNextWord)
     );
+
+    refresh_modifier_state_from(&mut state, |vk_code| vk_code == VK_MENU);
+    assert_eq!(
+        completion_hotkey_command(VK_RIGHT as u32, &state),
+        Some(CompletionCommand::AcceptNextWord)
+    );
+    assert_eq!(completion_hotkey_command(VK_TAB as u32, &state), None);
+    assert!(state[VK_MENU as usize] & 0x80 != 0);
+    assert_eq!(active_completion_passthrough_modifiers(&state), [VK_LMENU]);
 }
 
 #[test]
@@ -831,7 +862,7 @@ fn tracked_layout_replacement_reuses_backspace_then_unicode_effect_path() {
 }
 
 #[test]
-fn completion_word_uses_only_unicode_while_physical_alt_is_owned_by_sunswitcher() {
+fn completion_word_uses_only_unicode_inputs() {
     let inputs = build_completion_word_inputs("лать ");
     assert_eq!(inputs.len(), "лать ".encode_utf16().count() * 2);
     assert!(inputs.iter().all(|input| {
