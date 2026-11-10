@@ -1,0 +1,16 @@
+{
+	"mcpServers": {
+		"sunmcp": {
+			"type": "stdio",
+			"command": "python",
+			"args": [
+				"C:\\Drive\\MyPrograms\\SunAgent\\crates\\sunagent-mcp\\native-tools\\mcp_server.py",
+				"--root-dir",
+				"C:\\Drive\\MyPrograms\\SunSwitcher"
+			],
+			"timeout": 100000,
+			"exposure": "codemode"
+		}
+	},
+	"inputs": []
+}
