@@ -17,6 +17,7 @@ mod windows_app {
         AdaptiveCompletionSession, AdaptiveCorrectionDirective, AdaptiveCorrectionSession,
         AdaptiveLexicalRuntime,
     };
+    use sunswitcher::application_policy::{ApplicationIdentity, global_correction_policy};
     use sunswitcher::completion::{
         CompletionApplyOutcome, CompletionCommand, CompletionCommandResult,
     };
@@ -137,6 +138,7 @@ mod windows_app {
         completion: AdaptiveCompletionSession,
         popup: AutocompletePopupHandle,
         settings: SettingsStore,
+        foreground_application: Option<ApplicationIdentity>,
         // Clipboard manager state lives in the shared UI runtime.
     }
 
@@ -149,8 +151,10 @@ mod windows_app {
                 .map_err(|error| format!("could not create app-data directory: {error}"))?;
             let database_path = app_data_dir.join("sunswitcher.db");
             let database = Database::open(&database_path).map_err(|error| error.to_string())?;
-            let initial_settings = database.settings().map_err(|error| error.to_string())?;
-            let settings = SettingsStore::new(initial_settings);
+            let settings = SettingsStore::from_database(
+                Database::open(&database_path).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
             let minimum_confidence = Confidence::try_new(0.80).expect("valid production threshold");
             let runtime = AdaptiveLexicalRuntime::start(database, minimum_confidence)
                 .map_err(|error| error.to_string())?;
@@ -242,6 +246,7 @@ adaptive_learning
                     completion,
                     popup,
                     settings: settings.clone(),
+                    foreground_application: None,
                     // Clipboard manager is owned by popup,
                 },
                 settings,
@@ -271,13 +276,15 @@ adaptive_learning
 
         fn correction_policy(&self) -> CorrectionFeaturePolicy {
             self.settings
+                .correction_policy(self.foreground_application.as_ref())
+        }
+
+        // Explicit Ignore rechecks retain the pre-existing global policy, not
+        // the foreground automatic-replacement override.
+        fn global_correction_policy(&self) -> CorrectionFeaturePolicy {
+            self.settings
                 .load()
-                .map(|settings| {
-                    CorrectionFeaturePolicy::new(
-                        settings.enable_autocorrections(),
-                        settings.enable_auto_keyboard_switches(),
-                    )
-                })
+                .map(global_correction_policy)
                 .unwrap_or_else(|_| CorrectionFeaturePolicy::new(false, false))
         }
     }
@@ -327,6 +334,10 @@ adaptive_learning
     }
 
     impl InputProcessor for SunSwitcherProcessor {
+        fn foreground_application_changed(&mut self, application: Option<ApplicationIdentity>) {
+            self.foreground_application = application;
+        }
+
         fn completion_active(&self) -> bool {
             self.settings
                 .load()
@@ -464,7 +475,7 @@ adaptive_learning
             let word = text.trim();
             let correction = self
                 .session
-                .recheck_text_layout_after_lexical_override(word, self.correction_policy())
+                .recheck_text_layout_after_lexical_override(word, self.global_correction_policy())
                 .ok()??;
             let target_language = correction.target_language()?;
             let snapshot = self.runtime.snapshots().load().ok()?;
@@ -483,7 +494,7 @@ adaptive_learning
 
         fn recheck_ignored_tracked_word(&mut self) -> RuntimeDirective {
             let observed_at_ms = now_ms();
-            let policy = self.correction_policy();
+            let policy = self.global_correction_policy();
             match self
                 .session
                 .recheck_current_layout_after_lexical_override(observed_at_ms, policy)

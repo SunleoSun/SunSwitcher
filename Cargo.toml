@@ -32,5 +32,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+sun-observations = "0.2.3"
+
 [profile.test]
 opt-level = 2

@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_USER, WM_XBUTTONDOWN,
 };
 
+use crate::application_policy::ApplicationIdentity;
 use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
 use crate::input::{Boundary, InputEvent, PhysicalKey, TypedCharacter};
 use crate::language::{KeyboardLayoutSwitch, LanguageId};
@@ -72,6 +73,8 @@ const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 
 pub trait InputProcessor: Send + 'static {
     fn process(&mut self, event: InputEvent) -> RuntimeDirective;
+
+    fn foreground_application_changed(&mut self, _application: Option<ApplicationIdentity>) {}
 
     fn replacement_outcome(&mut self, _outcome: ReplacementOutcome) {}
 
@@ -378,13 +381,17 @@ impl RuntimeState {
         settings: SettingsStore,
         hotkey_capture: HotkeyCaptureHandle,
     ) -> Self {
+        let foreground_window_id = current_foreground_window_id();
+        processor.foreground_application_changed(
+            super::foreground_application::observe_foreground_window(foreground_window_id),
+        );
         let _ = processor.process(InputEvent::Invalidate);
         Self {
             processor,
             keyboard_state: initial_keyboard_state(),
             suppressed_keyups: Vec::with_capacity(2),
             deferred_alt: None,
-            foreground_window_id: current_foreground_window_id(),
+            foreground_window_id,
             settings,
             hotkey_capture,
             input_revision: 0,
@@ -399,6 +406,11 @@ impl RuntimeState {
     fn sync_foreground_window(&mut self, current: usize) -> bool {
         let changed = foreground_change_requires_invalidation(self.foreground_window_id, current);
         self.foreground_window_id = current;
+        if changed {
+            self.processor.foreground_application_changed(
+                super::foreground_application::observe_foreground_window(current),
+            );
+        }
         changed
     }
 

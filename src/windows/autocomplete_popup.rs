@@ -387,6 +387,7 @@ impl AutocompletePopupHandle {
                 let clipboard = ClipboardManagerHandle::new(clipboard_state, repaint_ctx.clone());
                 let tray = TrayIcon::start(
                     clipboard.clone(),
+                    settings.clone(),
                     Arc::clone(&shutdown),
                     repaint_ctx.clone(),
                 );

@@ -35,29 +35,25 @@ If ownership is ambiguous, consolidate ownership before extending behavior.
 
 When SunSwitcher gains persistent state, the database is the canonical persistent source of truth.
 
-UI state and runtime state are derived views of the database and must not become competing authorities. UI mutations change canonical state first and then reflect it. Runtime snapshots/caches are allowed for latency-sensitive paths, but they contain no independent persistence semantics and must be fully reconstructable from database state. Persistent application preferences follow the same rule: `AppSettings` is the typed SQLite contract, and the shared `SettingsStore` is only its live in-memory projection. Save DB state before replacing the projection; consumers read the projection rather than creating their own preference copies or querying SQLite in hot paths.
+UI state and runtime state are derived views of the database and must not become competing authorities. UI mutations change canonical state first and then reflect it. Runtime snapshots/caches are allowed for latency-sensitive paths, but they contain no independent persistence semantics and must be fully reconstructable from database state. Persistent application preferences follow the same rule: `AppSettings` is the typed singleton global-settings contract, and the separate `application_replacement_suppressions` relation owns explicit per-executable automatic-replacement suppression. The shared `SettingsStore` holds their rebuildable RAM projections and one serialized persistence-first writer used by both Settings UI and tray. Derive mutations from the latest canonical projection; save DB state before publishing it. Consumers never maintain competing preference copies or query SQLite in hot paths. Foreground executable discovery/cache belongs to the Windows boundary; `application_policy.rs` derives a typed effective correction policy without teaching correction engines about processes. Application suppression disables both automatic replacement classes, never autocomplete or manual commands; the tray checkbox remains global.
 
 The keyboard hot path must not perform database I/O. It consumes validated in-memory runtime state produced from canonical database state, including the live settings projection used for configurable hotkeys and correction feature policy.
 
-## 4. Tests live beside their functional owner
+## 4. Semantic certifications live beside their owner
 
-Unit tests and certification tests are colocated with the implementation they verify. Do not use a global `tests/` directory for tests that belong to one functional owner.
+Verification follows semantic ownership rather than a separate unit-vs-certification hierarchy. The target form for one production owner is an owner-adjacent `<owner>_certification.rs`; do not create new standalone `*_tests.rs`, `*_test.rs`, or `*_certification_test.rs` modules.
 
-Example:
+When an in-scope legacy ordinary test module is encountered, preserve every still-meaningful regression, boundary, failure path, or contract by migrating it into the owning certification through the certification API, then remove the legacy module. Do not retain checks that only assert implementation detail or duplicate an already authoritative semantic proof.
 
-- `replacement/replacement_engine.rs`
-- `replacement/replacement_engine_tests.rs`
-- `replacement/replacement_engine_certification.rs`
+A separate composition certification is justified only for a genuine cross-owner contract. Within this crate those proofs belong under `src/composition_certifications/`; they prove the cross-owner promise without duplicating owner-local semantics.
 
-A separate application-level test location is justified only when a test genuinely spans multiple functional owners or an external application/OS boundary.
+## 5. SunObservations is the certification framework
 
-## 5. Unit tests and behavioral certification have different jobs
+SunSwitcher pins `sun-observations` for certification code and mirrors the package-owned `certifications-methodology`, `certifications-api`, `domain-api`, and `observations-api` skills under `.agents/skills/`.
 
-Unit tests verify local invariants, edge cases, validation, and small operations.
+Certifications prove semantic behavior on the real production path. Use canonical results/artifacts/state first; use typed Observations only when a proof-critical semantic fact otherwise disappears inside that path. Domain describes input families while certification checks describe what must hold. Existing good semantic certifications do not need rewriting merely to use newer DSL.
 
-Certification tests verify the behavior promised by a functional owner across representative conditions. Certification is contract-oriented: it tests externally observable semantics through the public/typed contract rather than depending on internal data structures or implementation details.
-
-A meaningful semantic change is incomplete until the relevant unit tests and behavioral certification are updated and passing.
+Observation types and emission points belong to the production semantic owner whose facts they describe. Certifications may capture, decode, analyze, and assert over those facts but must not create a verification-only execution path or duplicate owner behavior. The only `#[cfg(test)]` wiring permitted in a production owner is its owner-adjacent certification module.
 
 ## 6. Fail closed when input state is uncertain
 

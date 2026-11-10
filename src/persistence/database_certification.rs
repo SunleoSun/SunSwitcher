@@ -41,7 +41,7 @@ impl Drop for TempDatabasePath {
 fn certification_fresh_database_has_only_the_required_application_tables() {
     let path = TempDatabasePath::new("schema");
     let database = Database::open(path.as_path()).unwrap();
-    assert_eq!(database.schema_version().unwrap(), 8);
+    assert_eq!(database.schema_version().unwrap(), 9);
     drop(database);
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -60,6 +60,7 @@ fn certification_fresh_database_has_only_the_required_application_tables() {
         tables,
         [
             "app_settings",
+            "application_replacement_suppressions",
             "clipboard_entries",
             "clipboard_files",
             "clipboard_images",
@@ -159,7 +160,7 @@ fn certification_builtin_vocabulary_is_not_duplicated_in_sqlite() {
     let path = TempDatabasePath::new("builtin-dictionary-authority");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 8);
+        assert_eq!(database.schema_version().unwrap(), 9);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -178,7 +179,7 @@ fn certification_unknown_enabled_language_fails_closed() {
     let path = TempDatabasePath::new("unknown-language");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 8);
+        assert_eq!(database.schema_version().unwrap(), 9);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -272,7 +273,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     let path = TempDatabasePath::new("schema-v1-to-v2");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 8);
+        assert_eq!(database.schema_version().unwrap(), 9);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -282,7 +283,7 @@ fn certification_schema_v1_migrates_through_current_schema() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert_eq!(migrated.schema_version().unwrap(), 9);
     migrated.hide_completion_word("hello").unwrap();
     assert!(
         migrated
@@ -297,7 +298,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     let path = TempDatabasePath::new("schema-v2-grave-cleanup");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 8);
+        assert_eq!(database.schema_version().unwrap(), 9);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -315,7 +316,7 @@ fn certification_schema_v2_removes_legacy_grave_pollution_on_upgrade() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert_eq!(migrated.schema_version().unwrap(), 9);
     assert!(
         migrated
             .load_user_lexicon()
@@ -338,7 +339,7 @@ fn certification_schema_v4_drops_obsolete_dictionary_table() {
     let path = TempDatabasePath::new("schema-v4-dictionary-drop");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 8);
+        assert_eq!(database.schema_version().unwrap(), 9);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -356,7 +357,7 @@ fn certification_schema_v4_drops_obsolete_dictionary_table() {
     drop(raw);
 
     let migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert_eq!(migrated.schema_version().unwrap(), 9);
     drop(migrated);
     let raw = Connection::open(path.as_path()).unwrap();
     let exists: i64 = raw
@@ -374,7 +375,7 @@ fn certification_schema_v7_adds_persistent_ignored_words() {
     let path = TempDatabasePath::new("schema-v6-ignored-words");
     {
         let database = Database::open(path.as_path()).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 8);
+        assert_eq!(database.schema_version().unwrap(), 9);
     }
 
     let raw = Connection::open(path.as_path()).unwrap();
@@ -383,7 +384,7 @@ fn certification_schema_v7_adds_persistent_ignored_words() {
     drop(raw);
 
     let mut migrated = Database::open(path.as_path()).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 8);
+    assert_eq!(migrated.schema_version().unwrap(), 9);
     assert!(migrated.load_ignored_words().unwrap().is_empty());
     migrated.ignore_word("jr").unwrap();
     drop(migrated);
@@ -450,6 +451,170 @@ fn certification_settings_are_canonical_and_survive_reopen() {
 }
 
 #[test]
+fn certification_application_overrides_round_trip_deduplicate_remove_and_reopen() {
+    use sun_observations::certifications::*;
+    let mut c = certification(
+        "certification_application_overrides_round_trip_deduplicate_remove_and_reopen",
+    );
+    use crate::application_policy::ApplicationIdentity;
+    let path = TempDatabasePath::new("application-overrides");
+    let application = ApplicationIdentity::try_new(r"C:\Apps\Example.exe").unwrap();
+    let other = ApplicationIdentity::try_new(r"D:\Apps\Example.exe").unwrap();
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        c.check_fact_expect(
+            "fresh overrides are empty",
+            database
+                .load_application_overrides()
+                .unwrap()
+                .applications()
+                .count(),
+            0,
+        );
+        database
+            .set_application_suppressed(&application, true)
+            .unwrap();
+        database
+            .set_application_suppressed(
+                &ApplicationIdentity::try_new("c:/apps/EXAMPLE.EXE").unwrap(),
+                true,
+            )
+            .unwrap();
+        let overrides = database.load_application_overrides().unwrap();
+        c.check_fact_expect(
+            "normalized duplicates persist one row",
+            overrides.applications().count(),
+            1,
+        );
+        c.check_fact_expect(
+            "configured path suppresses",
+            overrides.suppresses(&application),
+            true,
+        );
+        c.check_fact_expect(
+            "same basename on another drive inherits",
+            !overrides.suppresses(&other),
+            true,
+        );
+        c.check_fact_expect(
+            "application writes preserve all globals",
+            database.settings().unwrap(),
+            AppSettings::default(),
+        );
+    }
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        c.check_fact_expect(
+            "suppression survives reopen",
+            database
+                .load_application_overrides()
+                .unwrap()
+                .suppresses(&application),
+            true,
+        );
+        database
+            .set_application_suppressed(&application, false)
+            .unwrap();
+        database
+            .set_application_suppressed(&application, false)
+            .unwrap();
+    }
+    c.check_fact_expect(
+        "idempotent removal survives reopen",
+        Database::open(path.as_path())
+            .unwrap()
+            .load_application_overrides()
+            .unwrap()
+            .applications()
+            .count(),
+        0,
+    );
+    c.assert_certify();
+}
+
+#[test]
+fn certification_v8_upgrades_application_relation_without_changing_global_settings() {
+    use sun_observations::certifications::*;
+    let mut c = certification(
+        "certification_v8_upgrades_application_relation_without_changing_global_settings",
+    );
+    let path = TempDatabasePath::new("v8-applications");
+    let expected = AppSettings::default().with_enable_autocorrections(false);
+    {
+        let database = Database::open(path.as_path()).unwrap();
+        database.save_settings(expected).unwrap();
+    }
+    {
+        let raw = Connection::open(path.as_path()).unwrap();
+        raw.execute_batch(
+            "DROP TABLE application_replacement_suppressions; PRAGMA user_version = 8;",
+        )
+        .unwrap();
+    }
+    for _ in 0..2 {
+        let database = Database::open(path.as_path()).unwrap();
+        c.check_fact_expect(
+            "v8 migrates to schema v9",
+            database.schema_version().unwrap(),
+            9,
+        );
+        c.check_fact_expect(
+            "migration preserves global settings",
+            database.settings().unwrap(),
+            expected,
+        );
+        c.check_fact_expect(
+            "v8 starts without overrides",
+            database
+                .load_application_overrides()
+                .unwrap()
+                .applications()
+                .count(),
+            0,
+        );
+    }
+    c.assert_certify();
+}
+
+#[test]
+fn certification_invalid_or_noncanonical_application_rows_fail_closed() {
+    use sun_observations::certifications::*;
+    let mut c = certification("certification_invalid_or_noncanonical_application_rows_fail_closed");
+    for invalid in [
+        "example.exe",
+        r"C:\Apps\..\example.exe",
+        r"C:\Apps\Example.exe",
+        "c:/apps/example.exe",
+        r"c:\apps\example.exe:stream",
+    ] {
+        let path = TempDatabasePath::new("invalid-application");
+        drop(Database::open(path.as_path()).unwrap());
+        let raw = Connection::open(path.as_path()).unwrap();
+        raw.execute(
+            "INSERT INTO application_replacement_suppressions VALUES (?1)",
+            [invalid],
+        )
+        .unwrap();
+        drop(raw);
+        let database = Database::open(path.as_path()).unwrap();
+        c.check_fact_expect(
+            "malformed row rejected by identity owner",
+            matches!(
+                database.load_application_overrides(),
+                Err(DatabaseError::InvalidStoredApplicationIdentity(_))
+            ),
+            true,
+        );
+        c.check_fact_expect(
+            "malformed row prevents runtime projection",
+            crate::settings::SettingsStore::from_database(database).is_err(),
+            true,
+        );
+    }
+    c.assert_certify();
+}
+
+#[test]
 fn certification_clipboard_child_rows_are_owned_by_parent_entry() {
     let path = TempDatabasePath::new("clipboard-foreign-keys");
     let database = Database::open(path.as_path()).unwrap();
@@ -492,7 +657,7 @@ fn certification_newer_database_schema_fails_closed() {
         error,
         DatabaseError::SchemaTooNew {
             found: 999,
-            supported: 8
+            supported: 9
         }
     ));
 }

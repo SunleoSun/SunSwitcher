@@ -23,6 +23,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow,
 };
 
+use super::foreground_application::recent_external_application;
+use crate::application_policy::ApplicationIdentity;
 use crate::persistence::{
     AppSettings, ClipboardEntryContent, ClipboardEntryId, ClipboardEntryList,
     ClipboardEntrySummary, ClipboardEntrySummaryContent, ClipboardEntryView,
@@ -197,6 +199,12 @@ impl ClipboardManagerHandle {
         self.repaint_ctx.request_repaint_of(ViewportId::ROOT);
     }
 
+    pub(crate) fn notify_settings_changed(&self) {
+        self.repaint_ctx.request_repaint_of(ViewportId::ROOT);
+        self.repaint_ctx
+            .request_repaint_of(SettingsView::viewport_id());
+    }
+
     pub fn notify_history_changed(&self) {
         let visible = match self.state.write() {
             Ok(mut state) => {
@@ -228,13 +236,12 @@ struct SettingsUiState {
     error: Option<String>,
     notification_timeout_edit: u32,
     notification_timeout_dirty: bool,
+    application_path: String,
     capture_keyboard_state: [bool; 256],
 }
 
 #[derive(Clone)]
 struct SettingsView {
-    database_path: PathBuf,
-    settings_database: Arc<Mutex<Option<Database>>>,
     settings: SettingsStore,
     hotkey_capture: HotkeyCaptureHandle,
     state: Arc<Mutex<SettingsUiState>>,
@@ -362,7 +369,7 @@ impl ClipboardManagerApp {
                 }
             }
         };
-        let settings_view = SettingsView::new(database_path.clone(), settings, hotkey_capture);
+        let settings_view = SettingsView::new(settings, hotkey_capture);
         Self {
             database_path,
             list_database,
@@ -1307,31 +1314,12 @@ impl ClipboardManagerApp {
 }
 
 impl SettingsView {
-    fn new(
-        database_path: PathBuf,
-        settings: SettingsStore,
-        hotkey_capture: HotkeyCaptureHandle,
-    ) -> Self {
+    fn new(settings: SettingsStore, hotkey_capture: HotkeyCaptureHandle) -> Self {
         let notification_timeout_edit = settings
             .load()
             .map(|settings| settings.notification_timeout_seconds().get())
             .unwrap_or(NotificationTimeoutSeconds::DEFAULT.get());
-        let settings_database = if database_path.as_os_str().is_empty() {
-            None
-        } else {
-            match Database::open(&database_path) {
-                Ok(database) => Some(database),
-                Err(error) => {
-                    crate::runtime_log!(
-                        "[settings] dedicated database connection unavailable at startup: {error}"
-                    );
-                    None
-                }
-            }
-        };
         Self {
-            database_path,
-            settings_database: Arc::new(Mutex::new(settings_database)),
             settings,
             hotkey_capture,
             state: Arc::new(Mutex::new(SettingsUiState {
@@ -1340,6 +1328,7 @@ impl SettingsView {
                 error: None,
                 notification_timeout_edit,
                 notification_timeout_dirty: false,
+                application_path: String::new(),
                 capture_keyboard_state: keyboard_down_snapshot(),
             })),
         }
@@ -1462,38 +1451,95 @@ impl SettingsView {
         state.capture_keyboard_state = current;
     }
 
-    fn persist_settings(&self, state: &mut SettingsUiState, next: AppSettings) -> bool {
-        let persistence = self
-            .settings_database
-            .lock()
-            .map_err(|_| "settings database connection is unavailable".to_owned())
-            .and_then(|mut database| {
-                if database.is_none() {
-                    *database = Some(
-                        Database::open(&self.database_path).map_err(|error| error.to_string())?,
-                    );
-                }
-                database
-                    .as_ref()
-                    .expect("settings database was initialized above")
-                    .save_settings(next)
-                    .map_err(|error| error.to_string())
-            });
-
-        match persistence {
-            Ok(()) => match self.settings.replace(next) {
-                Ok(()) => {
-                    state.error = None;
-                    true
-                }
-                Err(error) => {
-                    state.error = Some(error.to_string());
-                    false
-                }
-            },
+    fn persist_settings(
+        &self,
+        state: &mut SettingsUiState,
+        change: impl FnOnce(AppSettings) -> AppSettings,
+    ) -> bool {
+        match self.settings.update(change) {
+            Ok(_) => {
+                state.error = None;
+                true
+            }
             Err(error) => {
-                state.error = Some(error);
+                state.error = Some(error.to_string());
                 false
+            }
+        }
+    }
+
+    fn persist_application(
+        &self,
+        state: &mut SettingsUiState,
+        application: &ApplicationIdentity,
+        suppressed: bool,
+    ) {
+        state.error = self
+            .settings
+            .set_application_suppressed(application, suppressed)
+            .err()
+            .map(|error| error.to_string());
+    }
+
+    fn application_controls(&self, ui: &mut egui::Ui, state: &mut SettingsUiState) {
+        ui.add_space(12.0);
+        ui.heading("Applications");
+        ui.separator();
+        ui.label("Disable automatic replacements for selected applications. Autocomplete and manual actions remain available.");
+        ui.small("Unchecked Autocorrections also disables automatic keyboard switching. Re-enable/remove to inherit global settings.");
+        if let Some(application) = recent_external_application()
+            && ui
+                .button(format!("Disable for recent: {}", application.file_name()))
+                .on_hover_text(application.executable_path())
+                .clicked()
+        {
+            self.persist_application(state, &application, true);
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut state.application_path)
+                    .hint_text(r"Full executable path: C:\Apps\app.exe"),
+            );
+            if ui.button("Add / disable").clicked() {
+                // Accept the quoted paths produced by Explorer's Copy as path.
+                match ApplicationIdentity::try_new(state.application_path.trim().trim_matches('"'))
+                {
+                    Ok(application) => {
+                        self.persist_application(state, &application, true);
+                        if state.error.is_none() {
+                            state.application_path.clear();
+                        }
+                    }
+                    Err(error) => state.error = Some(error.to_string()),
+                }
+            }
+        });
+        match self.settings.application_overrides() {
+            Ok(overrides) => {
+                egui::Grid::new("application_autocorrections")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Application");
+                        ui.strong("Autocorrections");
+                        ui.end_row();
+                        for application in overrides.applications() {
+                            ui.label(application.file_name())
+                                .on_hover_text(application.executable_path());
+                            let mut enabled = false;
+                            if ui.checkbox(&mut enabled, "Inherit global").changed() {
+                                self.persist_application(state, application, false);
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                self.persist_application(state, application, false);
+                            }
+                            ui.end_row();
+                            ui.small(application.executable_path());
+                            ui.end_row();
+                        }
+                    });
+            }
+            Err(error) => {
+                ui.colored_label(Color32::LIGHT_RED, error.to_string());
             }
         }
     }
@@ -1557,8 +1603,10 @@ impl SettingsView {
                             });
                         } else {
                             let next = current.with_hotkey(action, binding);
-                            if self.persist_settings(state, next) {
-                                *current = next;
+                            if self.persist_settings(state, |settings| {
+                                settings.with_hotkey(action, binding)
+                            }) {
+                                *current = self.settings.load().unwrap_or(next);
                                 self.hotkey_capture.cancel();
                             }
                         }
@@ -1631,8 +1679,10 @@ impl SettingsView {
             .changed()
         {
             let next = current.with_enable_autocomplete(autocomplete);
-            if self.persist_settings(&mut state, next) {
-                current = next;
+            if self.persist_settings(&mut state, |settings| {
+                settings.with_enable_autocomplete(autocomplete)
+            }) {
+                current = self.settings.load().unwrap_or(next);
             }
         }
         let mut autocorrections = current.enable_autocorrections();
@@ -1641,8 +1691,10 @@ impl SettingsView {
             .changed()
         {
             let next = current.with_enable_autocorrections(autocorrections);
-            if self.persist_settings(&mut state, next) {
-                current = next;
+            if self.persist_settings(&mut state, |settings| {
+                settings.with_enable_autocorrections(autocorrections)
+            }) {
+                current = self.settings.load().unwrap_or(next);
             }
         }
         let mut auto_switches = current.enable_auto_keyboard_switches();
@@ -1651,10 +1703,14 @@ impl SettingsView {
             .changed()
         {
             let next = current.with_enable_auto_keyboard_switches(auto_switches);
-            if self.persist_settings(&mut state, next) {
-                current = next;
+            if self.persist_settings(&mut state, |settings| {
+                settings.with_enable_auto_keyboard_switches(auto_switches)
+            }) {
+                current = self.settings.load().unwrap_or(next);
             }
         }
+
+        self.application_controls(ui, &mut state);
 
         ui.add_space(12.0);
         ui.heading("Notifications");
@@ -1675,8 +1731,9 @@ impl SettingsView {
             {
                 match NotificationTimeoutSeconds::try_new(state.notification_timeout_edit) {
                     Ok(timeout) => {
-                        let next = current.with_notification_timeout_seconds(timeout);
-                        if self.persist_settings(&mut state, next) {
+                        if self.persist_settings(&mut state, |settings| {
+                            settings.with_notification_timeout_seconds(timeout)
+                        }) {
                             state.notification_timeout_dirty = false;
                         }
                     }
@@ -2402,6 +2459,89 @@ mod tests {
         let hotkey_capture =
             HotkeyCaptureHandle::new(HotkeyCaptureHandle::shared_state(), repaint_ctx);
         ClipboardManagerApp::new(std::path::PathBuf::new(), state, settings, hotkey_capture)
+    }
+
+    #[test]
+    fn certification_settings_controls_share_persistence_first_runtime_projection() {
+        use sun_observations::certifications::*;
+        let mut c = certification(
+            "certification_settings_controls_share_persistence_first_runtime_projection",
+        );
+        let settings = SettingsStore::from_database(Database::open_in_memory().unwrap()).unwrap();
+        let capture = HotkeyCaptureHandle::new(
+            HotkeyCaptureHandle::shared_state(),
+            egui::Context::default(),
+        );
+        let view = SettingsView::new(settings.clone(), capture);
+        let mut state = view.state.lock().unwrap();
+        let application = ApplicationIdentity::try_new("C:/Apps/example.exe").unwrap();
+        view.persist_application(&mut state, &application, true);
+        view.persist_application(&mut state, &application, true);
+        c.check_fact_expect("application writes confirmed", state.error.is_none(), true);
+        c.check_fact_expect(
+            "duplicate application remains one row",
+            settings
+                .application_overrides()
+                .unwrap()
+                .applications()
+                .count(),
+            1,
+        );
+        c.check_fact_expect(
+            "autocomplete stays enabled",
+            settings.load().unwrap().enable_autocomplete(),
+            true,
+        );
+        c.check_fact_expect(
+            "UI global toggle succeeds",
+            view.persist_settings(&mut state, |current| {
+                current.with_enable_autocorrections(false)
+            }),
+            true,
+        );
+        c.check_fact_expect(
+            "global autocorrections now OFF",
+            !settings.load().unwrap().enable_autocorrections(),
+            true,
+        );
+        c.check_fact_expect(
+            "global layout permission unchanged",
+            settings.load().unwrap().enable_auto_keyboard_switches(),
+            true,
+        );
+        view.persist_application(&mut state, &application, false);
+        c.check_fact_expect(
+            "enabling inheritance removes suppression",
+            settings
+                .application_overrides()
+                .unwrap()
+                .applications()
+                .count(),
+            0,
+        );
+
+        let detached = SettingsView::new(
+            SettingsStore::new(AppSettings::default()),
+            view.hotkey_capture.clone(),
+        );
+        c.check_fact_expect(
+            "unavailable writer rejects UI change",
+            !detached.persist_settings(&mut state, |current| {
+                current.with_enable_autocorrections(false)
+            }),
+            true,
+        );
+        c.check_fact_expect(
+            "UI reports persistence failure",
+            state.error.is_some(),
+            true,
+        );
+        c.check_fact_expect(
+            "failed UI write leaves global snapshot unchanged",
+            detached.settings.load().unwrap(),
+            AppSettings::default(),
+        );
+        c.assert_certify();
     }
 
     #[test]

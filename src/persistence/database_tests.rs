@@ -36,7 +36,7 @@ fn file_database_uses_wal_normal_and_in_memory_keeps_memory_journal() {
 fn default_settings_use_the_explicit_clipboard_history_limit() {
     let database = Database::open_in_memory().expect("fresh in-memory database should open");
 
-    assert_eq!(database.schema_version().unwrap(), 8);
+    assert_eq!(database.schema_version().unwrap(), 9);
     assert_eq!(
         database.settings().unwrap().clipboard_history_limit(),
         ClipboardHistoryLimit::DEFAULT

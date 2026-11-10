@@ -17,14 +17,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateIconFromResourceEx, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
     GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, IDI_APPLICATION,
-    LR_DEFAULTCOLOR, LoadIconW, MF_STRING, MSG, PostThreadMessageW, RegisterClassW, SM_CXSMICON,
-    SM_CYSMICON, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP,
-    WNDCLASSW, WS_OVERLAPPED,
+    LR_DEFAULTCOLOR, LoadIconW, MF_CHECKED, MF_GRAYED, MF_STRING, MSG, PostThreadMessageW,
+    RegisterClassW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_QUIT,
+    WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use super::clipboard_manager::{ClipboardManagerHandle, ClipboardManagerTab};
+use super::foreground_application::observe_foreground_window;
 use super::keyboard_runtime::request_global_keyboard_hook_stop;
+use crate::persistence::AppSettings;
+use crate::settings::{SettingsStore, SettingsWriteError};
 
 const TRAY_ID: u32 = 1;
 const WM_TRAY_ICON: u32 = WM_APP + 31;
@@ -33,10 +36,12 @@ const NIN_KEYSELECT: u32 = 0x0401;
 const TRAY_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const TRAY_ICON_ICO: &[u8] = include_bytes!("../../assets/clipboard.ico");
 const TRAY_EXIT_COMMAND: usize = 1001;
+const TRAY_AUTOCORRECTIONS_COMMAND: usize = 1002;
 
 #[derive(Clone)]
 struct TrayRuntimeState {
     clipboard: ClipboardManagerHandle,
+    settings: SettingsStore,
     shutdown: Arc<AtomicBool>,
     repaint_ctx: egui::Context,
 }
@@ -51,12 +56,14 @@ pub(crate) struct TrayIcon {
 impl TrayIcon {
     pub(crate) fn start(
         clipboard: ClipboardManagerHandle,
+        settings: SettingsStore,
         shutdown: Arc<AtomicBool>,
         repaint_ctx: egui::Context,
     ) -> Self {
         if let Ok(mut slot) = TRAY_STATE.lock() {
             *slot = Some(TrayRuntimeState {
                 clipboard,
+                settings,
                 shutdown,
                 repaint_ctx,
             });
@@ -159,6 +166,7 @@ unsafe extern "system" fn tray_window_proc(
         match (lparam as u32) & 0xFFFF {
             WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT => {
                 let target_window_id = unsafe { GetForegroundWindow() } as usize;
+                let _ = observe_foreground_window(target_window_id);
                 crate::runtime_log!(
                     "[tray] left click received target_window_id={} tray_hwnd={}",
                     target_window_id,
@@ -202,10 +210,25 @@ fn open_clipboard_from_tray(target_window_id: usize) {
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
+    let _ = observe_foreground_window(unsafe { GetForegroundWindow() } as usize);
+    let settings = TRAY_STATE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|state| state.settings.clone()));
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return;
     }
+    let autocorrections_label = wide_null("Autocorrections");
+    let flags = autocorrections_menu_flags(settings.as_ref());
+    unsafe {
+        AppendMenuW(
+            menu,
+            flags,
+            TRAY_AUTOCORRECTIONS_COMMAND,
+            autocorrections_label.as_ptr(),
+        )
+    };
     let exit_label = wide_null("Exit");
     unsafe { AppendMenuW(menu, MF_STRING, TRAY_EXIT_COMMAND, exit_label.as_ptr()) };
     let mut point: POINT = unsafe { zeroed() };
@@ -228,7 +251,31 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     unsafe { DestroyMenu(menu) };
     if command == TRAY_EXIT_COMMAND {
         request_exit_from_tray();
+    } else if command == TRAY_AUTOCORRECTIONS_COMMAND
+        && let Some(settings) = settings
+    {
+        if let Err(error) = toggle_autocorrections(&settings) {
+            crate::runtime_log!("[tray] autocorrections update failed: {error}");
+        }
+        if let Ok(slot) = TRAY_STATE.lock()
+            && let Some(state) = slot.as_ref()
+        {
+            state.clipboard.notify_settings_changed();
+        }
     }
+}
+
+fn autocorrections_menu_flags(settings: Option<&SettingsStore>) -> u32 {
+    match settings.and_then(|store| store.load().ok()) {
+        Some(settings) if settings.enable_autocorrections() => MF_STRING | MF_CHECKED,
+        Some(_) => MF_STRING,
+        None => MF_STRING | MF_GRAYED,
+    }
+}
+
+fn toggle_autocorrections(settings: &SettingsStore) -> Result<AppSettings, SettingsWriteError> {
+    settings
+        .update(|current| current.with_enable_autocorrections(!current.enable_autocorrections()))
 }
 
 fn request_exit_from_tray() {
@@ -347,6 +394,154 @@ fn write_wide_fixed(target: &mut [u16], text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certification_tray_checkbox_uses_canonical_global_state_not_application_policy() {
+        use sun_observations::certifications::*;
+        let mut c = certification(
+            "certification_tray_checkbox_uses_canonical_global_state_not_application_policy",
+        );
+        use crate::application_policy::ApplicationIdentity;
+        use crate::persistence::Database;
+        let settings = SettingsStore::from_database(Database::open_in_memory().unwrap()).unwrap();
+        c.check_fact_expect(
+            "fresh global setting is checked",
+            autocorrections_menu_flags(Some(&settings)) & MF_CHECKED,
+            NotEqual(0),
+        );
+        let application = ApplicationIdentity::try_new("C:/Apps/example.exe").unwrap();
+        settings
+            .set_application_suppressed(&application, true)
+            .unwrap();
+        c.check_fact_expect(
+            "effective app policy suppresses both classes",
+            settings.correction_policy(Some(&application)),
+            crate::correction::CorrectionFeaturePolicy::new(false, false),
+        );
+        c.check_fact_expect(
+            "app override never unchecks global tray state",
+            autocorrections_menu_flags(Some(&settings)) & MF_CHECKED,
+            NotEqual(0),
+        );
+        toggle_autocorrections(&settings).unwrap();
+        c.check_fact_expect(
+            "toggle OFF renders unchecked",
+            autocorrections_menu_flags(Some(&settings)) & MF_CHECKED,
+            0,
+        );
+        c.check_fact_expect(
+            "toggle changes only global autocorrections",
+            settings.load().unwrap(),
+            AppSettings::default().with_enable_autocorrections(false),
+        );
+        toggle_autocorrections(&settings).unwrap();
+        c.check_fact_expect(
+            "toggle back restores global default",
+            settings.load().unwrap(),
+            AppSettings::default(),
+        );
+        c.check_fact_expect(
+            "global toggle preserves app suppression",
+            settings
+                .application_overrides()
+                .unwrap()
+                .suppresses(&application),
+            true,
+        );
+
+        settings
+            .update(|current| current.with_enable_autocorrections(false))
+            .unwrap();
+        c.check_fact_expect(
+            "Settings update appears on next tray refresh",
+            autocorrections_menu_flags(Some(&settings)) & MF_CHECKED,
+            0,
+        );
+        c.check_fact_expect(
+            "unavailable snapshot disables tray command",
+            autocorrections_menu_flags(None) & MF_GRAYED,
+            NotEqual(0),
+        );
+        let detached = SettingsStore::new(AppSettings::default());
+        c.check_fact_expect(
+            "unavailable writer rejects tray change",
+            toggle_autocorrections(&detached).is_err(),
+            true,
+        );
+        c.check_fact_expect(
+            "failed tray change leaves checkmark unchanged",
+            autocorrections_menu_flags(Some(&detached)) & MF_CHECKED,
+            NotEqual(0),
+        );
+        c.assert_certify();
+    }
+
+    #[test]
+    fn certification_tray_toggle_persists_and_failed_sqlite_update_preserves_checkmark() {
+        use crate::persistence::Database;
+        use sun_observations::certifications::*;
+        let mut c = certification("tray toggles canonical settings before publishing");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sunswitcher-tray-{}-{nonce}.db",
+            std::process::id()
+        ));
+        let settings = SettingsStore::from_database(Database::open(&path).unwrap()).unwrap();
+        toggle_autocorrections(&settings).unwrap();
+        let reopened = SettingsStore::from_database(Database::open(&path).unwrap()).unwrap();
+        c.check_fact_expect(
+            "OFF persists and renders unchecked after reopen",
+            autocorrections_menu_flags(Some(&reopened)) & MF_CHECKED,
+            0,
+        );
+        c.check_fact_expect(
+            "only global autocorrections changed",
+            reopened.load().unwrap(),
+            AppSettings::default().with_enable_autocorrections(false),
+        );
+        drop(reopened);
+        toggle_autocorrections(&settings).unwrap();
+        c.check_fact_expect(
+            "ON persists",
+            Database::open(&path).unwrap().settings().unwrap(),
+            AppSettings::default(),
+        );
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch("CREATE TRIGGER reject_tray BEFORE UPDATE ON app_settings BEGIN SELECT RAISE(FAIL, 'test write failure'); END;").unwrap();
+        c.check_fact_expect(
+            "SQLite failure reported",
+            matches!(
+                toggle_autocorrections(&settings),
+                Err(SettingsWriteError::Database(
+                    crate::persistence::DatabaseError::Sqlite(_)
+                ))
+            ),
+            true,
+        );
+        c.check_fact_expect(
+            "checkmark remains checked after failure",
+            autocorrections_menu_flags(Some(&settings)) & MF_CHECKED,
+            NotEqual(0),
+        );
+        c.check_fact_expect(
+            "failed toggle leaves canonical state unchanged",
+            Database::open(&path).unwrap().settings().unwrap(),
+            AppSettings::default(),
+        );
+        drop(raw);
+        drop(settings);
+        for file in [
+            &path,
+            &path.with_extension("db-wal"),
+            &path.with_extension("db-shm"),
+        ] {
+            let _ = std::fs::remove_file(file);
+        }
+        c.assert_certify();
+    }
 
     #[test]
     fn embedded_tray_icon_contains_usable_sizes() {

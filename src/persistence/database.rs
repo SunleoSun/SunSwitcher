@@ -5,13 +5,19 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
+use crate::application_policy::{ApplicationIdentity, ApplicationOverrides};
 use crate::completion::sequence::{SequenceCandidate, SequenceHistory, SequenceHistoryError};
 use crate::language::{
     LanguageId, LanguagePack, LanguagePackError, builtin_language_pack, normalize_word,
 };
 use crate::lexicon::{IgnoredWords, UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
+const SCHEMA_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS application_replacement_suppressions (
+    executable_path TEXT PRIMARY KEY NOT NULL CHECK (length(executable_path) > 0)
+) STRICT;
+"#;
 const SCHEMA_V1: &str = r#"
 CREATE TABLE app_settings (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -957,6 +963,7 @@ pub enum DatabaseError {
         normalized_term: String,
     },
     MissingAppSettings,
+    InvalidStoredApplicationIdentity(String),
 }
 
 impl Display for DatabaseError {
@@ -1021,6 +1028,9 @@ impl Display for DatabaseError {
                 "stored normalized dictionary term {normalized_term:?} does not match {term:?}"
             ),
             Self::MissingAppSettings => formatter.write_str("app settings row is missing"),
+            Self::InvalidStoredApplicationIdentity(path) => {
+                write!(formatter, "invalid stored application identity: {path:?}")
+            }
         }
     }
 }
@@ -1108,6 +1118,44 @@ impl Database {
             .connection
             .pragma_query_value(None, "synchronous", |row| row.get(0))?;
         Ok((journal_mode, synchronous))
+    }
+
+    pub fn load_application_overrides(&self) -> Result<ApplicationOverrides, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT executable_path FROM application_replacement_suppressions ORDER BY executable_path",
+        )?;
+        let paths = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut applications = Vec::new();
+        for path in paths {
+            let path = path?;
+            let identity = ApplicationIdentity::try_new(&path)
+                .map_err(|_| DatabaseError::InvalidStoredApplicationIdentity(path.clone()))?;
+            // Stored keys must already be canonical: never silently merge corrupt aliases.
+            if identity.executable_path() != path {
+                return Err(DatabaseError::InvalidStoredApplicationIdentity(path));
+            }
+            applications.push(identity);
+        }
+        Ok(ApplicationOverrides::from_applications(applications))
+    }
+
+    pub fn set_application_suppressed(
+        &self,
+        application: &ApplicationIdentity,
+        suppressed: bool,
+    ) -> Result<(), DatabaseError> {
+        if suppressed {
+            self.connection.execute(
+                "INSERT INTO application_replacement_suppressions (executable_path) VALUES (?1) ON CONFLICT DO NOTHING",
+                [application.executable_path()],
+            )?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM application_replacement_suppressions WHERE executable_path = ?1",
+                [application.executable_path()],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn settings(&self) -> Result<AppSettings, DatabaseError> {
@@ -2352,6 +2400,14 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
             }
         }
         transaction.pragma_update(None, "user_version", 8)?;
+        transaction.commit()?;
+        version = 8;
+    }
+
+    if version < 9 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V9)?;
+        transaction.pragma_update(None, "user_version", 9)?;
         transaction.commit()?;
     }
 

@@ -2,6 +2,7 @@ mod autocomplete_popup;
 mod caret_locator;
 mod clipboard_listener;
 mod clipboard_manager;
+mod foreground_application;
 mod hotkey_capture;
 mod keyboard_runtime;
 mod selected_text_runtime;
