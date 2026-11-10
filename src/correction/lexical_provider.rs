@@ -277,6 +277,11 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
                 {
                     continue;
                 }
+                if variant.layout_penalty == 0.0
+                    && is_learned_russian_ending_variant(&variant.text, entry.normalized_term())
+                {
+                    continue;
+                }
                 let edit_cost = weighted_damerau_cost(&variant.text, entry.normalized_term());
                 if edit_cost > max_edit_cost + f32::EPSILON {
                     continue;
@@ -594,6 +599,35 @@ fn digit_signature_matches(observed: &str, target: &str) -> bool {
         .eq(target
             .chars()
             .filter(|character| character.is_ascii_digit()))
+}
+
+fn is_learned_russian_ending_variant(observed: &str, target: &str) -> bool {
+    const MIN_COMMON_STEM_CHARS: usize = 5;
+    const MAX_ENDING_CHARS: usize = 2;
+
+    if !is_russian_alphabetic(observed) || !is_russian_alphabetic(target) {
+        return false;
+    }
+
+    let common_prefix_chars = observed
+        .chars()
+        .zip(target.chars())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let observed_ending_chars = observed.chars().count().saturating_sub(common_prefix_chars);
+    let target_ending_chars = target.chars().count().saturating_sub(common_prefix_chars);
+
+    common_prefix_chars >= MIN_COMMON_STEM_CHARS
+        && observed_ending_chars <= MAX_ENDING_CHARS
+        && target_ending_chars <= MAX_ENDING_CHARS
+        && (observed_ending_chars != 0 || target_ending_chars != 0)
+}
+
+fn is_russian_alphabetic(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|character| matches!(character, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
 }
 
 #[derive(Debug, Clone)]

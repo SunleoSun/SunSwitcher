@@ -232,6 +232,47 @@ fn exact_cross_layout_user_word_preserves_unmapped_digits() {
 }
 
 #[test]
+fn learned_russian_word_does_not_capture_short_ending_variants() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("проинспектил", 100).unwrap();
+    let provider = LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap();
+
+    for observed in ["проинспекти", "проинспектим"] {
+        let token = CompletedToken::new(observed, Boundary::Character(' '));
+        let candidates = provider.candidates(&token);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.replacement().as_str() != "проинспектил"),
+            "learned ending must not capture {observed:?}: {candidates:?}"
+        );
+    }
+}
+
+#[test]
+fn learned_russian_word_still_corrects_internal_typos() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("проинспектил", 100).unwrap();
+    let provider = LexicalCorrectionProvider::try_new(
+        database.load_enabled_language_packs().unwrap(),
+        database.load_user_lexicon().unwrap(),
+    )
+    .unwrap();
+    let token = CompletedToken::new("проинсепктил", Boundary::Character(' '));
+
+    assert!(
+        provider
+            .candidates(&token)
+            .iter()
+            .any(|candidate| candidate.replacement().as_str() == "проинспектил")
+    );
+}
+
+#[test]
 fn learned_user_word_replacement_uses_observed_case_not_first_stored_case() {
     let database = Database::open_in_memory().unwrap();
     database.record_user_word("CustomToken", 100).unwrap();

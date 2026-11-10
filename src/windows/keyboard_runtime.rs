@@ -350,10 +350,17 @@ impl MouseSelectionTracker {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredAlt {
+    vk_code: u16,
+    consumed_by_sunswitcher: bool,
+}
+
 struct RuntimeState {
     processor: Box<dyn InputProcessor>,
     keyboard_state: [u8; 256],
     suppressed_keyups: Vec<SuppressedKeyUp>,
+    deferred_alt: Option<DeferredAlt>,
     foreground_window_id: usize,
     settings: SettingsStore,
     hotkey_capture: HotkeyCaptureHandle,
@@ -376,6 +383,7 @@ impl RuntimeState {
             processor,
             keyboard_state: initial_keyboard_state(),
             suppressed_keyups: Vec::with_capacity(2),
+            deferred_alt: None,
             foreground_window_id: current_foreground_window_id(),
             settings,
             hotkey_capture,
@@ -399,9 +407,11 @@ impl RuntimeState {
     }
 
     fn refresh_modifier_state_from_async(&mut self) {
-        refresh_modifier_state_from(&mut self.keyboard_state, |vk_code| unsafe {
-            GetAsyncKeyState(vk_code as i32) < 0
-        });
+        refresh_modifier_state_preserving_deferred_alt(
+            &mut self.keyboard_state,
+            self.deferred_alt.map(|deferred| deferred.vk_code),
+            |vk_code| unsafe { GetAsyncKeyState(vk_code as i32) < 0 },
+        );
     }
 
     fn command_modifier_active(&self) -> bool {
@@ -417,6 +427,36 @@ impl RuntimeState {
             return None;
         }
         configured_completion_hotkey_command(vk_code, &self.keyboard_state, settings)
+    }
+
+    fn should_defer_alt_for_completion(&self, vk_code: u32) -> bool {
+        if !is_alt_modifier_key(vk_code) || !self.processor.completion_active() {
+            return false;
+        }
+        self.settings.load().is_ok_and(|settings| {
+            settings.enable_autocomplete() && configured_completion_uses_alt(settings)
+        })
+    }
+
+    fn defer_alt(&mut self, vk_code: u32) {
+        if self.deferred_alt.is_none() {
+            self.deferred_alt = Some(DeferredAlt {
+                vk_code: vk_code as u16,
+                consumed_by_sunswitcher: false,
+            });
+        }
+    }
+
+    fn mark_deferred_alt_consumed(&mut self) {
+        if let Some(deferred) = self.deferred_alt.as_mut() {
+            deferred.consumed_by_sunswitcher = true;
+        }
+    }
+
+    fn take_deferred_alt_for_keyup(&mut self, vk_code: u32) -> Option<DeferredAlt> {
+        self.deferred_alt
+            .filter(|deferred| is_matching_alt_identity(deferred.vk_code, vk_code))
+            .and_then(|_| self.deferred_alt.take())
     }
 
     fn clipboard_hotkey_command(&self, vk_code: u32) -> Option<ClipboardCommand> {
@@ -684,6 +724,17 @@ pub(super) fn refresh_modifier_state_from(state: &mut [u8; 256], is_down: impl F
     refresh_modifier_pair(state, VK_LWIN, VK_RWIN, &is_down);
 }
 
+pub(super) fn refresh_modifier_state_preserving_deferred_alt(
+    state: &mut [u8; 256],
+    deferred_alt_vk: Option<u16>,
+    is_down: impl Fn(u16) -> bool,
+) {
+    refresh_modifier_state_from(state, is_down);
+    if let Some(vk_code) = deferred_alt_vk {
+        update_keyboard_state(state, u32::from(vk_code), true);
+    }
+}
+
 fn refresh_modifier_group(
     state: &mut [u8; 256],
     generic: u16,
@@ -768,6 +819,13 @@ pub fn run_global_keyboard_hook(
                         invalidate_runtime_tracking();
                         continue;
                     }
+                    if let Err(error) = send_modifier_keyups(&[VK_LSHIFT, VK_RSHIFT]) {
+                        crate::runtime_log!(
+                            "[double-shift] failed to normalize downstream Shift state: {error:?}"
+                        );
+                        invalidate_runtime_tracking();
+                        continue;
+                    }
                     switch_selected_or_previous_text();
                     continue;
                 }
@@ -843,6 +901,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
     }
 
+    let physical_shift_release = is_physical_shift_release(event.vkCode, event.flags, is_key_up);
+
     if is_foreign_injected_keyboard_event(event.flags, event.dwExtraInfo) {
         // Ask downstream hooks first: if one suppresses the injected transition, it must not
         // become part of our modifier/toggle state. The attempted foreign edit still invalidates
@@ -863,6 +923,19 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             let _ = runtime.processor.process(InputEvent::Invalidate);
         }
         return next_result;
+    }
+
+    if is_physical_keyboard_event(event.flags) && is_shift_modifier_key(event.vkCode) {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] physical vk=0x{:02X} transition={} async_shift={} async_lshift={} async_rshift={} flags=0x{:X}",
+            event.vkCode,
+            if is_key_down { "down" } else { "up" },
+            shift,
+            left,
+            right,
+            event.flags
+        );
     }
 
     let state = {
@@ -902,6 +975,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             HotkeyCaptureEffect::Inactive
         };
         let hotkey_capture_active = hotkey_capture_effect != HotkeyCaptureEffect::Inactive;
+        let defer_alt_down = is_key_down
+            && !hotkey_capture_active
+            && is_physical_keyboard_event(event.flags)
+            && runtime.should_defer_alt_for_completion(event.vkCode);
+        if defer_alt_down {
+            runtime.defer_alt(event.vkCode);
+        }
 
         let mut clipboard_hotkey = None;
         let mut ignore_hotkey = false;
@@ -939,6 +1019,28 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             );
             runtime.clear_undo_word_dispatch();
         }
+        let matched_non_completion_hotkey =
+            clipboard_hotkey.is_some() || ignore_hotkey || undo_hotkey;
+        if is_key_down && matched_non_completion_hotkey && runtime.deferred_alt.is_some() {
+            runtime.mark_deferred_alt_consumed();
+        }
+        let deferred_alt_keyup = if is_key_up {
+            runtime.take_deferred_alt_for_keyup(event.vkCode)
+        } else {
+            None
+        };
+        let deferred_alt_replay_keydown = if is_key_down
+            && !is_modifier_key(event.vkCode)
+            && completion_hotkey.is_none()
+            && !matched_non_completion_hotkey
+        {
+            runtime
+                .deferred_alt
+                .take()
+                .map(|deferred| (deferred.vk_code, event.vkCode as u16))
+        } else {
+            None
+        };
         let dispatch_ignore_after_keyup =
             is_key_up && runtime.take_ignore_word_dispatch_when_modifiers_released();
         let dispatch_undo_after_keyup =
@@ -954,6 +1056,20 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         } else if double_shift == DoubleShiftEvent::Trigger {
             let _ = runtime.take_suppressed_keyup(event.vkCode);
             HookEventState::DoubleShift
+        } else if defer_alt_down {
+            HookEventState::SunSwitcherOnlyKeyDown
+        } else if let Some(deferred) = deferred_alt_keyup {
+            if deferred.consumed_by_sunswitcher {
+                HookEventState::KeyUp {
+                    suppression: Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+                    dispatch_ignore: dispatch_ignore_after_keyup,
+                    dispatch_undo: dispatch_undo_after_keyup,
+                }
+            } else {
+                HookEventState::ReplayDeferredAltTap {
+                    alt_vk: deferred.vk_code,
+                }
+            }
         } else if is_key_up {
             HookEventState::KeyUp {
                 suppression: runtime.take_suppressed_keyup(event.vkCode),
@@ -973,11 +1089,21 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         } else if undo_hotkey {
             HookEventState::UndoHotkey { ownership_stamp }
         } else if let Some(command) = completion_hotkey {
+            let deferred_alt_vk = runtime.deferred_alt.map(|deferred| deferred.vk_code);
+            let mut modifier_keys =
+                active_completion_passthrough_modifiers(&runtime.keyboard_state);
+            if deferred_alt_vk.is_some() {
+                modifier_keys.retain(|key| !is_alt_modifier_key(u32::from(*key)));
+            }
             HookEventState::CompletionHotkey {
                 command,
                 ownership_stamp,
-                modifier_keys: active_completion_passthrough_modifiers(&runtime.keyboard_state),
+                modifier_keys,
+                trigger_vk: event.vkCode as u16,
+                deferred_alt_vk,
             }
+        } else if let Some((alt_vk, key_vk)) = deferred_alt_replay_keydown {
+            HookEventState::ReplayDeferredAltKeyDown { alt_vk, key_vk }
         } else {
             if is_key_down && is_state_invalidating_key(event.vkCode) {
                 let had_tracked_span = runtime.processor.tracked_layout_switch_text().is_some();
@@ -1011,7 +1137,15 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             dispatch_ignore,
             dispatch_undo,
         } => {
-            if !suppressed_keyup_calls_downstream(suppression) {
+            let forced_physical_shift_release = physical_shift_release
+                && matches!(suppression, Some(SuppressedKeyUpRoute::SunSwitcherOnly));
+            if forced_physical_shift_release {
+                crate::runtime_log!(
+                    "[shift-trace] physical Shift-up forced downstream despite SunSwitcherOnly suppression vk=0x{:02X}",
+                    event.vkCode
+                );
+            }
+            if !keyup_calls_downstream(suppression, physical_shift_release) {
                 let ignore_queued = !dispatch_ignore || queue_ignore_word_dispatch();
                 let undo_queued = !dispatch_undo || queue_undo_word_dispatch();
                 if !ignore_queued || !undo_queued {
@@ -1034,18 +1168,53 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                     invalidate_runtime_tracking();
                 }
             }
-            if suppression.is_some() {
+            if keyup_suppresses_foreground(suppression, physical_shift_release) {
                 1
             } else {
                 next_result
             }
         }
-        HookEventState::SunSwitcherOnlyKeyDown => 1,
+        HookEventState::SunSwitcherOnlyKeyDown => {
+            if physical_shift_release {
+                crate::runtime_log!(
+                    "[shift-trace] physical Shift-up bypassed SunSwitcher-only hook suppression vk=0x{:02X}",
+                    event.vkCode
+                );
+                unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) }
+            } else {
+                1
+            }
+        }
+        HookEventState::ReplayDeferredAltKeyDown { alt_vk, key_vk } => {
+            if let Err(error) = replay_deferred_alt_keydown(alt_vk, key_vk) {
+                crate::runtime_log!("SunSwitcher deferred Alt chord replay failed: {error:?}");
+                invalidate_runtime_tracking();
+            }
+            1
+        }
+        HookEventState::ReplayDeferredAltTap { alt_vk } => {
+            if let Err(error) = replay_deferred_alt_tap(alt_vk) {
+                crate::runtime_log!("SunSwitcher deferred Alt tap replay failed: {error:?}");
+                invalidate_runtime_tracking();
+            }
+            1
+        }
         HookEventState::DoubleShift => {
             // The gesture fires while the second physical Shift key-up is still inside the
-            // low-level hook callback. Never run SendInput/clipboard capture from that callback:
-            // queue the editing effect so injected selection/copy events can be processed only
-            // after the hook returns and Windows completes the physical modifier transition.
+            // low-level hook callback. The physical release itself must continue through the
+            // downstream hook chain and remain unsuppressed; only the editing effect is deferred.
+            let next_result = if physical_shift_release {
+                crate::runtime_log!(
+                    "[shift-trace] Double Shift physical release passed downstream vk=0x{:02X}",
+                    event.vkCode
+                );
+                unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) }
+            } else {
+                1
+            };
+            // Never run SendInput/clipboard capture from this callback: queue the editing effect
+            // so injected selection/copy events can be processed only after the hook returns and
+            // Windows completes the physical modifier transition.
             let thread_id = HOOK_THREAD_ID.load(Ordering::Acquire);
             let shift_down_in_hook = unsafe { GetAsyncKeyState(VK_SHIFT as i32) } < 0;
             let queued = thread_id != 0
@@ -1059,7 +1228,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                 );
                 invalidate_runtime_tracking();
             }
-            1
+            next_result
         }
         HookEventState::KeyDownPass => {
             let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
@@ -1097,6 +1266,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
             command,
             ownership_stamp,
             modifier_keys,
+            trigger_vk,
+            deferred_alt_vk,
         } => {
             if !runtime_input_ownership_unchanged(ownership_stamp) {
                 invalidate_runtime_tracking();
@@ -1116,9 +1287,30 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
                         .map(|runtime| runtime.processor.completion_command(command))
                 })
                 .unwrap_or(CompletionCommandResult::Pass);
+            if deferred_alt_vk.is_some()
+                && !completion_result_passes_through(&result)
+                && let Ok(mut runtime_slot) = RUNTIME.lock()
+                && let Some(runtime) = runtime_slot.as_mut()
+            {
+                runtime.mark_deferred_alt_consumed();
+            }
             match result {
                 CompletionCommandResult::Pass => {
                     debug_assert!(completion_result_passes_through(&result));
+                    if let Some(alt_vk) = deferred_alt_vk {
+                        if let Ok(mut runtime_slot) = RUNTIME.lock()
+                            && let Some(runtime) = runtime_slot.as_mut()
+                        {
+                            runtime.deferred_alt = None;
+                        }
+                        if let Err(error) = replay_deferred_alt_keydown(alt_vk, trigger_vk) {
+                            crate::runtime_log!(
+                                "SunSwitcher deferred Alt completion pass replay failed: {error:?}"
+                            );
+                            invalidate_runtime_tracking();
+                        }
+                        return 1;
+                    }
                     let next_result = unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
                     if next_result != 0 {
                         invalidate_runtime_tracking();
@@ -1365,6 +1557,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
 #[derive(Debug)]
 enum HookEventState {
     SunSwitcherOnlyKeyDown,
+    ReplayDeferredAltKeyDown {
+        alt_vk: u16,
+        key_vk: u16,
+    },
+    ReplayDeferredAltTap {
+        alt_vk: u16,
+    },
     DoubleShift,
     KeyDownPass,
     KeyDownReplace {
@@ -1389,6 +1588,8 @@ enum HookEventState {
         command: CompletionCommand,
         ownership_stamp: InputOwnershipStamp,
         modifier_keys: Vec<u16>,
+        trigger_vk: u16,
+        deferred_alt_vk: Option<u16>,
     },
     KeyUp {
         suppression: Option<SuppressedKeyUpRoute>,
@@ -2140,6 +2341,10 @@ fn is_alt_modifier_key(vk_code: u32) -> bool {
         .any(|key| vk_code == key as u32)
 }
 
+fn is_matching_alt_identity(deferred_vk: u16, observed_vk: u32) -> bool {
+    observed_vk == deferred_vk as u32 || observed_vk == VK_MENU as u32 || deferred_vk == VK_MENU
+}
+
 fn is_modifier_key(vk_code: u32) -> bool {
     is_shift_modifier_key(vk_code)
         || [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_LWIN, VK_RWIN]
@@ -2164,10 +2369,25 @@ pub(super) fn should_refresh_modifier_state_before_key_classification(vk_code: u
     !is_modifier_key(vk_code)
 }
 
-pub(super) const fn suppressed_keyup_calls_downstream(
+pub(super) fn is_physical_shift_release(vk_code: u32, flags: u32, is_key_up: bool) -> bool {
+    is_key_up && is_physical_keyboard_event(flags) && is_shift_modifier_key(vk_code)
+}
+
+pub(super) const fn keyup_calls_downstream(
     suppression: Option<SuppressedKeyUpRoute>,
+    physical_shift_release: bool,
 ) -> bool {
-    !matches!(suppression, Some(SuppressedKeyUpRoute::SunSwitcherOnly))
+    // A physical Shift release is authoritative foreground state. Even if SunSwitcher has a
+    // stale SunSwitcherOnly key-up reservation, hiding the real release can leave the target
+    // application believing Shift is still held until the user presses Shift again.
+    physical_shift_release || !matches!(suppression, Some(SuppressedKeyUpRoute::SunSwitcherOnly))
+}
+
+pub(super) const fn keyup_suppresses_foreground(
+    suppression: Option<SuppressedKeyUpRoute>,
+    physical_shift_release: bool,
+) -> bool {
+    suppression.is_some() && !physical_shift_release
 }
 
 fn modifier_state(keyboard_state: &[u8; 256]) -> (bool, bool, bool, bool) {
@@ -2263,6 +2483,15 @@ pub(super) fn clipboard_hotkey_command(
     keyboard_state: &[u8; 256],
 ) -> Option<ClipboardCommand> {
     configured_clipboard_hotkey_command(vk_code, keyboard_state, AppSettings::default())
+}
+
+fn configured_completion_uses_alt(settings: AppSettings) -> bool {
+    [
+        HotkeyAction::CompletionAccept,
+        HotkeyAction::CompletionNextWord,
+    ]
+    .into_iter()
+    .any(|action| settings.hotkey(action).modifiers().alt())
 }
 
 pub(super) fn configured_completion_hotkey_command(
@@ -2476,17 +2705,88 @@ fn inject_tracked_text_replacement(
 }
 
 fn inject_completion_suffix(text: &str, modifier_keys: &[u16]) -> Result<(), RuntimeError> {
-    send_inputs(&build_completion_inputs_with_released_modifiers(
-        text,
-        modifier_keys,
-    ))
+    inject_completion_text(text, modifier_keys)
 }
 
 fn inject_completion_word(text: &str, modifier_keys: &[u16]) -> Result<(), RuntimeError> {
-    send_inputs(&build_completion_inputs_with_released_modifiers(
-        text,
-        modifier_keys,
-    ))
+    inject_completion_text(text, modifier_keys)
+}
+
+fn inject_completion_text(text: &str, modifier_keys: &[u16]) -> Result<(), RuntimeError> {
+    let trace_shift = modifier_keys
+        .iter()
+        .any(|key| is_shift_modifier_key(u32::from(*key)));
+    if trace_shift {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] completion begin modifiers={modifier_keys:?} async_shift={shift} async_lshift={left} async_rshift={right}"
+        );
+    }
+
+    let injection_result = send_inputs_preserving_pressed_modifiers(
+        &build_completion_inputs_with_modifier_release(text, modifier_keys),
+    );
+    if trace_shift {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] completion after-release-unicode ok={} async_shift={shift} async_lshift={left} async_rshift={right}",
+            injection_result.is_ok()
+        );
+    }
+
+    let restore_result = restore_physically_down_completion_modifiers(modifier_keys);
+    if trace_shift {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] completion end restore_ok={} async_shift={shift} async_lshift={left} async_rshift={right}",
+            restore_result.is_ok()
+        );
+    }
+    injection_result.and(restore_result)
+}
+
+fn restore_physically_down_completion_modifiers(modifier_keys: &[u16]) -> Result<(), RuntimeError> {
+    let trace_shift = modifier_keys
+        .iter()
+        .any(|key| is_shift_modifier_key(u32::from(*key)));
+    let restore_keys = completion_modifier_restore_keys(modifier_keys, |key| unsafe {
+        GetAsyncKeyState(key as i32) < 0
+    });
+
+    if trace_shift {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] completion restore-decision candidates={modifier_keys:?} selected={restore_keys:?} async_shift={shift} async_lshift={left} async_rshift={right}"
+        );
+    }
+
+    if restore_keys.is_empty() {
+        return Ok(());
+    }
+
+    let restore_inputs = restore_keys
+        .iter()
+        .map(|key| virtual_key_input(*key, false))
+        .collect::<Vec<_>>();
+    if let Err(error) = send_inputs_preserving_pressed_modifiers(&restore_inputs) {
+        if trace_shift {
+            crate::runtime_log!(
+                "[shift-trace] completion restore-send failed selected={restore_keys:?} error={error:?}"
+            );
+        }
+        return Err(error);
+    }
+
+    let released_during_restore = completion_modifier_restore_keys(&restore_keys, |key| unsafe {
+        GetAsyncKeyState(key as i32) >= 0
+    });
+    if trace_shift {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] completion restore-post selected={restore_keys:?} compensate={released_during_restore:?} async_shift={shift} async_lshift={left} async_rshift={right}"
+        );
+    }
+    send_modifier_keyups(&released_during_restore)
 }
 
 pub(super) fn build_completion_suffix_inputs(text: &str) -> Vec<INPUT> {
@@ -2503,24 +2803,31 @@ pub(super) fn build_completion_word_inputs(text: &str) -> Vec<INPUT> {
     build_completion_suffix_inputs(text)
 }
 
-pub(super) fn build_completion_inputs_with_released_modifiers(
+pub(super) fn build_completion_inputs_with_modifier_release(
     text: &str,
     modifier_keys: &[u16],
 ) -> Vec<INPUT> {
     let mut inputs = Vec::with_capacity(
         modifier_keys
             .len()
-            .saturating_mul(2)
             .saturating_add(text.encode_utf16().count().saturating_mul(2)),
     );
     for &key in modifier_keys.iter().rev() {
         inputs.push(virtual_key_input(key, true));
     }
     inputs.extend(build_completion_suffix_inputs(text));
-    for &key in modifier_keys {
-        inputs.push(virtual_key_input(key, false));
-    }
     inputs
+}
+
+pub(super) fn completion_modifier_restore_keys(
+    modifier_keys: &[u16],
+    is_down: impl Fn(u16) -> bool,
+) -> Vec<u16> {
+    modifier_keys
+        .iter()
+        .copied()
+        .filter(|key| is_down(*key))
+        .collect()
 }
 
 pub(super) fn build_selected_text_inputs(text: &str) -> Vec<INPUT> {
@@ -2722,35 +3029,164 @@ pub(super) fn partial_send_modifier_cleanup_keys(
     cleanup
 }
 
-fn send_inputs(inputs: &[INPUT]) -> Result<(), RuntimeError> {
+pub(super) fn synthetic_modifier_safety_release_keys(inputs: &[INPUT]) -> Vec<u16> {
+    let mut first_transition = [None; SYNTHETIC_MODIFIER_KEYS.len()];
+    for input in inputs {
+        if input.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        let key = unsafe { input.Anonymous.ki };
+        let Some(index) = synthetic_modifier_index(key.wVk) else {
+            continue;
+        };
+        first_transition[index].get_or_insert(key.dwFlags & KEYEVENTF_KEYUP != 0);
+    }
+
+    let mut cleanup = Vec::new();
+    for input in inputs.iter().rev() {
+        if input.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        let key = unsafe { input.Anonymous.ki };
+        let Some(index) = synthetic_modifier_index(key.wVk) else {
+            continue;
+        };
+        let was_pressed_by_sunswitcher = first_transition[index] == Some(false);
+        if was_pressed_by_sunswitcher
+            && key.dwFlags & KEYEVENTF_KEYUP == 0
+            && !cleanup.contains(&key.wVk)
+        {
+            cleanup.push(key.wVk);
+        }
+    }
+    cleanup
+}
+
+fn async_shift_snapshot() -> (bool, bool, bool) {
+    unsafe {
+        (
+            GetAsyncKeyState(VK_SHIFT as i32) < 0,
+            GetAsyncKeyState(VK_LSHIFT as i32) < 0,
+            GetAsyncKeyState(VK_RSHIFT as i32) < 0,
+        )
+    }
+}
+
+fn synthetic_shift_transitions(inputs: &[INPUT]) -> Vec<(u16, bool)> {
+    inputs
+        .iter()
+        .filter_map(|input| {
+            if input.r#type != INPUT_KEYBOARD {
+                return None;
+            }
+            let key = unsafe { input.Anonymous.ki };
+            is_shift_modifier_key(u32::from(key.wVk))
+                .then_some((key.wVk, key.dwFlags & KEYEVENTF_KEYUP != 0))
+        })
+        .collect()
+}
+
+fn send_modifier_keyups(keys: &[u16]) -> Result<(), RuntimeError> {
+    let trace_shift = keys
+        .iter()
+        .any(|key| is_shift_modifier_key(u32::from(*key)));
+    if trace_shift {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] modifier-keyups begin keys={keys:?} async_shift={shift} async_lshift={left} async_rshift={right}"
+        );
+    }
+
+    let inputs = keys
+        .iter()
+        .map(|key| virtual_key_input(*key, true))
+        .collect::<Vec<_>>();
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let expected = inputs.len() as u32;
+    let sent = unsafe { SendInput(expected, inputs.as_ptr(), size_of::<INPUT>() as i32) };
+
+    if trace_shift {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] modifier-keyups end keys={keys:?} sent={sent}/{expected} async_shift={shift} async_lshift={left} async_rshift={right}"
+        );
+    }
+
+    if sent != expected {
+        return Err(RuntimeError::InjectionFailed { expected, sent });
+    }
+    Ok(())
+}
+
+fn send_inputs_preserving_pressed_modifiers(inputs: &[INPUT]) -> Result<(), RuntimeError> {
+    let shift_transitions = synthetic_shift_transitions(inputs);
+    if !shift_transitions.is_empty() {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] SendInput begin transitions={shift_transitions:?} async_shift={shift} async_lshift={left} async_rshift={right}"
+        );
+    }
+
     let initially_down = modifier_state_before_injection(inputs);
     let expected = inputs.len() as u32;
     let sent = unsafe { SendInput(expected, inputs.as_ptr(), size_of::<INPUT>() as i32) };
     if sent != expected {
+        if !shift_transitions.is_empty() {
+            let (shift, left, right) = async_shift_snapshot();
+            crate::runtime_log!(
+                "[shift-trace] SendInput partial transitions={shift_transitions:?} sent={sent}/{expected} async_shift={shift} async_lshift={left} async_rshift={right}"
+            );
+        }
         let cleanup_keys = partial_send_modifier_cleanup_keys(inputs, sent, &initially_down);
         if !cleanup_keys.is_empty() {
-            let cleanup_inputs = cleanup_keys
-                .iter()
-                .map(|key| virtual_key_input(*key, true))
-                .collect::<Vec<_>>();
-            let cleanup_expected = cleanup_inputs.len() as u32;
-            let cleanup_sent = unsafe {
-                SendInput(
-                    cleanup_expected,
-                    cleanup_inputs.as_ptr(),
-                    size_of::<INPUT>() as i32,
-                )
-            };
-            crate::runtime_log!(
-                "SunSwitcher partial input injection cleanup expected={} sent={} modifiers={:?}",
-                cleanup_expected,
-                cleanup_sent,
-                cleanup_keys
-            );
+            let _ = send_modifier_keyups(&cleanup_keys);
         }
         return Err(RuntimeError::InjectionFailed { expected, sent });
     }
+
+    if !shift_transitions.is_empty() {
+        let (shift, left, right) = async_shift_snapshot();
+        crate::runtime_log!(
+            "[shift-trace] SendInput end transitions={shift_transitions:?} sent={sent}/{expected} async_shift={shift} async_lshift={left} async_rshift={right}"
+        );
+    }
     Ok(())
+}
+
+fn send_inputs(inputs: &[INPUT]) -> Result<(), RuntimeError> {
+    send_inputs_preserving_pressed_modifiers(inputs)?;
+
+    let safety_release_keys = synthetic_modifier_safety_release_keys(inputs);
+    if let Err(error) = send_modifier_keyups(&safety_release_keys) {
+        crate::runtime_log!("SunSwitcher synthetic modifier safety release failed: {error:?}");
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(super) fn build_deferred_alt_keydown_inputs(alt_vk: u16, key_vk: u16) -> Vec<INPUT> {
+    vec![
+        virtual_key_input(key_vk, true),
+        virtual_key_input(alt_vk, false),
+        virtual_key_input(key_vk, false),
+    ]
+}
+
+pub(super) fn build_deferred_alt_tap_inputs(alt_vk: u16) -> Vec<INPUT> {
+    vec![
+        virtual_key_input(alt_vk, false),
+        virtual_key_input(alt_vk, true),
+    ]
+}
+
+fn replay_deferred_alt_keydown(alt_vk: u16, key_vk: u16) -> Result<(), RuntimeError> {
+    send_inputs_preserving_pressed_modifiers(&build_deferred_alt_keydown_inputs(alt_vk, key_vk))
+}
+
+fn replay_deferred_alt_tap(alt_vk: u16) -> Result<(), RuntimeError> {
+    send_inputs(&build_deferred_alt_tap_inputs(alt_vk))
 }
 
 pub(super) fn build_live_prefix_replacement_inputs(
@@ -2805,6 +3241,8 @@ fn virtual_key_input(key: u16, key_up: bool) -> INPUT {
             | VK_RIGHT
             | VK_UP
             | VK_DOWN
+            | VK_RCONTROL
+            | VK_RMENU
     );
     input.Anonymous.ki = KEYBDINPUT {
         wVk: key,

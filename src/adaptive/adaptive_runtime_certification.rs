@@ -556,6 +556,28 @@ fn certification_typed_plain_word_becomes_a_typo_target_after_one_kept_use() {
 }
 
 #[test]
+fn certification_learned_russian_ending_variant_is_kept_and_learned() {
+    let database = Database::open_in_memory().unwrap();
+    database.record_user_word("проинспектил", 10).unwrap();
+    let runtime =
+        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
+    let mut session = runtime.session();
+
+    assert_eq!(
+        type_token(&mut session, "проинспекти", 100),
+        AdaptiveCorrectionDirective::Pass
+    );
+    runtime.flush().unwrap();
+
+    let snapshot = runtime.snapshots().load().unwrap();
+    assert!(snapshot.user_lexicon().contains_normalized("проинспектил"));
+    assert!(
+        snapshot.user_lexicon().contains_normalized("проинспекти"),
+        "a kept Russian ending variant must enter user_words without manual intervention"
+    );
+}
+
+#[test]
 fn certification_copied_plain_word_becomes_a_typo_target_after_text_observation() {
     let runtime = AdaptiveLexicalRuntime::start(
         Database::open_in_memory().unwrap(),

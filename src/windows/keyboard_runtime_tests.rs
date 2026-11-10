@@ -14,20 +14,24 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::keyboard_runtime::{
     ClipboardCommand, DoubleShiftEvent, DoubleShiftTracker, InputOwnershipStamp,
     KeyDownDisposition, MouseSelectionEffect, MouseSelectionTracker, PauseHotkeyAction,
-    RuntimeError, active_completion_passthrough_modifiers, build_backward_selection_inputs,
-    build_completion_inputs_with_released_modifiers, build_completion_suffix_inputs,
-    build_completion_word_inputs, build_ctrl_chord_inputs, build_ctrl_shift_chord_inputs,
-    build_previous_caret_range_replacement_inputs, build_replacement_inputs,
-    build_tracked_text_replacement_inputs, clipboard_hotkey_command, completion_hotkey_command,
+    RuntimeError, SuppressedKeyUpRoute, active_completion_passthrough_modifiers,
+    build_backward_selection_inputs, build_completion_inputs_with_modifier_release,
+    build_completion_suffix_inputs, build_completion_word_inputs, build_ctrl_chord_inputs,
+    build_ctrl_shift_chord_inputs, build_deferred_alt_keydown_inputs,
+    build_deferred_alt_tap_inputs, build_previous_caret_range_replacement_inputs,
+    build_replacement_inputs, build_tracked_text_replacement_inputs, clipboard_hotkey_command,
+    completion_hotkey_command, completion_modifier_restore_keys,
     configured_clipboard_hotkey_command, configured_completion_hotkey_command,
     foreground_change_requires_invalidation, hotkey_binding_matches, ignore_hotkey_matches,
     injected_marker, input_ownership_matches, is_foreign_injected_keyboard_event,
-    is_physical_keyboard_event, is_shift_modifier_key, is_toggle_key,
-    keyup_suppression_after_injection, mouse_message_invalidates_tracking,
-    partial_send_modifier_cleanup_keys, pause_hotkey_action, physical_key_from_vk,
-    preclassify_key_down, refresh_modifier_state_from, selection_capture_intent_for_navigation,
-    should_refresh_modifier_state_before_key_classification, undo_hotkey_matches,
-    undo_outcome_after_injection, update_keyboard_state, word_hotkey_dispatch_ready,
+    is_physical_keyboard_event, is_physical_shift_release, is_shift_modifier_key, is_toggle_key,
+    keyup_calls_downstream, keyup_suppresses_foreground, keyup_suppression_after_injection,
+    mouse_message_invalidates_tracking, partial_send_modifier_cleanup_keys, pause_hotkey_action,
+    physical_key_from_vk, preclassify_key_down, refresh_modifier_state_from,
+    refresh_modifier_state_preserving_deferred_alt, selection_capture_intent_for_navigation,
+    should_refresh_modifier_state_before_key_classification,
+    synthetic_modifier_safety_release_keys, undo_hotkey_matches, undo_outcome_after_injection,
+    update_keyboard_state, word_hotkey_dispatch_ready,
 };
 use super::selected_text_runtime::SelectionCaptureIntent;
 use crate::completion::CompletionCommand;
@@ -311,6 +315,20 @@ fn generic_physical_alt_reconciliation_preserves_alt_right_completion_command() 
     assert_ne!(state[VK_MENU as usize] & 0x80, 0);
     assert_ne!(state[VK_LMENU as usize] & 0x80, 0);
     assert_eq!(state[VK_RMENU as usize] & 0x80, 0);
+    assert_eq!(
+        completion_hotkey_command(VK_RIGHT as u32, &state),
+        Some(CompletionCommand::AcceptNextWord)
+    );
+}
+
+#[test]
+fn deferred_alt_remains_active_when_async_state_cannot_see_suppressed_alt_down() {
+    let mut state = [0u8; 256];
+    refresh_modifier_state_preserving_deferred_alt(&mut state, Some(VK_LMENU), |_| false);
+
+    assert_ne!(state[VK_MENU as usize] & 0x80, 0);
+    assert_ne!(state[VK_LMENU as usize] & 0x80, 0);
+    assert_eq!(completion_hotkey_command(VK_TAB as u32, &state), None);
     assert_eq!(
         completion_hotkey_command(VK_RIGHT as u32, &state),
         Some(CompletionCommand::AcceptNextWord)
@@ -621,28 +639,31 @@ fn completion_hotkeys_require_exact_default_modifier_contract() {
 }
 
 #[test]
-fn configured_completion_inserts_immediately_with_ctrl_temporarily_released() {
+fn configured_completion_releases_ctrl_before_text_and_restores_only_if_still_physical() {
     let mut state = [0u8; 256];
     update_keyboard_state(&mut state, VK_CONTROL as u32, true);
     let modifiers = active_completion_passthrough_modifiers(&state);
     assert_eq!(modifiers, [VK_LCONTROL]);
 
-    let inputs = build_completion_inputs_with_released_modifiers(" next", &modifiers);
+    let inputs = build_completion_inputs_with_modifier_release(" next", &modifiers);
     let first = unsafe { inputs.first().unwrap().Anonymous.ki };
-    let last = unsafe { inputs.last().unwrap().Anonymous.ki };
     assert_eq!(first.wVk, VK_LCONTROL);
     assert_ne!(first.dwFlags & KEYEVENTF_KEYUP, 0);
-    assert_eq!(last.wVk, VK_LCONTROL);
-    assert_eq!(last.dwFlags & KEYEVENTF_KEYUP, 0);
-    assert!(inputs[1..inputs.len() - 1].iter().all(|input| {
+    assert!(inputs[1..].iter().all(|input| {
         let key = unsafe { input.Anonymous.ki };
         key.wVk == 0 && key.dwFlags & KEYEVENTF_UNICODE != 0
     }));
-    let injected_units = inputs[1..inputs.len() - 1]
+    let injected_units = inputs[1..]
         .chunks_exact(2)
         .map(|pair| unsafe { pair[0].Anonymous.ki.wScan })
         .collect::<Vec<_>>();
     assert_eq!(String::from_utf16(&injected_units).unwrap(), " next");
+
+    assert_eq!(
+        completion_modifier_restore_keys(&modifiers, |key| key == VK_LCONTROL),
+        [VK_LCONTROL]
+    );
+    assert!(completion_modifier_restore_keys(&modifiers, |_| false).is_empty());
 }
 
 #[test]
@@ -679,7 +700,49 @@ fn partial_synthetic_modifier_send_cleans_up_unbalanced_modifiers() {
 }
 
 #[test]
-fn physical_alt_remains_os_owned_while_alt_right_completion_still_matches() {
+fn successful_synthetic_modifier_batches_get_idempotent_safety_keyups() {
+    let selection = build_backward_selection_inputs(4);
+    assert_eq!(
+        synthetic_modifier_safety_release_keys(&selection),
+        [VK_LSHIFT]
+    );
+
+    let chord = build_ctrl_shift_chord_inputs(b'C' as u16);
+    assert_eq!(
+        synthetic_modifier_safety_release_keys(&chord),
+        [VK_LSHIFT, VK_LCONTROL]
+    );
+
+    let physical_shift = build_completion_inputs_with_modifier_release(" next", &[VK_LSHIFT]);
+    assert!(synthetic_modifier_safety_release_keys(&physical_shift).is_empty());
+}
+
+#[test]
+fn deferred_alt_replay_restores_system_chord_without_leaking_a_bare_alt() {
+    let inputs = build_deferred_alt_keydown_inputs(VK_LMENU, VK_TAB);
+    assert_eq!(inputs.len(), 3);
+
+    let trigger_up = unsafe { inputs[0].Anonymous.ki };
+    let alt_down = unsafe { inputs[1].Anonymous.ki };
+    let trigger_down = unsafe { inputs[2].Anonymous.ki };
+    assert_eq!(trigger_up.wVk, VK_TAB);
+    assert_ne!(trigger_up.dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_eq!(alt_down.wVk, VK_LMENU);
+    assert_eq!(alt_down.dwFlags & KEYEVENTF_KEYUP, 0);
+    assert_eq!(trigger_down.wVk, VK_TAB);
+    assert_eq!(trigger_down.dwFlags & KEYEVENTF_KEYUP, 0);
+
+    let tap = build_deferred_alt_tap_inputs(VK_RMENU);
+    assert_eq!(tap.len(), 2);
+    for input in tap {
+        let key = unsafe { input.Anonymous.ki };
+        assert_eq!(key.wVk, VK_RMENU);
+        assert_ne!(key.dwFlags & KEYEVENTF_EXTENDEDKEY, 0);
+    }
+}
+
+#[test]
+fn physical_alt_state_still_matches_alt_right_completion() {
     let mut state = [0u8; 256];
     update_keyboard_state(&mut state, VK_MENU as u32, true);
 
@@ -702,6 +765,49 @@ fn physical_alt_remains_os_owned_while_alt_right_completion_still_matches() {
 fn double_shift_ignores_injected_keyboard_transitions() {
     assert!(is_physical_keyboard_event(0));
     assert!(!is_physical_keyboard_event(LLKHF_INJECTED));
+}
+
+#[test]
+fn physical_shift_keyup_always_reaches_downstream_and_foreground() {
+    for vk_code in [VK_SHIFT, VK_LSHIFT, VK_RSHIFT] {
+        let physical_release = is_physical_shift_release(vk_code as u32, 0, true);
+        assert!(physical_release);
+        assert!(keyup_calls_downstream(
+            Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+            physical_release,
+        ));
+        assert!(!keyup_suppresses_foreground(
+            Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+            physical_release,
+        ));
+
+        assert!(!is_physical_shift_release(
+            vk_code as u32,
+            LLKHF_INJECTED,
+            true,
+        ));
+        assert!(!is_physical_shift_release(vk_code as u32, 0, false));
+    }
+
+    let ordinary_keyup = false;
+    assert!(!keyup_calls_downstream(
+        Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+        ordinary_keyup,
+    ));
+    assert!(keyup_suppresses_foreground(
+        Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+        ordinary_keyup,
+    ));
+    assert!(keyup_calls_downstream(
+        Some(SuppressedKeyUpRoute::DownstreamThenSuppress),
+        ordinary_keyup,
+    ));
+    assert!(keyup_suppresses_foreground(
+        Some(SuppressedKeyUpRoute::DownstreamThenSuppress),
+        ordinary_keyup,
+    ));
+    assert!(keyup_calls_downstream(None, ordinary_keyup));
+    assert!(!keyup_suppresses_foreground(None, ordinary_keyup));
 }
 
 #[test]

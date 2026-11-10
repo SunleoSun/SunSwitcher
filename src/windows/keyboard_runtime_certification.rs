@@ -1,6 +1,7 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_CONTROL, VK_OEM_1, VK_OEM_2, VK_OEM_3,
-    VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN, VK_TAB,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK, VK_CONTROL, VK_LSHIFT, VK_OEM_1, VK_OEM_2,
+    VK_OEM_3, VK_OEM_4, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_PERIOD, VK_PAUSE, VK_RETURN,
+    VK_TAB,
 };
 
 use windows_sys::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED;
@@ -9,9 +10,10 @@ use super::keyboard_runtime::{
     InputOwnershipStamp, KeyDownDisposition, RuntimeError, SuppressedKeyUpRoute,
     build_replacement_inputs, completion_result_passes_through,
     foreground_change_requires_invalidation, ignore_hotkey_matches, injected_marker,
-    input_ownership_matches, is_foreign_injected_keyboard_event, keyup_suppression_after_injection,
+    input_ownership_matches, is_foreign_injected_keyboard_event, is_physical_shift_release,
+    keyup_calls_downstream, keyup_suppresses_foreground, keyup_suppression_after_injection,
     physical_key_from_vk, preclassify_key_down, replacement_outcome_after_injection,
-    suppressed_keyup_calls_downstream, undo_hotkey_matches, undo_outcome_after_injection,
+    undo_hotkey_matches, undo_outcome_after_injection,
 };
 use crate::completion::CompletionCommandResult;
 use crate::correction::{CorrectionDecision, ReplacementText};
@@ -158,13 +160,43 @@ fn certification_only_consumed_completion_triggers_are_withheld_from_foreground(
         &CompletionCommandResult::AcceptWord("word ".to_owned())
     ));
 
-    assert!(!suppressed_keyup_calls_downstream(Some(
-        SuppressedKeyUpRoute::SunSwitcherOnly
-    )));
-    assert!(suppressed_keyup_calls_downstream(Some(
-        SuppressedKeyUpRoute::DownstreamThenSuppress
-    )));
-    assert!(suppressed_keyup_calls_downstream(None));
+    let ordinary_keyup = false;
+    assert!(!keyup_calls_downstream(
+        Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+        ordinary_keyup,
+    ));
+    assert!(keyup_suppresses_foreground(
+        Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+        ordinary_keyup,
+    ));
+    assert!(keyup_calls_downstream(
+        Some(SuppressedKeyUpRoute::DownstreamThenSuppress),
+        ordinary_keyup,
+    ));
+    assert!(keyup_suppresses_foreground(
+        Some(SuppressedKeyUpRoute::DownstreamThenSuppress),
+        ordinary_keyup,
+    ));
+    assert!(keyup_calls_downstream(None, ordinary_keyup));
+    assert!(!keyup_suppresses_foreground(None, ordinary_keyup));
+
+    // A real Shift release overrides both kinds of SunSwitcher suppression: it is sent
+    // through the downstream hook chain and the foreground delivery is not canceled.
+    let physical_shift_release = is_physical_shift_release(VK_LSHIFT as u32, 0, true);
+    assert!(physical_shift_release);
+    assert!(keyup_calls_downstream(
+        Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+        physical_shift_release,
+    ));
+    assert!(!keyup_suppresses_foreground(
+        Some(SuppressedKeyUpRoute::SunSwitcherOnly),
+        physical_shift_release,
+    ));
+    assert!(!is_physical_shift_release(
+        VK_LSHIFT as u32,
+        LLKHF_INJECTED,
+        true,
+    ));
 }
 
 #[test]
