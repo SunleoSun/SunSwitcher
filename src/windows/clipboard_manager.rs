@@ -1485,11 +1485,11 @@ impl SettingsView {
         ui.add_space(12.0);
         ui.heading("Applications");
         ui.separator();
-        ui.label("Disable automatic replacements for selected applications. Autocomplete and manual actions remain available.");
-        ui.small("Unchecked Autocorrections also disables automatic keyboard switching. Re-enable/remove to inherit global settings.");
+        ui.label("Exclude selected applications from SunSwitcher input handling.");
+        ui.small("Excluded applications receive no autocorrections, autocomplete, automatic keyboard switching, or SunSwitcher hotkeys. Remove an application to restore global behavior.");
         if let Some(application) = recent_external_application()
             && ui
-                .button(format!("Disable for recent: {}", application.file_name()))
+                .button(format!("Exclude recent: {}", application.file_name()))
                 .on_hover_text(application.executable_path())
                 .clicked()
         {
@@ -1498,9 +1498,9 @@ impl SettingsView {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.application_path)
-                    .hint_text(r"Full executable path: C:\Apps\app.exe"),
+                    .hint_text("Full executable path: C:/Apps/app.exe"),
             );
-            if ui.button("Add / disable").clicked() {
+            if ui.button("Add / exclude").clicked() {
                 // Accept the quoted paths produced by Explorer's Copy as path.
                 match ApplicationIdentity::try_new(state.application_path.trim().trim_matches('"'))
                 {
@@ -1516,19 +1516,15 @@ impl SettingsView {
         });
         match self.settings.application_overrides() {
             Ok(overrides) => {
-                egui::Grid::new("application_autocorrections")
+                egui::Grid::new("application_exclusions")
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("Application");
-                        ui.strong("Autocorrections");
+                        ui.strong("Action");
                         ui.end_row();
                         for application in overrides.applications() {
                             ui.label(application.file_name())
                                 .on_hover_text(application.executable_path());
-                            let mut enabled = false;
-                            if ui.checkbox(&mut enabled, "Inherit global").changed() {
-                                self.persist_application(state, application, false);
-                            }
                             if ui.small_button("Remove").clicked() {
                                 self.persist_application(state, application, false);
                             }
@@ -2488,9 +2484,14 @@ mod tests {
             1,
         );
         c.check_fact_expect(
-            "autocomplete stays enabled",
-            settings.load().unwrap().enable_autocomplete(),
+            "application exclusion suppresses SunSwitcher input",
+            settings.input_suppressed(Some(&application)),
             true,
+        );
+        c.check_fact_expect(
+            "application exclusion does not mutate global settings",
+            settings.load().unwrap(),
+            AppSettings::default(),
         );
         c.check_fact_expect(
             "UI global toggle succeeds",
@@ -2511,13 +2512,9 @@ mod tests {
         );
         view.persist_application(&mut state, &application, false);
         c.check_fact_expect(
-            "enabling inheritance removes suppression",
-            settings
-                .application_overrides()
-                .unwrap()
-                .applications()
-                .count(),
-            0,
+            "removing application restores global behavior",
+            settings.input_suppressed(Some(&application)),
+            false,
         );
 
         let detached = SettingsView::new(

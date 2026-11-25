@@ -76,6 +76,10 @@ pub trait InputProcessor: Send + 'static {
 
     fn foreground_application_changed(&mut self, _application: Option<ApplicationIdentity>) {}
 
+    fn input_suppressed(&self) -> bool {
+        false
+    }
+
     fn replacement_outcome(&mut self, _outcome: ReplacementOutcome) {}
 
     fn live_prefix_replacement_outcome(&mut self, _outcome: ReplacementOutcome) {}
@@ -587,6 +591,15 @@ impl RuntimeState {
     fn clear_selection_capture_intent(&mut self) {
         self.selection_capture_intent = SelectionCaptureIntent::Unknown;
     }
+
+    fn clear_sunswitcher_input_state(&mut self) {
+        self.suppressed_keyups.clear();
+        self.deferred_alt = None;
+        self.pending_ignore_word_dispatch = false;
+        self.pending_undo_word_dispatch = false;
+        self.double_shift = DoubleShiftTracker::default();
+        self.selection_capture_intent = SelectionCaptureIntent::Unknown;
+    }
 }
 
 static RUNTIME: Mutex<Option<RuntimeState>> = Mutex::new(None);
@@ -971,6 +984,12 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
 
         let was_key_down = (event.vkCode as usize) < runtime.keyboard_state.len()
             && runtime.keyboard_state[event.vkCode as usize] & 0x80 != 0;
+        runtime.update_key_state(event.vkCode, is_key_down);
+        if runtime.processor.input_suppressed() {
+            runtime.clear_sunswitcher_input_state();
+            drop(runtime_slot);
+            return unsafe { CallNextHookEx(null_mut(), code, w_param, l_param) };
+        }
         let double_shift = if !runtime.hotkey_capture.is_active()
             && is_physical_keyboard_event(event.flags)
         {
@@ -980,7 +999,6 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: WPARAM, l_param: LPA
         } else {
             DoubleShiftEvent::None
         };
-        runtime.update_key_state(event.vkCode, is_key_down);
         let hotkey_capture_effect = if is_key_down && is_physical_keyboard_event(event.flags) {
             runtime.observe_hotkey_capture(event.vkCode)
         } else {

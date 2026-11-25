@@ -117,6 +117,13 @@ impl SettingsStore {
             .unwrap_or_else(|_| CorrectionFeaturePolicy::new(false, false))
     }
 
+    pub fn input_suppressed(&self, foreground: Option<&ApplicationIdentity>) -> bool {
+        self.current
+            .read()
+            .map(|snapshot| snapshot.applications.suppresses_input(foreground))
+            .unwrap_or(true)
+    }
+
     /// Derive the change from the latest canonical projection under the shared
     /// writer gate, not from a possibly stale UI copy of the whole settings row.
     pub fn update(

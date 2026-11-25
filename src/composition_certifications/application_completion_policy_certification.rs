@@ -1,75 +1,47 @@
 use crate::adaptive::{AdaptiveCorrectionDirective, AdaptiveLexicalRuntime};
-use crate::completion::{CompletionApplyOutcome, CompletionCommand, CompletionCommandResult};
 use crate::correction::Confidence;
 use crate::input::InputEvent;
 use crate::persistence::Database;
 
 #[test]
-fn certification_application_suppression_preserves_live_completion_navigation_and_acceptance() {
-    use sun_observations::certifications::*;
-    let mut c = certification(
-        "certification_application_suppression_preserves_live_completion_navigation_and_acceptance",
-    );
+fn certification_application_exclusion_preserves_globals_and_reports_full_input_suppression() {
     use crate::application_policy::ApplicationIdentity;
     use crate::persistence::AppSettings;
     use crate::settings::SettingsStore;
-    let settings = SettingsStore::from_database(Database::open_in_memory().unwrap()).unwrap();
-    let application = ApplicationIdentity::try_new("C:/Apps/example.exe").unwrap();
-    settings
-        .set_application_suppressed(&application, true)
-        .unwrap();
-    let database = Database::open_in_memory().unwrap();
-    database
-        .record_user_word("AcceptPrediction902", 10)
-        .unwrap();
-    let runtime =
-        AdaptiveLexicalRuntime::start(database, Confidence::try_new(0.80).unwrap()).unwrap();
-    let mut correction = runtime.live_session();
-    let mut completion = runtime.completion_session();
-    for character in "AcceptPred".chars() {
-        let event = InputEvent::character(character);
+    use sun_observations::certifications::*;
 
-        completion.process_event(event, 100).unwrap();
-        c.check_fact_expect(
-            "automatic live replacement suppressed",
-            correction
-                .process_with_policy(event, 100, settings.correction_policy(Some(&application)))
-                .unwrap(),
-            AdaptiveCorrectionDirective::Pass,
-        );
-    }
+    let mut c = certification("application exclusion is a full input suppression");
+    let settings = SettingsStore::from_database(Database::open_in_memory().unwrap()).unwrap();
+    let excluded = ApplicationIdentity::try_new("C:/Apps/excluded.exe").unwrap();
+    let ordinary = ApplicationIdentity::try_new("C:/Apps/ordinary.exe").unwrap();
+
+    settings
+        .set_application_suppressed(&excluded, true)
+        .unwrap();
+
     c.check_fact_expect(
-        "completion session remains active",
-        completion.is_active(),
+        "excluded foreground bypasses SunSwitcher input",
+        settings.input_suppressed(Some(&excluded)),
         true,
     );
     c.check_fact_expect(
-        "completion suggestions remain available",
-        completion.suggestions()[0].text(),
-        "AcceptPrediction902",
+        "ordinary foreground remains enabled",
+        settings.input_suppressed(Some(&ordinary)),
+        false,
     );
     c.check_fact_expect(
-        "next completion navigation consumed",
-        completion.command(CompletionCommand::Next).unwrap(),
-        CompletionCommandResult::Consumed,
-    );
-    c.check_fact_expect(
-        "previous completion navigation consumed",
-        completion.command(CompletionCommand::Previous).unwrap(),
-        CompletionCommandResult::Consumed,
-    );
-    c.check_fact_expect(
-        "explicit completion acceptance returns suffix",
-        completion.command(CompletionCommand::Accept).unwrap(),
-        CompletionCommandResult::AcceptSuffix("iction902".to_owned()),
-    );
-    completion
-        .suffix_acceptance_outcome(CompletionApplyOutcome::Applied, 200)
-        .unwrap();
-    c.check_fact_expect(
-        "application suppression preserves globals",
+        "application exclusion preserves global settings",
         settings.load().unwrap(),
         AppSettings::default(),
+    );
+
+    settings
+        .set_application_suppressed(&excluded, false)
+        .unwrap();
+    c.check_fact_expect(
+        "removal restores global input behavior",
+        settings.input_suppressed(Some(&excluded)),
+        false,
     );
     c.assert_certify();
 }

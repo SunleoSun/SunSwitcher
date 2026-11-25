@@ -20,7 +20,7 @@ use crate::language::normalize_word;
 use crate::lexicon::{UserLexicon, UserWord};
 use crate::persistence::{
     CorrectionEventId, CorrectionUndoPlan, Database, DatabaseError, ForgetWordOutcome,
-    IgnoreWordOutcome,
+    IgnoreWordOutcome, MaintenanceReport,
 };
 use crate::replacement::{
     LivePrefixReplacementAction, ReplacementAction, ReplacementEngine, ReplacementOutcome,
@@ -167,6 +167,10 @@ enum LearningCommand {
     CommitRecordedUndo {
         receipt: CorrectionEventReceipt,
         undone_at_ms: i64,
+    },
+    Maintain {
+        now_ms: i64,
+        response: mpsc::Sender<Result<MaintenanceReport, String>>,
     },
     Barrier(mpsc::Sender<()>),
     Shutdown,
@@ -316,6 +320,16 @@ impl LearningClient {
             receipt,
             undone_at_ms,
         })
+    }
+
+    /// Called by the lifecycle timer, never by input or completion lookup.
+    pub fn maintain(&self, now_ms: i64) -> Result<MaintenanceReport, AdaptiveRuntimeError> {
+        let (response, receiver) = mpsc::channel();
+        self.send(LearningCommand::Maintain { now_ms, response })?;
+        receiver
+            .recv()
+            .map_err(|_| AdaptiveRuntimeError::LearningWorkerUnavailable)?
+            .map_err(AdaptiveRuntimeError::LearningWorkerFailed)
     }
 
     pub fn flush(&self) -> Result<(), AdaptiveRuntimeError> {
@@ -1337,6 +1351,22 @@ fn learning_worker(
                 Ok(Err(error)) => Err(AdaptiveRuntimeError::LearningWorkerFailed(error)),
                 Err(_) => Err(AdaptiveRuntimeError::LearningWorkerUnavailable),
             },
+            LearningCommand::Maintain { now_ms, response } => {
+                let result = database
+                    .maintain(now_ms)
+                    .map_err(AdaptiveRuntimeError::from)
+                    .and_then(|report| {
+                        if report.text_history_deleted != 0 {
+                            sequences
+                                .replace(load_active_sequence_history(&database)?)
+                                .map_err(|_| AdaptiveRuntimeError::SnapshotUnavailable)?;
+                        }
+                        Ok(report)
+                    });
+                let response_result = result.as_ref().copied().map_err(ToString::to_string);
+                let _ = response.send(response_result);
+                result.map(|_| ())
+            }
             LearningCommand::Barrier(response) => {
                 let _ = response.send(());
                 Ok(())

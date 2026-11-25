@@ -90,6 +90,10 @@ impl ApplicationOverrides {
         self.0.contains(application)
     }
 
+    pub fn suppresses_input(&self, foreground: Option<&ApplicationIdentity>) -> bool {
+        foreground.is_some_and(|application| self.suppresses(application))
+    }
+
     /// Unknown foreground ownership fails closed for automatic edits only.
     pub fn effective_policy(
         &self,

@@ -131,7 +131,23 @@ mod windows_app {
         0
     }
 
+    /// Stops the daily scheduler before the adaptive persistence worker is dropped.
+    struct MaintenanceWorker {
+        stop: std::sync::mpsc::Sender<()>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for MaintenanceWorker {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
     struct SunSwitcherProcessor {
+        _maintenance: MaintenanceWorker,
         _clipboard_listener: ClipboardTextListener,
         runtime: AdaptiveLexicalRuntime,
         session: AdaptiveCorrectionSession,
@@ -150,7 +166,10 @@ mod windows_app {
             std::fs::create_dir_all(&app_data_dir)
                 .map_err(|error| format!("could not create app-data directory: {error}"))?;
             let database_path = app_data_dir.join("sunswitcher.db");
-            let database = Database::open(&database_path).map_err(|error| error.to_string())?;
+            let mut database = Database::open(&database_path).map_err(|error| error.to_string())?;
+            database
+                .maintain(now_ms())
+                .map_err(|error| format!("database maintenance failed: {error}"))?;
             let settings = SettingsStore::from_database(
                 Database::open(&database_path).map_err(|error| error.to_string())?,
             )
@@ -163,6 +182,28 @@ mod windows_app {
                 .map_err(|error| format!("SunSwitcher UI failed: {error}"))?;
             let hotkey_capture = popup.hotkey_capture_handle();
             let clipboard_updates = popup.clipboard_handle();
+            let maintenance_updates = clipboard_updates.clone();
+            let maintenance_learning = learning.clone();
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                while matches!(
+                    stopped.recv_timeout(Database::MAINTENANCE_INTERVAL),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    match maintenance_learning.maintain(now_ms()) {
+                        Ok(report) => {
+                            if report.clipboard_entries_deleted != 0 {
+                                maintenance_updates.notify_history_changed();
+                            }
+                        }
+                        Err(error) => app_error!("database maintenance failed: {error}"),
+                    }
+                }
+            });
+            let maintenance = MaintenanceWorker {
+                stop,
+                worker: Some(worker),
+            };
             let clipboard_database_path = database_path.clone();
             let clipboard_settings = settings.clone();
             let clipboard_listener = ClipboardTextListener::start(move |content| {
@@ -240,6 +281,7 @@ adaptive_learning
             app_log!("Adaptive state: {}", database_path.display());
             Ok((
                 Self {
+                    _maintenance: maintenance,
                     _clipboard_listener: clipboard_listener,
                     runtime,
                     session,
@@ -256,11 +298,17 @@ adaptive_learning
     }
 
     impl SunSwitcherProcessor {
+        fn input_suppressed(&self) -> bool {
+            self.settings
+                .input_suppressed(self.foreground_application.as_ref())
+        }
+
         fn sync_popup(&self) {
-            if self
-                .settings
-                .load()
-                .is_ok_and(|settings| settings.enable_autocomplete())
+            if !self.input_suppressed()
+                && self
+                    .settings
+                    .load()
+                    .is_ok_and(|settings| settings.enable_autocomplete())
             {
                 self.popup.update(
                     self.completion
@@ -338,14 +386,23 @@ adaptive_learning
             self.foreground_application = application;
         }
 
+        fn input_suppressed(&self) -> bool {
+            SunSwitcherProcessor::input_suppressed(self)
+        }
+
         fn completion_active(&self) -> bool {
-            self.settings
-                .load()
-                .is_ok_and(|settings| settings.enable_autocomplete())
+            !self.input_suppressed()
+                && self
+                    .settings
+                    .load()
+                    .is_ok_and(|settings| settings.enable_autocomplete())
                 && self.completion.is_active()
         }
 
         fn switch_layout_text(&self, text: &str) -> Option<KeyboardLayoutSwitch> {
+            if self.input_suppressed() {
+                return None;
+            }
             let snapshot = self.runtime.snapshots().load().ok()?;
             switch_keyboard_layout_text(snapshot.languages(), text)
         }
@@ -355,6 +412,9 @@ adaptive_learning
             text: &str,
             target_language: &sunswitcher::language::LanguageId,
         ) -> Option<KeyboardLayoutSwitch> {
+            if self.input_suppressed() {
+                return None;
+            }
             let snapshot = self.runtime.snapshots().load().ok()?;
             switch_keyboard_layout_text_to(snapshot.languages(), text, target_language)
         }
@@ -440,6 +500,9 @@ adaptive_learning
             self.sync_popup();
         }
         fn ignore_word(&mut self, text: &str) -> IgnoreWordStatus {
+            if self.input_suppressed() {
+                return IgnoreWordStatus::Failed;
+            }
             let word = text.trim().to_owned();
             if word.is_empty() {
                 return IgnoreWordStatus::Failed;
@@ -472,6 +535,9 @@ adaptive_learning
         }
 
         fn ignored_word_layout_switch(&self, text: &str) -> Option<KeyboardLayoutSwitch> {
+            if self.input_suppressed() {
+                return None;
+            }
             let word = text.trim();
             let correction = self
                 .session
@@ -486,6 +552,9 @@ adaptive_learning
         }
 
         fn tracked_word_for_ignore(&self) -> Option<String> {
+            if self.input_suppressed() {
+                return None;
+            }
             self.session
                 .current_lexical_term_for_hotkey()
                 .ok()
@@ -493,6 +562,9 @@ adaptive_learning
         }
 
         fn recheck_ignored_tracked_word(&mut self) -> RuntimeDirective {
+            if self.input_suppressed() {
+                return RuntimeDirective::Pass;
+            }
             let observed_at_ms = now_ms();
             let policy = self.global_correction_policy();
             match self
@@ -539,6 +611,9 @@ adaptive_learning
         }
 
         fn forget_word(&mut self, text: &str) {
+            if self.input_suppressed() {
+                return;
+            }
             let word = text.trim().to_owned();
             let receipt = match self.runtime.learning().forget_word(word.clone()) {
                 Ok(receipt) => receipt,
@@ -583,6 +658,9 @@ adaptive_learning
         }
 
         fn undo(&mut self) -> UndoDirective {
+            if self.input_suppressed() {
+                return UndoDirective::Pass;
+            }
             match self.session.request_undo(now_ms()) {
                 Ok(Some(action)) => {
                     match &action {
@@ -623,6 +701,9 @@ adaptive_learning
         }
 
         fn completion_command(&mut self, command: CompletionCommand) -> CompletionCommandResult {
+            if self.input_suppressed() {
+                return CompletionCommandResult::Pass;
+            }
             let result = match self.completion.command(command) {
                 Ok(result) => result,
                 Err(error) => {
@@ -644,6 +725,9 @@ adaptive_learning
         }
 
         fn clipboard_command(&mut self, command: ClipboardCommand, target_window_id: usize) {
+            if self.input_suppressed() {
+                return;
+            }
             let (tab, command_label) = match command {
                 ClipboardCommand::OpenCurrent => (ClipboardManagerTab::Current, "open_current"),
                 ClipboardCommand::OpenPinned => (ClipboardManagerTab::Pinned, "open_pinned"),

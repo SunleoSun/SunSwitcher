@@ -274,8 +274,13 @@ fn autocorrections_menu_flags(settings: Option<&SettingsStore>) -> u32 {
 }
 
 fn toggle_autocorrections(settings: &SettingsStore) -> Result<AppSettings, SettingsWriteError> {
-    settings
-        .update(|current| current.with_enable_autocorrections(!current.enable_autocorrections()))
+    settings.update(|current| {
+        let enabled = !current.enable_autocorrections();
+        current
+            .with_enable_autocorrections(enabled)
+            .with_enable_autocomplete(enabled)
+            .with_enable_auto_keyboard_switches(enabled)
+    })
 }
 
 fn request_exit_from_tray() {
@@ -430,9 +435,12 @@ mod tests {
             0,
         );
         c.check_fact_expect(
-            "toggle changes only global autocorrections",
+            "tray OFF disables all automatic text features",
             settings.load().unwrap(),
-            AppSettings::default().with_enable_autocorrections(false),
+            AppSettings::default()
+                .with_enable_autocorrections(false)
+                .with_enable_autocomplete(false)
+                .with_enable_auto_keyboard_switches(false),
         );
         toggle_autocorrections(&settings).unwrap();
         c.check_fact_expect(
@@ -498,9 +506,12 @@ mod tests {
             0,
         );
         c.check_fact_expect(
-            "only global autocorrections changed",
+            "tray OFF persists all automatic text features disabled",
             reopened.load().unwrap(),
-            AppSettings::default().with_enable_autocorrections(false),
+            AppSettings::default()
+                .with_enable_autocorrections(false)
+                .with_enable_autocomplete(false)
+                .with_enable_auto_keyboard_switches(false),
         );
         drop(reopened);
         toggle_autocorrections(&settings).unwrap();

@@ -12,7 +12,40 @@ use crate::language::{
 };
 use crate::lexicon::{IgnoredWords, UserLexicon, UserLexiconError, UserWord};
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+#[cfg(test)]
+#[path = "database_certification.rs"]
+mod database_certification;
+
+const CURRENT_SCHEMA_VERSION: i64 = 10;
+const MAX_SEQUENCE_RETENTION_MONTHS: i64 = 12;
+
+const CLIPBOARD_PAYLOAD_BUDGET_BYTES: i64 = 200 * 1024 * 1024;
+const SCHEMA_V10: &str = r#"
+CREATE INDEX IF NOT EXISTS text_history_retention_idx
+ON text_history(min(use_count, 12), last_used_at_ms);
+"#;
+
+// Payload bytes are persisted UTF-8 text, image data and format, and file paths.
+// A newest-first prefix is equivalent to deleting oldest eligible rows until both limits hold.
+const PRUNE_CLIPBOARD_SQL: &str = r#"
+WITH payloads AS (
+    SELECT e.id, e.current_order_index,
+        COALESCE((SELECT length(CAST(text AS BLOB)) FROM clipboard_text WHERE entry_id = e.id), 0)
+        + COALESCE((SELECT length(data) + length(CAST(format AS BLOB)) FROM clipboard_images WHERE entry_id = e.id), 0)
+        + COALESCE((SELECT sum(length(CAST(path AS BLOB))) FROM clipboard_files WHERE entry_id = e.id), 0)
+        AS payload_bytes
+    FROM clipboard_entries e
+    WHERE e.pinned_at_ms IS NULL
+), ranked AS (
+    SELECT id,
+        row_number() OVER (ORDER BY current_order_index DESC, id DESC) AS entry_rank,
+        sum(payload_bytes) OVER (ORDER BY current_order_index DESC, id DESC ROWS UNBOUNDED PRECEDING) AS stored_bytes
+    FROM payloads
+)
+DELETE FROM clipboard_entries WHERE id IN (
+    SELECT id FROM ranked WHERE entry_rank > ?1 OR stored_bytes > ?2
+)
+"#;
 const SCHEMA_V9: &str = r#"
 CREATE TABLE IF NOT EXISTS application_replacement_suppressions (
     executable_path TEXT PRIMARY KEY NOT NULL CHECK (length(executable_path) > 0)
@@ -964,6 +997,7 @@ pub enum DatabaseError {
     },
     MissingAppSettings,
     InvalidStoredApplicationIdentity(String),
+    InvalidMaintenanceTimestamp(i64),
 }
 
 impl Display for DatabaseError {
@@ -1027,6 +1061,12 @@ impl Display for DatabaseError {
                 formatter,
                 "stored normalized dictionary term {normalized_term:?} does not match {term:?}"
             ),
+            Self::InvalidMaintenanceTimestamp(value) => {
+                write!(
+                    formatter,
+                    "maintenance timestamp is outside the supported UTC calendar: {value}"
+                )
+            }
             Self::MissingAppSettings => formatter.write_str("app settings row is missing"),
             Self::InvalidStoredApplicationIdentity(path) => {
                 write!(formatter, "invalid stored application identity: {path:?}")
@@ -1069,11 +1109,27 @@ impl From<SequenceHistoryError> for DatabaseError {
     }
 }
 
+/// Counts committed by one atomic retention and clipboard maintenance pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    pub text_history_deleted: usize,
+    pub clipboard_entries_deleted: usize,
+}
+
 pub struct Database {
     connection: Connection,
 }
 
 impl Database {
+    pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        Self::from_connection(Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let connection = Connection::open(path)?;
         Self::from_connection(connection)
@@ -1104,20 +1160,8 @@ impl Database {
         Ok(Self { connection })
     }
 
-    #[cfg(test)]
-    pub(super) fn schema_version(&self) -> Result<i64, DatabaseError> {
+    pub fn schema_version(&self) -> Result<i64, DatabaseError> {
         schema_version(&self.connection)
-    }
-
-    #[cfg(test)]
-    pub(super) fn storage_pragmas(&self) -> Result<(String, i64), DatabaseError> {
-        let journal_mode = self
-            .connection
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-        let synchronous = self
-            .connection
-            .pragma_query_value(None, "synchronous", |row| row.get(0))?;
-        Ok((journal_mode, synchronous))
     }
 
     pub fn load_application_overrides(&self) -> Result<ApplicationOverrides, DatabaseError> {
@@ -1729,6 +1773,65 @@ WHERE id = ?2
         )? != 0)
     }
 
+    /// Subtract calendar months in UTC, clamping month-end, preserving milliseconds.
+    /// Only rows strictly older than their cutoff expire; survivors are never rewritten.
+    pub fn maintain(&mut self, now_ms: i64) -> Result<MaintenanceReport, DatabaseError> {
+        let mut cutoffs = [0i64; MAX_SEQUENCE_RETENTION_MONTHS as usize];
+        for months in 1..=MAX_SEQUENCE_RETENTION_MONTHS {
+            let seconds: Option<i64> = self.connection.query_row(
+                "SELECT CAST(strftime('%s', ?1, 'unixepoch', ?2, 'floor') AS INTEGER)",
+                params![now_ms.div_euclid(1000), format!("-{months} months")],
+                |row| row.get(0),
+            )?;
+            cutoffs[(months - 1) as usize] = seconds
+                .and_then(|value| value.checked_mul(1000))
+                .and_then(|value| value.checked_add(now_ms.rem_euclid(1000)))
+                .ok_or(DatabaseError::InvalidMaintenanceTimestamp(now_ms))?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let limit = ClipboardHistoryLimit::try_from_stored(transaction.query_row(
+            "SELECT clipboard_history_limit FROM app_settings WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?)?;
+        let mut text_history_deleted = 0;
+        for months in 1..=MAX_SEQUENCE_RETENTION_MONTHS {
+            text_history_deleted += transaction.execute(
+                "DELETE FROM text_history WHERE min(use_count, 12) = ?1 AND last_used_at_ms < ?2",
+                params![months, cutoffs[(months - 1) as usize]],
+            )?;
+        }
+        let clipboard_entries_deleted = transaction.execute(
+            PRUNE_CLIPBOARD_SQL,
+            params![i64::from(limit.get()), CLIPBOARD_PAYLOAD_BUDGET_BYTES],
+        )?;
+        transaction.commit()?;
+        Ok(MaintenanceReport {
+            text_history_deleted,
+            clipboard_entries_deleted,
+        })
+    }
+
+    /// Offline compaction only. Retains exclusive access until this connection is dropped.
+    pub fn vacuum_exclusive(&self) -> Result<(), DatabaseError> {
+        self.connection
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT; VACUUM;")?;
+        let (busy, _, _): (i64, i64, i64) =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if busy != 0 {
+            return Err(DatabaseError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("vacuum checkpoint could not finish".to_owned()),
+            )));
+        }
+        Ok(())
+    }
+
     pub fn clear_clipboard_history(&self) -> Result<usize, DatabaseError> {
         Ok(self
             .connection
@@ -1740,18 +1843,8 @@ WHERE id = ?2
         limit: ClipboardHistoryLimit,
     ) -> Result<usize, DatabaseError> {
         Ok(self.connection.execute(
-            r#"
-DELETE FROM clipboard_entries
-WHERE pinned_at_ms IS NULL
-AND id NOT IN (
-SELECT id
-FROM clipboard_entries
-WHERE pinned_at_ms IS NULL
-ORDER BY current_order_index DESC, id DESC
-LIMIT ?1
-)
-"#,
-            [i64::from(limit.get())],
+            PRUNE_CLIPBOARD_SQL,
+            params![i64::from(limit.get()), CLIPBOARD_PAYLOAD_BUDGET_BYTES],
         )?)
     }
 
@@ -2408,6 +2501,14 @@ fn migrate(connection: &mut Connection) -> Result<(), DatabaseError> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA_V9)?;
         transaction.pragma_update(None, "user_version", 9)?;
+        transaction.commit()?;
+        version = 9;
+    }
+
+    if version < 10 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_V10)?;
+        transaction.pragma_update(None, "user_version", 10)?;
         transaction.commit()?;
     }
 

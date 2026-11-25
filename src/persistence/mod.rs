@@ -5,10 +5,5 @@ pub use database::{
     ClipboardEntrySummary, ClipboardEntrySummaryContent, ClipboardEntryView, ClipboardHistoryLimit,
     ClipboardReorderPosition, CorrectionEventId, CorrectionUndoPlan, Database, DatabaseError,
     ForgetWordOutcome, HotkeyAction, HotkeyBinding, HotkeyConflict, HotkeyModifiers,
-    IgnoreWordOutcome, NotificationTimeoutSeconds, SettingsError, UndoHotkey,
+    IgnoreWordOutcome, MaintenanceReport, NotificationTimeoutSeconds, SettingsError, UndoHotkey,
 };
-
-#[cfg(test)]
-mod database_certification;
-#[cfg(test)]
-mod database_tests;

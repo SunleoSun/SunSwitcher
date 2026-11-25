@@ -55,9 +55,19 @@ fn live_application_changes_preserve_globals_and_rehydrate_from_canonical_persis
         CorrectionFeaturePolicy::new(false, false),
     );
     c.check_fact_expect(
+        "active exclusion suppresses all SunSwitcher input",
+        store.input_suppressed(Some(&application)),
+        true,
+    );
+    c.check_fact_expect(
         "switching to ordinary inherits",
         store.correction_policy(Some(&ordinary)),
         CorrectionFeaturePolicy::ALL,
+    );
+    c.check_fact_expect(
+        "ordinary application is not excluded",
+        store.input_suppressed(Some(&ordinary)),
+        false,
     );
     c.check_fact_expect(
         "switching back suppresses again",
@@ -95,9 +105,9 @@ fn live_application_changes_preserve_globals_and_rehydrate_from_canonical_persis
         CorrectionFeaturePolicy::new(false, true),
     );
     c.check_fact_expect(
-        "autocomplete remains enabled",
-        store.load().unwrap().enable_autocomplete(),
-        true,
+        "removed application no longer suppresses input",
+        store.input_suppressed(Some(&application)),
+        false,
     );
     let reopened = SettingsStore::from_database(Database::open(&fixture.path).unwrap()).unwrap();
     c.check_fact_expect(

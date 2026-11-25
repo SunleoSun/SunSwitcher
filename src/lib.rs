@@ -14,5 +14,9 @@ pub mod settings;
 #[path = "composition_certifications/application_completion_policy_certification.rs"]
 mod application_completion_policy_certification;
 
+#[cfg(test)]
+#[path = "composition_certifications/persistence_completion_retention_certification.rs"]
+mod persistence_completion_retention_certification;
+
 #[cfg(target_os = "windows")]
 pub mod windows;

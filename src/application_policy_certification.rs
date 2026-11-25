@@ -25,7 +25,7 @@ struct PolicyInput {
 }
 
 #[test]
-fn effective_policy_preserves_independent_global_permissions_unless_suppressed_or_unknown() {
+fn effective_policy_preserves_independent_global_permissions_and_full_input_suppression() {
     let mut runner =
         certification("effective application correction policy").executor(|input: &PolicyInput| {
             let application = ApplicationIdentity::try_new(r"C:\Apps\example.exe").unwrap();
@@ -39,9 +39,11 @@ fn effective_policy_preserves_independent_global_permissions_unless_suppressed_o
                 .with_enable_autocorrections(input.autocorrect.enabled())
                 .with_enable_auto_keyboard_switches(input.auto_layout.enabled())
                 .with_enable_autocomplete(input.autocomplete.enabled());
+            let foreground = input.known.enabled().then_some(&application);
             Ok::<_, ()>((
-                overrides.effective_policy(settings, input.known.enabled().then_some(&application)),
+                overrides.effective_policy(settings, foreground),
                 settings,
+                overrides.suppresses_input(foreground),
             ))
         });
     runner.domain(domain!(PolicyInput {
@@ -87,6 +89,9 @@ fn effective_policy_preserves_independent_global_permissions_unless_suppressed_o
         fact!(case.result().1.enable_auto_keyboard_switches())
             .expect(fact!(case.input().auto_layout.enabled())),
     );
+    runner.check(fact!(case.result().2).expect(fact!(
+        case.input().known.enabled() && case.input().suppressed.enabled()
+    )));
     runner.assert_certify();
 }
 
