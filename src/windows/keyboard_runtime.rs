@@ -572,21 +572,26 @@ impl RuntimeState {
     }
 
     fn observe_selection_capture_intent(&mut self, vk_code: u32, is_key_down: bool) {
-        if !is_key_down {
-            return;
+            if !is_key_down {
+                return;
+            }
+            let (ctrl_active, shift_active, alt_active, win_active) =
+                modifier_state(&self.keyboard_state);
+            if let Some(intent) = selection_capture_intent_for_key_down(
+                vk_code,
+                ctrl_active,
+                shift_active,
+                alt_active,
+                win_active,
+            ) {
+                self.selection_capture_intent = intent;
+            } else if !is_modifier_key(vk_code)
+                && !self.undo_hotkey_matches(vk_code)
+                && !self.ignore_hotkey_matches(vk_code)
+            {
+                self.selection_capture_intent = SelectionCaptureIntent::Unknown;
+            }
         }
-        if let Some(intent) = selection_capture_intent_for_navigation(
-            vk_code,
-            self.keyboard_state[VK_SHIFT as usize] & 0x80 != 0,
-        ) {
-            self.selection_capture_intent = intent;
-        } else if !is_modifier_key(vk_code)
-            && !self.undo_hotkey_matches(vk_code)
-            && !self.ignore_hotkey_matches(vk_code)
-        {
-            self.selection_capture_intent = SelectionCaptureIntent::Unknown;
-        }
-    }
 
     fn clear_selection_capture_intent(&mut self) {
         self.selection_capture_intent = SelectionCaptureIntent::Unknown;
@@ -2572,10 +2577,16 @@ fn is_selection_navigation_key(vk_code: u32) -> bool {
     .any(|key| vk_code == key as u32)
 }
 
-pub(super) fn selection_capture_intent_for_navigation(
+pub(super) fn selection_capture_intent_for_key_down(
     vk_code: u32,
+    ctrl_active: bool,
     shift_active: bool,
+    alt_active: bool,
+    win_active: bool,
 ) -> Option<SelectionCaptureIntent> {
+    if vk_code == b'A' as u32 && ctrl_active && !shift_active && !alt_active && !win_active {
+        return Some(SelectionCaptureIntent::UserSelection);
+    }
     is_selection_navigation_key(vk_code).then_some(if shift_active {
         SelectionCaptureIntent::UserSelection
     } else {

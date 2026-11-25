@@ -138,7 +138,7 @@ impl DeleteIndex {
     }
 }
 
-fn deletion_budget(word: &str, requested: usize) -> usize {
+pub(crate) fn deletion_budget(word: &str, requested: usize) -> usize {
     let chars = word.chars().count();
     if chars <= FULL_TYPO_INDEX_MAX_CHARS {
         requested
@@ -149,7 +149,7 @@ fn deletion_budget(word: &str, requested: usize) -> usize {
     }
 }
 
-fn deletion_forms(word: &str, max_deletions: usize) -> HashSet<String> {
+pub(crate) fn deletion_forms(word: &str, max_deletions: usize) -> HashSet<String> {
     let mut seen = HashSet::from([word.to_owned()]);
     let mut frontier = vec![word.to_owned()];
 

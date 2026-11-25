@@ -28,7 +28,7 @@ use super::keyboard_runtime::{
     keyup_calls_downstream, keyup_suppresses_foreground, keyup_suppression_after_injection,
     mouse_message_invalidates_tracking, partial_send_modifier_cleanup_keys, pause_hotkey_action,
     physical_key_from_vk, preclassify_key_down, refresh_modifier_state_from,
-    refresh_modifier_state_preserving_deferred_alt, selection_capture_intent_for_navigation,
+    refresh_modifier_state_preserving_deferred_alt, selection_capture_intent_for_key_down,
     should_refresh_modifier_state_before_key_classification,
     synthetic_modifier_safety_release_keys, undo_hotkey_matches, undo_outcome_after_injection,
     update_keyboard_state, word_hotkey_dispatch_ready,
@@ -41,17 +41,33 @@ use crate::persistence::{AppSettings, HotkeyAction, HotkeyBinding, UndoHotkey};
 use crate::replacement::{ReplacementEngine, UndoOutcome};
 
 #[test]
-fn shift_navigation_is_explicit_selection_intent_but_plain_navigation_is_not() {
+fn shift_navigation_and_ctrl_a_are_explicit_selection_intent_but_plain_navigation_is_not() {
     assert_eq!(
-        selection_capture_intent_for_navigation(VK_LEFT as u32, true),
+        selection_capture_intent_for_key_down(VK_LEFT as u32, false, true, false, false),
         Some(SelectionCaptureIntent::UserSelection)
     );
     assert_eq!(
-        selection_capture_intent_for_navigation(VK_RIGHT as u32, false),
+        selection_capture_intent_for_key_down(VK_LEFT as u32, true, true, false, false),
+        Some(SelectionCaptureIntent::UserSelection)
+    );
+    assert_eq!(
+        selection_capture_intent_for_key_down(VK_RIGHT as u32, false, false, false, false),
         Some(SelectionCaptureIntent::Unknown)
     );
     assert_eq!(
-        selection_capture_intent_for_navigation(b'A' as u32, true),
+        selection_capture_intent_for_key_down(b'A' as u32, true, false, false, false),
+        Some(SelectionCaptureIntent::UserSelection)
+    );
+    assert_eq!(
+        selection_capture_intent_for_key_down(b'A' as u32, false, true, false, false),
+        None
+    );
+    assert_eq!(
+        selection_capture_intent_for_key_down(b'A' as u32, true, true, false, false),
+        None
+    );
+    assert_eq!(
+        selection_capture_intent_for_key_down(b'A' as u32, true, false, true, false),
         None
     );
 }

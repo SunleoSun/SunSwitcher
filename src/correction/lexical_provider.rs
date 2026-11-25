@@ -203,12 +203,22 @@ impl CorrectionCandidateProvider for LexicalCorrectionProvider {
             && ((!exact_user_word && exact_system_word) || learned_function_word_alias);
 
         let literal_view = LiteralWordView::from_token(token);
-        let literal_core_is_valid = literal_view
-            .as_ref()
-            .is_some_and(|view| self.contains_normalized(&normalize_word(&view.core)));
+        let literal_core_protected = literal_view.as_ref().is_some_and(|view| {
+            if view.prefix.is_empty() && view.suffix.is_empty() {
+                return false;
+            }
+            let literal_core = normalize_word(&view.core);
+            if !self.contains_normalized(&literal_core) {
+                return false;
+            }
+            let cross_absorbs_edge_punctuation = exact_cross_layout.as_ref().is_some_and(|cross| {
+                cross.normalized_core.chars().count() > literal_core.chars().count()
+            });
+            !cross_absorbs_edge_punctuation
+        });
         if (exact_user_word && !learned_function_word_alias)
             || (exact_system_word && !single_character_layout_ambiguity)
-            || (literal_core_is_valid && !has_exact_cross_layout)
+            || literal_core_protected
         {
             // Exact learned words remain authoritative, except for a one-character learned
             // alias whose opposite-layout interpretation is a short Russian function word

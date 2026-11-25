@@ -160,6 +160,9 @@ fn certification_shifted_layout_ambiguous_key_preserves_target_case() {
 fn certification_literal_punctuation_remains_punctuation_for_valid_or_corrected_english() {
     assert_eq!(replacement_for_physical_input("hello,"), None);
     assert_eq!(replacement_for_physical_input("world."), None);
+    assert_eq!(replacement_for_physical_input("О,"), None);
+    assert_eq!(replacement_for_physical_input("И,"), None);
+    assert_eq!(replacement_for_physical_input("А."), None);
     assert_eq!(
         replacement_for_physical_input("hlelo,").as_deref(),
         Some("hello,")

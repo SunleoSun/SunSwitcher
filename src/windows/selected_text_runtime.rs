@@ -173,6 +173,7 @@ enum SelectedTextOrigin {
     ExistingSelection {
         retained_after_copy: bool,
     },
+    ExistingSelectionCollapsedWithoutEditableCaret,
     PreviousCaretChunk {
         range: TrailingNonWhitespaceRange,
         retained_after_copy: bool,
@@ -275,8 +276,15 @@ impl SelectedTextSession {
             shortcut.label(),
             ui_after_copy
         );
-        session.origin = SelectedTextOrigin::ExistingSelection {
-            retained_after_copy,
+        session.origin = if ui_selection.is_some() && !retained_after_copy {
+            crate::runtime_log!(
+                "[double-shift] explicit-selection proven by UIA collapsed after copy; marking read-only without editable caret"
+            );
+            SelectedTextOrigin::ExistingSelectionCollapsedWithoutEditableCaret
+        } else {
+            SelectedTextOrigin::ExistingSelection {
+                retained_after_copy,
+            }
         };
         Ok(Some(session))
     }
@@ -532,6 +540,12 @@ impl SelectedTextSession {
                     action.replacement().as_str(),
                 )?;
             }
+            SelectedTextOrigin::ExistingSelectionCollapsedWithoutEditableCaret => {
+                crate::runtime_log!(
+                    "[double-shift] apply path=uia-selection-collapsed-after-copy failing closed instead of editing at unknown caret"
+                );
+                return Err(SelectedTextRuntimeError::SelectionChangedDuringCapture);
+            }
             SelectedTextOrigin::PreviousCaretChunk {
                 range,
                 retained_after_copy: true,
@@ -572,7 +586,8 @@ impl SelectedTextSession {
         match self.origin {
             SelectedTextOrigin::ExistingSelection {
                 retained_after_copy: true,
-            } => {}
+            }
+            | SelectedTextOrigin::ExistingSelectionCollapsedWithoutEditableCaret => {}
             SelectedTextOrigin::ExistingSelection {
                 retained_after_copy: false,
             } => {

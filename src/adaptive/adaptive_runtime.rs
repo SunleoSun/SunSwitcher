@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -195,9 +196,88 @@ impl<T> WordMutationReceipt<T> {
     }
 }
 
+#[derive(Debug, Default)]
+struct LearningQueueState {
+    interactive: VecDeque<LearningCommand>,
+    background: VecDeque<LearningCommand>,
+    closed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LearningQueue {
+    inner: Arc<(Mutex<LearningQueueState>, Condvar)>,
+}
+
+impl LearningQueue {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(LearningQueueState::default()), Condvar::new())),
+        }
+    }
+
+    fn push(&self, command: LearningCommand) -> Result<(), AdaptiveRuntimeError> {
+        let (lock, cvar) = &*self.inner;
+        let mut state = lock
+            .lock()
+            .map_err(|_| AdaptiveRuntimeError::LearningWorkerUnavailable)?;
+        if state.closed {
+            return Err(AdaptiveRuntimeError::LearningWorkerUnavailable);
+        }
+        if command.is_interactive() {
+            state.interactive.push_back(command);
+        } else {
+            state.background.push_back(command);
+        }
+        cvar.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<LearningCommand> {
+        let (lock, cvar) = &*self.inner;
+        let mut state = lock.lock().ok()?;
+        loop {
+            if let Some(command) = state.interactive.pop_front() {
+                return Some(command);
+            }
+            if let Some(command) = state.background.pop_front() {
+                return Some(command);
+            }
+            if state.closed {
+                return None;
+            }
+            state = cvar.wait(state).ok()?;
+        }
+    }
+
+    fn close(&self) {
+        let (lock, cvar) = &*self.inner;
+        if let Ok(mut state) = lock.lock() {
+            state.closed = true;
+            cvar.notify_all();
+        }
+    }
+}
+
+impl LearningCommand {
+    const fn is_interactive(&self) -> bool {
+        matches!(
+            self,
+            Self::ObserveToken { .. }
+                | Self::ObserveTypedSequence { .. }
+                | Self::IgnoreWord { .. }
+                | Self::ForgetWord { .. }
+                | Self::RecordCorrection { .. }
+                | Self::PrepareUndo { .. }
+                | Self::CommitUndo { .. }
+                | Self::CommitRecordedUndo { .. }
+                | Self::DeleteCompletion { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LearningClient {
-    sender: mpsc::Sender<LearningCommand>,
+    queue: LearningQueue,
     last_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -349,9 +429,7 @@ impl LearningClient {
     }
 
     fn send(&self, command: LearningCommand) -> Result<(), AdaptiveRuntimeError> {
-        self.sender
-            .send(command)
-            .map_err(|_| AdaptiveRuntimeError::LearningWorkerUnavailable)
+        self.queue.push(command)
     }
 }
 
@@ -381,10 +459,11 @@ impl AdaptiveLexicalRuntime {
         let sequences = SequenceSnapshotStore::new(sequence_history);
         let completion_suppressions =
             CompletionSuppressionSnapshotStore::new(completion_suppressions);
-        let (sender, receiver) = mpsc::channel();
+        let queue = LearningQueue::new();
+        let worker_queue = queue.clone();
         let last_error = Arc::new(Mutex::new(None));
         let learning = LearningClient {
-            sender,
+            queue,
             last_error: Arc::clone(&last_error),
         };
         let worker_snapshots = snapshots.clone();
@@ -396,7 +475,7 @@ impl AdaptiveLexicalRuntime {
                 worker_snapshots,
                 worker_sequences,
                 worker_completion_suppressions,
-                receiver,
+                worker_queue,
                 last_error,
                 minimum_confidence,
             )
@@ -1241,11 +1320,11 @@ fn learning_worker(
     snapshots: LexicalSnapshotStore,
     sequences: SequenceSnapshotStore,
     completion_suppressions: CompletionSuppressionSnapshotStore,
-    receiver: mpsc::Receiver<LearningCommand>,
+    queue: LearningQueue,
     last_error: Arc<Mutex<Option<String>>>,
     minimum_confidence: Confidence,
 ) {
-    while let Ok(command) = receiver.recv() {
+    while let Some(command) = queue.pop() {
         let result = match command {
             LearningCommand::ObserveToken { token, used_at_ms } => {
                 observe_user_word(&database, &snapshots, &token, used_at_ms)
@@ -1267,7 +1346,7 @@ fn learning_worker(
                     .ignore_word(&term)
                     .map_err(AdaptiveRuntimeError::from)
                     .and_then(|outcome| {
-                        refresh_lexical_overrides(&database, &snapshots)?;
+                        refresh_lexical_overrides_after_removal(&database, &snapshots, &term)?;
                         Ok(outcome)
                     });
                 let response_result = result.as_ref().copied().map_err(ToString::to_string);
@@ -1279,7 +1358,9 @@ fn learning_worker(
                     .forget_word(&term)
                     .map_err(AdaptiveRuntimeError::from)
                     .and_then(|outcome| {
-                        refresh_lexical_overrides(&database, &snapshots)?;
+                        if outcome != ForgetWordOutcome::NotFound {
+                            refresh_lexical_overrides_after_removal(&database, &snapshots, &term)?;
+                        }
                         Ok(outcome)
                     });
                 let response_result = result.as_ref().copied().map_err(ToString::to_string);
@@ -1335,7 +1416,9 @@ fn learning_worker(
                 let result = database
                     .commit_correction_undo(event_id, undone_at_ms)
                     .map_err(AdaptiveRuntimeError::from)
-                    .and_then(|_| refresh_lexical_overrides(&database, &snapshots));
+                    .and_then(|stored| {
+                        refresh_lexical_overrides_after_upsert(&database, &snapshots, stored)
+                    });
                 let response_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
                 let _ = response.send(response_result);
                 result
@@ -1347,7 +1430,9 @@ fn learning_worker(
                 Ok(Ok(event_id)) => database
                     .commit_correction_undo(event_id, undone_at_ms)
                     .map_err(AdaptiveRuntimeError::from)
-                    .and_then(|_| refresh_lexical_overrides(&database, &snapshots)),
+                    .and_then(|stored| {
+                        refresh_lexical_overrides_after_upsert(&database, &snapshots, stored)
+                    }),
                 Ok(Err(error)) => Err(AdaptiveRuntimeError::LearningWorkerFailed(error)),
                 Err(_) => Err(AdaptiveRuntimeError::LearningWorkerUnavailable),
             },
@@ -1371,7 +1456,10 @@ fn learning_worker(
                 let _ = response.send(());
                 Ok(())
             }
-            LearningCommand::Shutdown => break,
+            LearningCommand::Shutdown => {
+                queue.close();
+                break;
+            }
         };
 
         if let Err(error) = result
@@ -1625,14 +1713,32 @@ fn elapsed_millis(started_at: Instant) -> u128 {
     started_at.elapsed().as_millis()
 }
 
-fn refresh_lexical_overrides(
+fn refresh_lexical_overrides_after_removal(
     database: &Database,
     snapshots: &LexicalSnapshotStore,
+    term: &str,
 ) -> Result<(), AdaptiveRuntimeError> {
-    snapshots.replace_lexical_overrides(
-        database.load_user_lexicon()?,
-        database.load_ignored_words()?,
-    )
+    let current = snapshots.load()?;
+    let normalized = normalize_word(term.trim());
+    let updated_lexicon = if normalized.is_empty() {
+        current.user_lexicon().clone()
+    } else {
+        current.user_lexicon().without_normalized(&normalized)
+    };
+    snapshots.replace_lexical_overrides(updated_lexicon, database.load_ignored_words()?)
+}
+
+fn refresh_lexical_overrides_after_upsert(
+    database: &Database,
+    snapshots: &LexicalSnapshotStore,
+    stored: UserWord,
+) -> Result<(), AdaptiveRuntimeError> {
+    let current = snapshots.load()?;
+    let updated_lexicon = match current.user_lexicon().with_upserted_many([stored]) {
+        Some(updated) => updated,
+        None => database.load_user_lexicon()?,
+    };
+    snapshots.replace_lexical_overrides(updated_lexicon, database.load_ignored_words()?)
 }
 
 fn refresh_user_lexicon_from_updates(
@@ -1644,7 +1750,7 @@ fn refresh_user_lexicon_from_updates(
         return Ok(());
     }
     let current = snapshots.load()?;
-    if let Some(updated) = current.user_lexicon().with_updated_existing_many(updates) {
+    if let Some(updated) = current.user_lexicon().with_upserted_many(updates) {
         snapshots.replace_user_lexicon(updated)
     } else {
         snapshots.replace_user_lexicon(database.load_user_lexicon()?)

@@ -1,11 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use crate::language::normalize_word;
 
-use super::{DeleteIndex, MAX_INDEX_DELETIONS};
+use super::delete_index::{DeleteIndex, MAX_INDEX_DELETIONS, deletion_budget, deletion_forms};
+
+const MAX_INCREMENTAL_OVERLAY_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone, Default)]
+struct UserLexiconOverlay {
+    entries: Vec<Option<Arc<UserWord>>>,
+    exact_index: HashMap<Arc<str>, usize>,
+    delete_forms: HashMap<Box<str>, Vec<usize>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserWord {
@@ -87,6 +96,8 @@ pub struct UserLexicon {
     entries: Vec<Arc<UserWord>>,
     exact_index: Arc<HashMap<Arc<str>, usize>>,
     delete_index: Arc<DeleteIndex>,
+    removed: Arc<HashSet<usize>>,
+    overlay: Arc<UserLexiconOverlay>,
     max_use_count: u32,
 }
 
@@ -124,6 +135,8 @@ impl UserLexicon {
             entries,
             exact_index: Arc::new(exact_index),
             delete_index: Arc::new(delete_index),
+            removed: Arc::new(HashSet::new()),
+            overlay: Arc::new(UserLexiconOverlay::default()),
             max_use_count,
         })
     }
@@ -136,6 +149,9 @@ impl UserLexicon {
         let mut max_use_count = self.max_use_count;
         for mut update in updates {
             let index = *self.exact_index.get(update.normalized_term())?;
+            if self.removed.contains(&index) {
+                return None;
+            }
             max_use_count = max_use_count.max(update.use_count());
             update.normalized_term = Arc::clone(&self.entries[index].normalized_term);
             entries[index] = Arc::new(update);
@@ -144,8 +160,133 @@ impl UserLexicon {
             entries,
             exact_index: Arc::clone(&self.exact_index),
             delete_index: Arc::clone(&self.delete_index),
+            removed: Arc::clone(&self.removed),
+            overlay: Arc::clone(&self.overlay),
             max_use_count,
         })
+    }
+
+    pub fn with_upserted_many(
+        &self,
+        updates: impl IntoIterator<Item = UserWord>,
+    ) -> Option<Self> {
+        let mut entries = self.entries.clone();
+        let mut removed = (*self.removed).clone();
+        let mut overlay = (*self.overlay).clone();
+        let mut max_use_count = self.max_use_count;
+        let mut removed_changed = false;
+        let mut overlay_changed = false;
+
+        for mut update in updates {
+            max_use_count = max_use_count.max(update.use_count());
+            if let Some(&index) = self.exact_index.get(update.normalized_term()) {
+                if removed.remove(&index) {
+                    removed_changed = true;
+                }
+                update.normalized_term = Arc::clone(&self.entries[index].normalized_term);
+                entries[index] = Arc::new(update);
+            } else if let Some(&ov_index) = overlay.exact_index.get(update.normalized_term()) {
+                overlay.entries[ov_index] = Some(Arc::new(update));
+                overlay_changed = true;
+            } else {
+                if overlay.entries.len() >= MAX_INCREMENTAL_OVERLAY_ENTRIES {
+                    return None;
+                }
+                let ov_index = overlay.entries.len();
+                let norm = Arc::clone(&update.normalized_term);
+                let budget = deletion_budget(norm.as_ref(), MAX_INDEX_DELETIONS);
+                for form in deletion_forms(norm.as_ref(), budget) {
+                    overlay
+                        .delete_forms
+                        .entry(form.into_boxed_str())
+                        .or_default()
+                        .push(ov_index);
+                }
+                overlay.exact_index.insert(norm, ov_index);
+                overlay.entries.push(Some(Arc::new(update)));
+                overlay_changed = true;
+            }
+        }
+
+        Some(Self {
+            entries,
+            exact_index: Arc::clone(&self.exact_index),
+            delete_index: Arc::clone(&self.delete_index),
+            removed: if removed_changed {
+                Arc::new(removed)
+            } else {
+                Arc::clone(&self.removed)
+            },
+            overlay: if overlay_changed {
+                Arc::new(overlay)
+            } else {
+                Arc::clone(&self.overlay)
+            },
+            max_use_count,
+        })
+    }
+
+    pub fn without_normalized(&self, normalized_term: &str) -> Self {
+        if let Some(&index) = self.exact_index.get(normalized_term) {
+            if self.removed.contains(&index) {
+                return self.clone();
+            }
+            let mut removed = (*self.removed).clone();
+            removed.insert(index);
+            let needs_max_recompute = self.entries[index].use_count() >= self.max_use_count;
+            let mut updated = Self {
+                entries: self.entries.clone(),
+                exact_index: Arc::clone(&self.exact_index),
+                delete_index: Arc::clone(&self.delete_index),
+                removed: Arc::new(removed),
+                overlay: Arc::clone(&self.overlay),
+                max_use_count: self.max_use_count,
+            };
+            if needs_max_recompute {
+                updated.max_use_count = updated.recompute_max_use_count();
+            }
+            return updated;
+        }
+        if let Some(&ov_index) = self.overlay.exact_index.get(normalized_term)
+            && let Some(existing) = self.overlay.entries[ov_index].as_ref()
+        {
+            let needs_max_recompute = existing.use_count() >= self.max_use_count;
+            let mut overlay = (*self.overlay).clone();
+            overlay.entries[ov_index] = None;
+            let mut updated = Self {
+                entries: self.entries.clone(),
+                exact_index: Arc::clone(&self.exact_index),
+                delete_index: Arc::clone(&self.delete_index),
+                removed: Arc::clone(&self.removed),
+                overlay: Arc::new(overlay),
+                max_use_count: self.max_use_count,
+            };
+            if needs_max_recompute {
+                updated.max_use_count = updated.recompute_max_use_count();
+            }
+            return updated;
+        }
+        self.clone()
+    }
+
+    fn recompute_max_use_count(&self) -> u32 {
+        let base_max = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.removed.contains(index))
+            .map(|(_, entry)| entry.use_count())
+            .max()
+            .unwrap_or(1);
+        let overlay_max = self
+            .overlay
+            .entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.use_count())
+            .max()
+            .unwrap_or(1);
+        base_max.max(overlay_max)
     }
 
     pub fn empty() -> Self {
@@ -153,21 +294,43 @@ impl UserLexicon {
     }
 
     pub fn contains_normalized(&self, normalized_term: &str) -> bool {
-        self.exact_index.contains_key(normalized_term)
+        self.exact(normalized_term).is_some()
     }
 
     pub fn exact(&self, normalized_term: &str) -> Option<&UserWord> {
-        self.exact_index
+        if let Some(&index) = self.exact_index.get(normalized_term) {
+            return (!self.removed.contains(&index)).then(|| self.entries[index].as_ref());
+        }
+        self.overlay
+            .exact_index
             .get(normalized_term)
-            .map(|index| self.entries[*index].as_ref())
+            .and_then(|&ov_index| self.overlay.entries[ov_index].as_deref())
     }
 
     pub fn candidate_entries(&self, observed: &str, max_deletions: usize) -> Vec<&UserWord> {
-        self.delete_index
+        let mut results: Vec<&UserWord> = self
+            .delete_index
             .candidate_indices(observed, max_deletions)
             .into_iter()
+            .filter(|index| !self.removed.contains(index))
             .map(|index| self.entries[index].as_ref())
-            .collect()
+            .collect();
+        if !self.overlay.entries.is_empty() {
+            let budget = deletion_budget(observed, max_deletions.min(MAX_INDEX_DELETIONS));
+            let mut seen_overlay = HashSet::new();
+            for form in deletion_forms(observed, budget) {
+                if let Some(indices) = self.overlay.delete_forms.get(form.as_str()) {
+                    for &ov_index in indices {
+                        if seen_overlay.insert(ov_index)
+                            && let Some(entry) = self.overlay.entries[ov_index].as_deref()
+                        {
+                            results.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        results
     }
 
     pub fn prefix_matches(&self, prefix: &str, limit: usize) -> Vec<&UserWord> {
@@ -184,9 +347,21 @@ impl UserLexicon {
             .partition_point(|entry| entry.normalized_term.as_ref() < normalized_prefix.as_str());
         let mut matches: Vec<_> = self.entries[start..]
             .iter()
-            .take_while(|entry| entry.normalized_term.starts_with(&normalized_prefix))
-            .map(Arc::as_ref)
+            .enumerate()
+            .take_while(|(_, entry)| entry.normalized_term.starts_with(&normalized_prefix))
+            .filter(|(offset, _)| !self.removed.contains(&(start + offset)))
+            .map(|(_, entry)| entry.as_ref())
             .collect();
+        if !self.overlay.entries.is_empty() {
+            matches.extend(
+                self.overlay
+                    .entries
+                    .iter()
+                    .flatten()
+                    .filter(|entry| entry.normalized_term.starts_with(&normalized_prefix))
+                    .map(Arc::as_ref),
+            );
+        }
         matches.sort_by(|left, right| {
             right
                 .last_used_at_ms
@@ -203,7 +378,8 @@ impl UserLexicon {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.len() == self.removed.len()
+            && self.overlay.entries.iter().all(Option::is_none)
     }
 }
 
@@ -218,6 +394,50 @@ mod incremental_update_tests {
     use std::sync::Arc;
 
     use super::{UserLexicon, UserWord};
+
+    #[test]
+    fn incremental_upsert_and_removal_preserve_exact_candidates_and_prefixes() {
+        let base = UserLexicon::try_new(vec![
+            UserWord::try_new("alpha", 5, 10).unwrap(),
+            UserWord::try_new("alpine", 2, 20).unwrap(),
+        ])
+        .unwrap();
+
+        let added = base
+            .with_upserted_many([UserWord::try_new("джоба", 1, 30).unwrap()])
+            .expect("small overlay upsert should stay incremental");
+        assert!(added.contains_normalized("джоба"));
+        assert_eq!(added.exact("джоба").unwrap().term(), "джоба");
+        assert!(
+            added
+                .candidate_entries("джоб", 2)
+                .iter()
+                .any(|w| w.normalized_term() == "джоба")
+        );
+        assert_eq!(added.prefix_matches("джо", 5).len(), 1);
+
+        let removed_base = added.without_normalized("alpha");
+        assert!(!removed_base.contains_normalized("alpha"));
+        assert!(removed_base.exact("alpha").is_none());
+        assert!(
+            !removed_base
+                .candidate_entries("alph", 2)
+                .iter()
+                .any(|w| w.normalized_term() == "alpha")
+        );
+        assert_eq!(removed_base.max_use_count(), 2);
+
+        let removed_overlay = removed_base.without_normalized("джоба");
+        assert!(!removed_overlay.contains_normalized("джоба"));
+        assert!(removed_overlay.prefix_matches("джо", 5).is_empty());
+
+        let restored = removed_base
+            .with_upserted_many([UserWord::try_new("alpha", 7, 40).unwrap()])
+            .expect("restoring a tombstoned base word should stay incremental");
+        assert!(restored.contains_normalized("alpha"));
+        assert_eq!(restored.exact("alpha").unwrap().use_count(), 7);
+        assert_eq!(restored.max_use_count(), 7);
+    }
 
     #[test]
     fn metadata_refresh_reuses_search_indexes_for_existing_words() {

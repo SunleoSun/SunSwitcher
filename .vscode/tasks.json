@@ -3,17 +3,14 @@
   "tasks": [
     {
       "label": "SunSwitcher: build release",
-      "type": "process",
-      "command": "cargo",
-      "args": [
-        "build",
-        "--release",
-        "--locked",
-        "--bin",
-        "sunswitcher"
-      ],
+      "type": "shell",
+      "command": "cargo build --release --locked --bin sunswitcher; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $src = 'C:\\Temp\\sunswitcher-build\\release\\sunswitcher.exe'; $dstDir = 'C:\\SunSwitcher'; $dst = Join-Path $dstDir 'sunswitcher.exe'; $old = Join-Path $dstDir 'sunswitcher.exe.old'; New-Item -ItemType Directory -Force -Path $dstDir | Out-Null; if (Test-Path $old) { Remove-Item -Force $old -ErrorAction SilentlyContinue }; if (Test-Path $dst) { try { Copy-Item -Force $src $dst -ErrorAction Stop } catch { Move-Item -Force $dst $old; Copy-Item -Force $src $dst } } else { Copy-Item -Force $src $dst }",
       "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "powershell.exe",
+          "args": ["-NoProfile", "-Command"]
+        }
       },
       "problemMatcher": ["$rustc"],
       "group": {
